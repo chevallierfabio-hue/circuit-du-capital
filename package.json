@@ -1,0 +1,23 @@
+{
+  "name": "circuit-du-capital",
+  "private": true,
+  "version": "0.66.0",
+  "type": "module",
+  "description": "Le Circuit du Capital — prototype 3D. M0 : portage Vite iso-fonctionnel du v66.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "verify": "node scripts/verify-runtime.mjs",
+    "assets:test-glb": "node scripts/build-test-glb.mjs",
+    "assets:draco": "node scripts/copy-draco-decoder.mjs"
+  },
+  "dependencies": {
+    "three": "^0.168.0"
+  },
+  "devDependencies": {
+    "draco3d": "^1.5.7",
+    "puppeteer-core": "^25.1.0",
+    "vite": "^5.4.0"
+  }
+}

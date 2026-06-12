@@ -1,0 +1,7623 @@
+/* =====================================================================
+   src/app.js  —  legacy bundle M0 du portage Vite.
+
+   Code du v66 (UMD r128) repris ici quasi à l'identique. Trois ajustements
+   localisés (et localisables) :
+     1. THREE devient un objet local qui combine le core ESM et les addons
+        de post-processing. Les références (Mesh, Material, etc.) restent
+        celles du module three : instanceof continue de fonctionner.
+     2. Compensation des "physically-correct lights" : depuis r155, le BRDF
+        intègre la division par π, ce qui assombrit les scènes legacy. On
+        multiplie chaque intensité de DirectionalLight / PointLight /
+        HemisphereLight / AmbientLight par LIGHT_GAIN = Math.PI au moment
+        où elle est posée — création + mutations du cycle jour/nuit.
+     3. Les CanvasTexture créées à la main (cartouches, plaques de bois,
+        sceau d'État, ciel peint…) sont marquées sRGB explicitement, ce
+        qui était implicite en r128.
+
+   Les missions M1+ découperont ce fichier le long de la frontière déjà
+   annoncée dans l'en-tête v66 (World / Vehicle / CameraController / Input
+   / HUD / sim). M0 garde l'unité pour préserver la parité visuelle.
+   ===================================================================== */
+
+import * as THREE_BASE from 'three';
+import { EffectComposer }    from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }        from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass }   from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass }        from 'three/addons/postprocessing/ShaderPass.js';
+import { CopyShader }        from 'three/addons/shaders/CopyShader.js';
+import { LuminosityHighPassShader } from 'three/addons/shaders/LuminosityHighPassShader.js';
+
+// Miroir THREE = core + addons. Object.assign copie les références ; les
+// constructeurs (Mesh, Material…) restent ceux du module three.
+const THREE = Object.assign({}, THREE_BASE, {
+  EffectComposer, RenderPass, UnrealBloomPass, ShaderPass,
+  CopyShader, LuminosityHighPassShader,
+});
+
+// Compensation BRDF moderne (cf. en-tête).
+const LIGHT_GAIN = Math.PI;
+const physI = (v) => v * LIGHT_GAIN;
+
+// CanvasTexture par défaut en sRGB.
+(function patchCanvasTextureColorSpace(){
+  const Orig = THREE_BASE.CanvasTexture;
+  function Patched(...args){
+    const t = new Orig(...args);
+    t.colorSpace = THREE_BASE.SRGBColorSpace;
+    return t;
+  }
+  Patched.prototype = Orig.prototype;
+  Object.setPrototypeOf(Patched, Orig);
+  THREE.CanvasTexture = Patched;
+})();
+
+// L'AssetManager fournit la texture HDR équirectangulaire ; init() compile
+// le PMREM une fois le renderer en place. ENV_INTENSITY (constante exposée)
+// est volontairement basse pour ne PAS modifier le rendu v66 maintenant ;
+// elle sera relevée en M1 quand on calibrera l'éclairage IBL.
+export const ENV_INTENSITY = 0.25;
+
+/* ===== MOTEUR ÉCONOMIQUE (modules sim, identiques au fichier moteur) ===== */
+/* =====================================================================
+   SimulationState  —  src/sim/SimulationState.js
+   L'état complet. Une seule source de vérité ; la 3D viendra le LIRE.
+   ===================================================================== */
+class SimulationState {
+  constructor(){
+    this.cycle = 0;
+    this.objectifIndex = 0;      // progression PÉDAGOGIQUE, indépendante du nombre de cycles
+    this.cyclesProfitables = 0;  // total de cycles au résultat net positif
+    this.objectifCyclesSurPlace = 0;  // cycles consécutifs passés sur le même objectif sans le valider
+    this.cyclesSansInvestir = 0;      // cycles sans construire / embaucher / mécaniser / élargir
+    this._investedThisCycle = false;  // drapeau interne, remis à zéro chaque tour
+    // leviers contrôlés par le joueur
+    this.heures = 10;            // journée de travail
+    this.salaire = 5;            // £ / ouvrier / cycle
+    this.travailleurs = 0;       // L employés — aucun au départ
+    this.niveauMachine = 0;      // aucun outillage encore
+    // capital monétaire
+    this.argent = 400;
+    this.dette = 0;
+    this._cycleCredit = 0;       // crédit pris pendant le tour (pour le bilan)
+    this._cycleRepay = 0;        // dette remboursée pendant le tour
+    this._cycleMachine = 0;      // machines achetées à crédit pendant le tour
+    this.profitCumule = 0;
+    // population / chômage
+    this.populationActive = 0;   // pas encore de marché du travail constitué
+    // sphère marchande
+    this.stocks = 0;             // unités invendues reportées
+    this.prixUnitaire = 1.4;     // £/unité (démarre à la valeur)
+    this.productionActive = false; // pas de production tant qu'atelier + ouvrier manquent
+    this.firstProduced = false;    // 1re marchandise produite ?
+    // état social (0..1)
+    this.fatigue = 0.1;
+    this.sante = 0.9;
+    this.colere = 0.1;
+    this.peurChomage = 0.2;
+    this.conscience = 0.05;
+    this.revendication = null;     // revendication ouvrière en cours (journee/salaire/securite/licenciements)
+    this.securiteNiveau = 0;       // investissements en sécurité (réduit les accidents)
+    this.disciplineBonus = 1;      // surveillance : petit gain de productivité, au prix de la colère
+    this._primeActive = 0;         // prime promise : apaise puis, non renouvelée, fâche
+    // dérivés du dernier cycle (remplis par les systèmes)
+    this.d = {};
+    // mémoire pour les deltas affichés
+    this.prev = {};
+    this.enGreve = false;
+    this.fini = false;
+    // entreprises concurrentes (IA) — chacune une stratégie d'accumulation
+    /* v48 — les concurrents ne sont plus des lignes de tableur : chaque firme est
+       incarnée (district sur la carte, ouvriers, machines, stocks, colère, âge propre).
+       Les champs prix/productivite/capital/part/vivant restent pilotés par
+       CompetitionSystem (parts de marché, faillites) ; CompetitorWorld anime le reste. */
+    this.competitors = [
+      {nom:'Manufacture Brandt', strat:'mecanise',     prix:1.45, productivite:1.0, capital:320, part:0, vivant:true,
+       couleur:0x4a5a6e, district:{x:52,z:32},  workers:7, machineLevel:1, wage:5, stocks:8,  debt:60,  anger:0.15, stage:1,
+       enGreve:false, spied:false, devise:'mécanisation agressive : machines, licenciements, prix cassés'},
+      {nom:'Filature Verrié',    strat:'bas-salaires', prix:1.36, productivite:1.0, capital:320, part:0, vivant:true,
+       couleur:0x7a3a2e, district:{x:86,z:30},  workers:9, machineLevel:1, wage:4, stocks:10, debt:20,  anger:0.30, stage:1,
+       enGreve:false, spied:false, devise:'bas salaires : marges rapides, colère ouvrière qui couve'},
+      {nom:'Comptoir Halage',    strat:'compromis',    prix:1.55, productivite:1.0, capital:360, part:0, vivant:true,
+       couleur:0x5a6a4a, district:{x:-60,z:30}, workers:6, machineLevel:1, wage:6, stocks:5,  debt:0,   anger:0.10, stage:1,
+       enGreve:false, spied:false, devise:'prudence : dette faible, croissance lente, stabilité'},
+    ];
+    this.marketConcentration = 0;   // v48 : indice de concentration (faillites -> oligopole -> quasi-monopole)
+    this.rachatDispo = null;   // concurrent en faillite rachetable ce cycle
+    // crédit & État
+    this.tauxInteret = 0.08;   // recalculé chaque cycle (prime de risque)
+    this.plafondCredit = 600;
+    this.limiteJournee = 18;   // loi sur la journée de travail (18 = aucune)
+    this.modeEtat = 'laisser-faire';
+    this.taxe = 0;             // impôt prélevé sur le profit réalisé
+    // --- couche "ville capitaliste" (évolution visuelle + modificateurs) ---
+    // Avant la production capitaliste : seulement un marché local et des terres communes.
+    this.buildings = { banque:0, atelier:0, usine:0, entrepot:0, marche:1, quartier:0, travail:0, rails:0, port:0, bourse:0, terres:1, outils:0 };
+    this.demandeBonus = 0;       // marché / port -> + demande solvable
+    this.stockCapaciteBonus = 0; // entrepôt -> seuil de stock avant crise relevé
+    this.railsBonus = 0;         // rails -> + ventes réalisables
+    this.creditBonus = 0;        // banque -> + plafond de crédit
+    this.reproSocial = 0;        // logements ouvriers -> apaise la colère
+    this.bourseActive = false;   // bourse -> + risque spéculatif
+    this.portOuvert = false;     // port -> marché mondial ouvert
+    this.niveauVille = 0;        // développement du capital (0..7) — 0 = argent dormant
+  }
+  get chomage(){
+    return this.populationActive>0 ? Math.max(0, this.populationActive - this.travailleurs) / this.populationActive : 0;
+  }
+}
+
+/* =====================================================================
+   ProductionSystem  —  src/sim/ProductionSystem.js
+   Le procès P. Seul le travail vivant crée de la valeur nouvelle ;
+   les machines démultiplient les unités (use-values) sans créer de valeur.
+   ===================================================================== */
+const TAU = 1.0;            // valeur nouvelle créée par heure-ouvrier (£)
+const PROD_PHYS_BASE = 1.0; // unités par heure-ouvrier, machine niveau 1
+const MAT_PAR_UNITE = 0.30; // matières premières par unité (£)
+let DEBUG_ECON = false;     // passe à true en console pour tracer la comptabilité de fin de cycle
+
+class ProductionSystem {
+  static run(s){
+    // Pas de production capitaliste sans atelier ET sans force de travail.
+    if(!s.buildings || s.buildings.atelier===0 || s.buildings.outils===0 || s.travailleurs===0){
+      Object.assign(s.d, {
+        productivitePhys:0, heuresEff:0, valeurNouvelle:0, v:0, plusValue:0, Q:0,
+        matieres:0, usure:0, c:0, valeurMarch:0, valeurUnitaire:0,
+        travailNecessaire:0, surtravail:0, tauxExploitation:0, tauxProfit:0, compoOrganique:0,
+        pasDeProduction:true
+      });
+      return;
+    }
+    const divisionBonus = s.niveauVille >= 2 ? 1.15 : 1;   // manufacture : productivité par division du travail
+    const productivitePhys = PROD_PHYS_BASE * divisionBonus * (s.disciplineBonus||1) * (1 + 0.5*(s.niveauMachine-1)); // +50%/niveau machine
+    const heuresEff = s.heures * (1 - 0.55*s.fatigue) * (s.enGreve ? 0.15 : 1); // fatigue & grève rognent
+    const heuresOuvrier = s.travailleurs * heuresEff;
+
+    const valeurNouvelle = heuresOuvrier * TAU;        // v + s
+    const v  = s.travailleurs * s.salaire;             // capital variable
+    const plusValue = Math.max(0, valeurNouvelle - v); // s
+    const Q = Math.round(heuresOuvrier * productivitePhys); // unités physiques
+
+    const matieres = Q * MAT_PAR_UNITE;
+    // outils simples (stade atelier) : usure faible ; machines industrielles : usure forte
+    const usure = (s.niveauVille<=1) ? Math.min(2, s.niveauMachine) : s.niveauMachine * 10;
+    const c = matieres + usure;                        // capital constant consommé
+
+    const valeurMarch = c + valeurNouvelle;            // W = c + v + s
+    const valeurUnitaire = Q>0 ? valeurMarch/Q : 0;
+
+    Object.assign(s.d, {
+      productivitePhys, heuresEff, valeurNouvelle, v, plusValue, Q,
+      matieres, usure, c, valeurMarch, valeurUnitaire,
+      travailNecessaire: valeurNouvelle>0 ? v/TAU : 0,
+      surtravail: plusValue/TAU,
+      tauxExploitation: v>0 ? plusValue/v : 0,
+      tauxProfit: (c+v)>0 ? plusValue/(c+v) : 0,
+      compoOrganique: v>0 ? c/v : 0,
+    });
+    if(Q>0) s.firstProduced=true;
+  }
+}
+
+/* =====================================================================
+   CompetitionSystem  —  src/sim/CompetitionSystem.js
+   Les autres capitaux. Ils accumulent en silence et tirent les prix vers
+   le bas. La demande solvable TOTALE est ici ; le marché la répartit
+   selon les prix. Ne pas suivre la course, c'est perdre sa part — donc
+   ses débouchés, donc son capital. La concurrence transforme
+   l'accumulation en contrainte de survie.
+   ===================================================================== */
+const DEMANDE_TOTALE_BASE = 465;
+const ELASTICITE = 3.2;        // sensibilité des parts au prix
+
+class CompetitionSystem {
+  static run(s){
+    // 1) demande solvable de TOUTE l'économie
+    const consoOuvriere   = s.d.v * 1.15;  // v47 : salaires ↑ -> demande ↑ plus lisible (stratégie salariale viable)
+    const consoChomeurs   = Math.max(0, s.populationActive - s.travailleurs) * 0.6;
+    const consoCapitaliste= 0.18 * Math.max(0, s.profitCumule);
+    const demande = DEMANDE_TOTALE_BASE + (s.demandeBonus||0) + consoOuvriere + consoChomeurs + consoCapitaliste;
+    s.d.demande = demande;
+
+    // 2) les concurrents accumulent — pression permanente sur les prix (pas au cycle 1)
+    const stagne = (s.niveauVille>=2 && s.cyclesSansInvestir>=2);   // le joueur n'investit plus
+    if (s.cycle>2) for(const c of s.competitors){
+      if(!c.vivant) continue;
+      const boost = stagne ? 1.018 : 1;                            // ils prennent un peu d'avance
+      if(c.strat==='mecanise'){      c.productivite*=1.045*boost; c.prix=Math.max(0.70, c.prix*0.955); }
+      else if(c.strat==='bas-salaires'){ c.prix=Math.max(0.80, c.prix*0.985); c.productivite*=boost; }
+      else {                         c.productivite*=1.008*boost; } // compromis : tient son prix
+    }
+
+    // 3) parts de marché ∝ (1/prix)^élasticité — le moins cher rafle le marché
+    const firms = [{prix:s.prixUnitaire}, ...s.competitors.filter(c=>c.vivant)];
+    const w = firms.map(f=>Math.pow(1/Math.max(0.3,f.prix), ELASTICITE));
+    const sum = w.reduce((a,b)=>a+b,0) || 1;
+    let i=0;
+    s.d.partJoueur = w[i++]/sum;
+    for(const c of s.competitors){ c.part = c.vivant ? w[i++]/sum : 0; }
+
+    // 4) santé financière des concurrents -> faillites -> concentration (pas au cycle 1)
+    const marketMin = Math.min(...firms.map(f=>f.prix));
+    const failed = [];
+    if (s.cycle>2) for(const c of s.competitors){
+      if(!c.vivant) continue;
+      const recette = c.part * demande;
+      const tropCher = c.prix > marketMin*1.18 ? (c.prix/marketMin - 1)*45 : 0;
+      const marge = recette*0.22 - 6 - tropCher;
+      c.capital += marge;
+      if(c.capital <= 0){ c.vivant=false; c.part=0; failed.push(c); }
+    }
+    s.d.faillitesConc = failed;
+    if(failed.length && s.argent > 200) s.rachatDispo = failed[failed.length-1];
+  }
+}
+
+/* =====================================================================
+   MarketSystem  —  src/sim/MarketSystem.js
+   M′ → A′. La valeur n'est rien tant qu'elle n'est pas RÉALISÉE.
+   Le joueur ne vend que sur SA part de la demande totale (cf. concurrence).
+   ===================================================================== */
+class MarketSystem {
+  static run(s){
+    const offreUnites = s.stocks + s.d.Q;
+    const demandeJoueur = (s.d.demande||0) * (s.d.partJoueur ?? 1); // £ qui me reviennent
+
+    const uVendablesParPrix = s.prixUnitaire>0 ? demandeJoueur / s.prixUnitaire : 0;
+    const unitesVendues = Math.min(offreUnites, uVendablesParPrix*(1+(s.railsBonus||0)));
+    const recette = unitesVendues * s.prixUnitaire;
+    const invendus = offreUnites - unitesVendues;
+
+    const coutsAvances = s.d.c + s.d.v;
+    const profitRealise = recette - coutsAvances;
+
+    // ajustement de prix pour le PROCHAIN cycle (réaction à la mévente)
+    const tension = offreUnites>0 ? unitesVendues/offreUnites : 1;
+    let nouveauPrix = s.prixUnitaire;
+    if (tension < 0.95) nouveauPrix *= (1 - 0.10*(1-tension));   // surproduction -> baisse
+    else if (offreUnites < uVendablesParPrix) nouveauPrix *= 1.03;
+    nouveauPrix = Math.max(0.4, Math.min(2.2, nouveauPrix));
+
+    Object.assign(s.d, {
+      demandeJoueur, offreUnites, unitesVendues, invendus, recette, coutsAvances,
+      profitRealise, tauxVente: tension, nouveauPrix
+    });
+  }
+}
+
+/* =====================================================================
+   LaborSystem  —  src/sim/LaborSystem.js
+   Fatigue, santé, colère, peur, conscience. La force de travail s'use.
+   ===================================================================== */
+// rapport de force entre travail et capital (0 = capital domine, 1 = travail organisé)
+function rapportDeForceSocial(s){
+  return clamp(0.35*(s.colere||0) + 0.30*(s.conscience||0) + 0.20*(s.fatigue||0)
+             - 0.25*(s.peurChomage||0) - 0.15*(s.chomage||0));
+}
+const REVENDICATIONS = {
+  journee:'journée plus courte', salaire:'salaire plus élevé',
+  securite:'meilleures conditions de sécurité', licenciements:'refus des licenciements'
+};
+function maybeCreateRevendication(s){
+  if(s.revendication) return;
+  if(rapportDeForceSocial(s) < 0.55) return;
+  if(s.heures>10) s.revendication='journee';
+  else if(s.salaire<5) s.revendication='salaire';
+  else if(s.fatigue>0.6) s.revendication='securite';
+  else if(s.chomage>0.25) s.revendication='licenciements';
+  else s.revendication='salaire';
+}
+class LaborSystem {
+  static run(s){
+    const surcharge = Math.max(0, (s.heures - 9) / 8);          // au-delà de 9 h
+    const salaireReel = s.salaire / 5;                           // 5 = subsistance de base
+    const ch = s.chomage;
+
+    s.fatigue = clamp(s.fatigue + surcharge*0.28 - 0.12);        // récupère un peu sinon
+    s.sante   = clamp(s.sante  - (s.fatigue>0.6 ? 0.10 : 0.0) - surcharge*0.04 + 0.02);
+    s.peurChomage = clamp(0.15 + ch*1.4);
+    // colère : montée si surcharge ou salaire bas ; freinée par la peur du chômage
+    const pousseColere = surcharge*0.18 + Math.max(0,(1-salaireReel))*0.25 + (s.fatigue>0.7?0.1:0);
+    s.colere = clamp(s.colere + pousseColere - 0.06 - s.peurChomage*0.05 - (s.reproSocial||0));
+    // conscience collective : la colère partagée s'organise
+    s.conscience = clamp(s.conscience + (s.colere>0.6 ? 0.08 : -0.02));
+
+    // armée industrielle de réserve : double fonction du chômage
+    if (s.chomage>0.25){
+      s.peurChomage = clamp(s.peurChomage + 0.08);   // discipline : peur du chômage
+      s.colere = clamp(s.colere - 0.03);             // colère contenue à court terme
+      s.d.demandeOuvriereFragilisee = true;          // mais la demande solvable faiblit
+    }
+    if (s.chomage>0.35 && s.cycle>6){
+      s.conscience = clamp(s.conscience + 0.03);     // misère prolongée : colère différée s'organise
+    }
+
+    // rapport de force et grève — rare et tardive (après la manufacture)
+    const rapport = rapportDeForceSocial(s);
+    s.d.rapportSocial = rapport;
+    maybeCreateRevendication(s);
+    s.enGreve = (rapport>0.62 && s.colere>0.65 && s.conscience>0.40 && s.peurChomage<0.65);
+    if (s.cycle<=5 || s.niveauVille<2) s.enGreve = false;   // pas de grève avant la manufacture
+
+    // accidents
+    s.d.accident = (s.fatigue>0.75 && Math.random()<0.4) || (s.heures>13 && Math.random()<0.3);
+    if (s.securiteNiveau>0 && s.d.accident && Math.random()<0.55) s.d.accident=false;  // sécurité réduit le risque
+  }
+}
+
+/* =====================================================================
+   CrisisSystem  —  src/sim/CrisisSystem.js
+   Le risque n'est pas un script : c'est une somme pondérée des tensions.
+   ===================================================================== */
+const STOCK_SEUIL = 220, DETTE_SEUIL = 900;
+class CrisisSystem {
+  static run(s){
+    const stockN = Math.min(1, s.stocks / (STOCK_SEUIL + (s.stockCapaciteBonus||0)));
+    const detteN = Math.min(1, s.dette / DETTE_SEUIL);
+    const venteN = 1 - (s.d.tauxVente ?? 1);
+    const surinvest = Math.min(1, Math.max(0, s.d.compoOrganique-3)/5);
+    const crunchN = s.d.creditCrunch ? 0.2 : 0;
+    const age = s.age||0;
+    const speculN = s.bourseActive ? (age>=5?0.16:0.08) : 0;   // capital fictif -> prime de risque (renforcée en finance)
+    const dividN = Math.min(0.12, (s.dividende||0)/400);        // dividendes à servir = fragilité financière
+    const ageRisk = age>=5 ? 0.18 : age>=4 ? 0.13 : age>=3 ? 0.10 : 0;   // les contradictions montent avec l'échelle
+    const risque = clamp(0.42*stockN + 0.24*detteN + 0.22*s.chomage + 0.30*venteN + 0.12*surinvest + crunchN + speculN + dividN + ageRisk);
+    s.d.risqueCrise = risque;
+    s._risqueChaud = (s._risqueChaud||0);
+    s.d.declenche = false;
+    const seuil = age>=3 ? 0.58 : 0.66;                        // grande échelle : le seuil de crise s'abaisse
+    const besoinChaud = age>=4 ? 1 : 2;                        // ville/finance/monde : la crise éclate plus vite
+    if (risque > seuil){ s._risqueChaud++; } else { s._risqueChaud = Math.max(0, s._risqueChaud-1); }
+    if (s._risqueChaud >= besoinChaud && s.cycle>2){           // tension soutenue -> crise (jamais au cycle 1)
+      s.d.declenche = true; s._risqueChaud = 0;
+      s.d.nouveauPrix *= 0.6;            // krach des prix (sur le tour suivant)
+      const liquides = Math.round(s.stocks*0.7);
+      s.stocks -= liquides;              // bradés
+      const licencies = Math.max(0, Math.round(s.travailleurs*0.35));
+      s.travailleurs -= licencies;       // dégraissage
+      s.colere = clamp(s.colere+0.2);
+      s.d.licenciesCrise = licencies;
+    }
+  }
+}
+
+/* =====================================================================
+   CreditSystem  —  src/sim/CreditSystem.js
+   La banque finance l'accumulation, mais à un taux qui monte avec le
+   levier (prime de risque). Surendetté et peu rentable, on subit le
+   "credit crunch" : le robinet se ferme exactement quand il faudrait
+   qu'il coule. Le crédit accélère la course — et la chute.
+   ===================================================================== */
+class CreditSystem {
+  static run(s){
+    const collateral = Math.max(0, s.argent) + s.niveauMachine*150;
+    s.plafondCredit = Math.round(collateral*1.2 + 200 + (s.creditBonus||0));
+    const leverage = s.dette / Math.max(1, collateral);
+    // taux lisible : faible au début, prime de risque seulement si la dette devient lourde
+    if (s.cycle <= 3){
+      s.tauxInteret = 0.01;                                  // premiers cycles : crédit doux
+    } else {
+      const base = 0.02;
+      const primeRisque = 0.04 * Math.min(1, leverage) + (leverage>1.5 ? 0.06*(leverage-1.5) : 0);
+      s.tauxInteret = +(base + primeRisque).toFixed(3);
+    }
+    s.d.leverage = leverage;
+    // rappel de crédit : surendettement + profit négatif (jamais dans les 3 premiers cycles)
+    s.d.creditCrunch = (s.cycle>3 && leverage > 1.5 && (s.d.profitRealise||0) < 0);
+    if (s.d.creditCrunch){
+      const rappel = Math.round(s.dette*0.15);
+      s.argent -= rappel;       // remboursement forcé
+      s.dette  -= rappel;
+      s.d.crunchAmount = rappel;
+    }
+  }
+}
+
+/* =====================================================================
+   StateSystem  —  src/sim/StateSystem.js
+   L'État n'est pas au-dessus de la mêlée : il garantit l'accumulation,
+   mais doit aussi préserver la paix sociale et la reproduction de la
+   force de travail. Selon le rapport de force (lutte des classes), il
+   légifère sur la journée, réprime, concède, ou sauve le système.
+   ===================================================================== */
+class StateSystem {
+  static run(s){
+    if (s.cycle<=2){ s.d.pressionPop=0; return; }   // cycles 1-2 : l état n entre pas encore en scène
+    const pressionPop = s.colere*0.40 + s.conscience*0.30 + s.chomage*0.30 + (s.d.accident?0.15:0);
+    s.d.pressionPop = pressionPop;
+
+    // 1) loi sur la journée de travail (Factory Acts)
+    if ((s.d.accident || s.heures>=13) && pressionPop>0.40 && s.limiteJournee>10){
+      s.limiteJournee = 12;
+      s.heures = Math.min(s.heures, s.limiteJournee);
+      s.d.loiJournee = s.limiteJournee;
+    }
+    if (pressionPop>0.70 && s.limiteJournee>8){
+      s.limiteJournee = 8; s.heures = Math.min(s.heures, 8); s.d.loiJournee = 8;
+    }
+
+    // 2) les grèves ne sont plus arbitrées automatiquement : le joueur décide (modale Conflit social).
+    //    L'État garde son rôle sur la journée de travail et le sauvetage de crise.
+    if (!s.enGreve && pressionPop<0.30){ s.modeEtat='laisser-faire'; }
+
+    // 3) sauvetage du système en cas de crise
+    if (s.d.declenche){
+      s.modeEtat='réforme';
+      s.d.nouveauPrix *= 1.25;   // soutien de la demande, amortit le krach
+      s.taxe = 0.05;             // financé par l'impôt — qui pèsera ensuite
+      s.d.sauvetage=true;
+    }
+  }
+}
+
+/* =====================================================================
+   CapitalCircuit  —  src/sim/CapitalCircuit.js
+   Orchestre un tour complet A → M → P → M′ → A′ et règle la trésorerie.
+   ===================================================================== */
+class CapitalCircuit {
+  constructor(state){ this.s = state; }
+  cycle(){
+    const s = this.s;
+    s.prev = { argent:s.argent, stocks:s.stocks, tauxExploitation:s.d.tauxExploitation||0,
+               tauxProfit:s.d.tauxProfit||0, profitRealise:s.d.profitRealise||0, plusValue:s.d.plusValue||0,
+               colere:s.colere, fatigue:s.fatigue, chomage:s.chomage,
+               risqueCrise:s.d.risqueCrise||0, prixUnitaire:s.prixUnitaire, partJoueur:s.d.partJoueur };
+    s.cycle++;
+    s.d = {};
+    s.rachatDispo = null;
+
+    // P : production de la valeur
+    ProductionSystem.run(s);
+    // les autres capitaux : demande totale + parts de marché
+    CompetitionSystem.run(s);
+    // M′ → A′ : réalisation sur MA part du marché
+    MarketSystem.run(s);
+    // social
+    LaborSystem.run(s);
+    // crédit : taux, plafond, rappel éventuel
+    CreditSystem.run(s);
+    // tensions systémiques
+    CrisisSystem.run(s);
+    // l'État réagit (loi, répression, concession, sauvetage)
+    StateSystem.run(s);
+
+    // règlement monétaire : recettes, coûts, intérêts (taux dynamique), impôt
+    const interets = (s.dette>0) ? Math.round(s.dette * s.tauxInteret) : 0;  // pas d'intérêt sans dette
+    const impot = Math.round(Math.max(0, s.d.profitRealise) * s.taxe);
+    s.argent += s.d.recette - s.d.coutsAvances - interets - impot;
+    s.profitCumule += s.d.profitRealise - interets - impot;
+    s.stocks = Math.max(0, s.d.invendus);   // stock final = invendus restants (déjà = ancien stock + Q − ventes)
+    s.prixUnitaire = s.d.nouveauPrix;     // prix pour le tour suivant (crash/sauvetage inclus)
+    s.d.interets = interets; s.d.impot = impot;
+    // résultat productif (atelier) vs résultat net (après dette/impôt)
+    s.d.resultatProductif = s.d.profitRealise;                 // recette − salaires − matières − usure
+    s.d.resultatNet = s.d.profitRealise - interets - impot;
+    if(s.d.resultatNet > 0) s.cyclesProfitables++;             // total de cycles bénéficiaires (net)
+    // dette : photo du tour pour le bilan
+    const credit=s._cycleCredit||0, repay=s._cycleRepay||0;
+    s.d.detteFin = s.dette;
+    s.d.detteDebut = Math.max(0, s.dette - credit + repay);    // avant les mouvements du tour
+    s.d.creditPris = credit; s.d.detteRemb = repay; s.d.taux = s.tauxInteret;
+    s.d.machineAchat = s._cycleMachine||0;
+    s._cycleCredit = 0; s._cycleRepay = 0; s._cycleMachine = 0;       // remise à zéro pour le tour suivant
+    // accumulation : ai-je investi ce tour-ci ?
+    if(s._investedThisCycle) s.cyclesSansInvestir = 0; else s.cyclesSansInvestir++;
+    s._investedThisCycle = false;
+    s.d.stagne = (s.niveauVille>=2 && s.cyclesSansInvestir>=2);       // « accumuler ou être dépassé »
+    if(s._primeActive>0){ s._primeActive--; if(s._primeActive===0) s.colere=clamp(s.colere+0.08); } // prime non renouvelée
+    if (typeof DEBUG_ECON!=='undefined' && DEBUG_ECON){
+      console.table({ cycle:s.cycle, argentAvant:s.prev.argent, recette:s.d.recette, couts:s.d.coutsAvances,
+        interets, impot, profitRealise:s.d.profitRealise, argentApres:s.argent, production:s.d.Q,
+        vendues:s.d.unitesVendues, ancienStock:s.prev.stocks, invendusFinaux:s.d.invendus, stockFinal:s.stocks });
+    }
+
+    // faillite
+    if (s.argent < -200){ s.d.faillite = true; s.fini = true; }
+    return s.d;
+  }
+}
+
+/* =====================================================================
+   EventLog  —  src/sim/EventLog.js
+   Transforme le tableur en chronique. C'est lui qui donne l'effet
+   "Dwarf Fortress" : on lit l'histoire au lieu de regarder des nombres.
+   ===================================================================== */
+class EventLog {
+  constructor(){ this.entries = []; }
+  pousser(texte, type='plain'){ this.entries.unshift({an:null, texte, type}); }
+  chroniquer(s){
+    const an = 1800 + s.cycle;
+    const out = [];
+    const add=(t,type='plain')=>out.push({type, t});
+
+    if (s.d.declenche){
+      add(`Crise. Les marchandises ne trouvent plus d’acheteurs : les prix s’effondrent, ${s.d.licenciesCrise} ouvriers sont jetés à la rue, les stocks sont bradés. Ce n’est pas un accident venu du dehors — c’est le circuit lui-même qui se grippe.`, 'crisis');
+    }
+    if (s.d.faillite){ add(`Faillite. Le capital avancé ne revient plus. L’entreprise s’éteint ; un concurrent rachètera ses machines pour rien — le capital se concentre.`, 'crisis'); }
+
+    if (s.d.tauxExploitation > (s.prev.tauxExploitation||0) + 0.15)
+      add(`Le taux d’exploitation grimpe à ${pct(s.d.tauxExploitation)} : l’ouvrier travaille une part croissante de sa journée gratuitement pour le capital.`, 'social');
+
+    if (s.d.profitRealise < s.d.plusValue - 8 && s.d.invendus > 3)
+      add(`Paradoxe : on a extrait ${money(s.d.plusValue)} de plus-value, mais seulement ${money(Math.max(0,s.d.profitRealise))} de profit réalisé. ${Math.round(s.d.invendus)} unités restent invendues. Produire ne suffit pas : encore faut-il vendre.`, 'warn');
+
+    if (s.d.invendus > 5)
+      add(`${Math.round(s.d.invendus)} unités s’entassent dans les entrepôts (stock total : ${Math.round(s.stocks)}). Les prix fléchissent.`, 'warn');
+
+    if (s.prev.chomage!==undefined && s.chomage > s.prev.chomage + 0.05)
+      add(`Le chômage monte à ${pct(s.chomage)}. L’armée industrielle de réserve grossit — et avec elle la pression à la baisse sur les salaires.`, 'social');
+
+    if (s.d.accident)
+      add(`Un accident à l’atelier. Au-delà de dix heures, les corps lâchent ; la machine, elle, ne se fatigue pas.`, 'social');
+
+    if (s.enGreve)
+      add(`Grève. La colère est devenue collective ; la production s’arrête presque. La force de travail rappelle qu’elle n’est pas une chose.`, 'social');
+
+    (s.d.faillitesConc||[]).forEach(c=>
+      add(`${c.nom} fait faillite. Ses machines partiront pour une bouchée de pain : le capital se concentre entre moins de mains.`, 'crisis'));
+
+    if (s.d.partJoueur!==undefined && s.d.partJoueur < 0.17)
+      add(`Ta part de marché tombe à ${pct(s.d.partJoueur)}. Les concurrents qui ont mécanisé vendent moins cher ; rester en place, c’est déjà reculer.`, 'warn');
+
+    if (s.d.loiJournee)
+      add(`L’État promulgue une loi : la journée de travail est plafonnée à ${s.d.loiJournee} heures. La limite à l’exploitation absolue ne vient pas du marché — elle est arrachée par la loi.`, 'social');
+    if (s.d.repression)
+      add(`L’État réprime la grève. Le calme revient dans l’atelier — mais la matraque laisse une mémoire, et la conscience de classe s’aiguise.`, 'social');
+    if (s.d.concession)
+      add(`Le rapport de force a tourné : l’État impose une concession, les salaires montent d’un cran.`, 'social');
+    if (s.d.creditCrunch)
+      add(`La banque rappelle ${money(s.d.crunchAmount)} de crédit. Le robinet se ferme au pire moment : le crédit qui accélérait l’accumulation précipite la chute.`, 'warn');
+    if (s.d.sauvetage)
+      add(`L’État vole au secours du système : il soutient les prix et renfloue, financé par l’impôt. Le capital privatise les profits et socialise les crises.`, 'crisis');
+
+    if (out.length===0)
+      add(`Le cycle s’est bouclé : ${money(s.d.recette)} encaissés, ${money(Math.max(0,s.d.profitRealise))} de profit. L’argent revient augmenté, puis repart.`);
+
+    out.forEach(e=> this.entries.unshift({an, texte:e.t, type:e.type}));
+  }
+}
+
+/* ---------- utilitaires ---------- */
+function clamp(x){ return Math.max(0, Math.min(1, x)); }
+function money(x){ return `${Math.round(x).toLocaleString('fr-FR')} £`; }
+function money2(x){ return `${(Math.round(x*100)/100).toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2})} £`; }
+function pct(x){ return `${Math.round(x*100)} %`; }
+
+
+/* ===== RENDU 3D + LIAISON ===== */
+/* ===================================================================
+   Palette partagée avec le site / le moteur
+   =================================================================== */
+/* Palette centrale — « vieux registre comptable qui devient ville industrielle » */
+const THEME = {
+  paper:0xe9ddc6, ink:0x241f17, red:0x8a2c1d, gold:0xa8812c,
+  brown:0x5a4530, darkBrown:0x33261b, iron:0x4b4a45, smoke:0x6c665c,
+  worker:0x4d5f70, cloth:0x2f3a44, grassDead:0x9b8d6d, crisis:0x5b1712,
+};
+const COL = {
+  papier:THEME.paper, sol:0xd6c6a2, encre:THEME.ink,
+  rouge:THEME.red, or:THEME.gold, bleu:THEME.worker, brun:THEME.brown,
+  pierre:0xcabf9f, charbon:THEME.darkBrown, vert:0x4f5a3e, froid:0x6c7d8c,
+  fer:THEME.iron, fumee:THEME.smoke, crise:THEME.crisis,
+};
+
+/* ===================================================================
+   MiniCircuit  —  STUB. Sera remplacé par le vrai CapitalCircuit.js
+   (déjà écrit) au portage. Ici : juste de quoi rendre le HUD vivant
+   quand on traverse les zones. Aucune simulation sérieuse.
+   =================================================================== */
+/* ===== LIAISON moteur <-> monde 3D ===== */
+const state   = new SimulationState();
+const circuit = new CapitalCircuit(state);
+const log     = new EventLog();
+
+let cycleCooldown=0, lastLogLen=log.entries.length, flashTimer=0;
+
+function runCycle(){
+  snapshotHUD();            // v47 : photo des valeurs affichées -> les ▲▼ du HUD comparent cycle à cycle
+  circuit.cycle();
+  log.chroniquer(state);
+  const fresh = log.entries.slice(0, log.entries.length-lastLogLen);
+  lastLogLen = log.entries.length;
+  fresh.reverse().forEach(e=>pushLog('An '+(e.an||''), e.texte, e.type));
+  if(state.d.declenche || state.d.faillite) flashTimer=0.45;
+  updateHUD(); updateMarx(); renderLeviers();
+  if(typeof LivingWorld!=='undefined') LivingWorld.onCycle();
+  if(gameMode==='guided' && gamePhase==='circuit' && state.cycle>=1) pendingEnterSF=true;
+}
+
+// MiniCircuit garde son nom (la 3D l'appelle deja) mais PILOTE le vrai moteur.
+const MiniCircuit = {
+  cargo:'argent',
+  reset(){ this.cargo='argent'; },
+  get argent(){ return state.argent; },
+  get profit(){ return state.d.profitRealise||0; },
+  get dette(){ return state.dette; },
+  get stocks(){ return Math.round(state.stocks); },
+  get chomage(){ return state.chomage; },
+  get colere(){ return state.colere; },
+  banque(){ this.cargo='argent';
+    if(state.cycle<=2)
+      return ["Banque","Ici, tu pourras plus tard recourir au crédit. Pour l’instant, ton argent suffit : avance-le (A)."];
+    if(state.dette>0)
+      return ["Banque",`Crédit ouvert. Dette : ${money(state.dette)} · taux ${pct(state.tauxInteret)}. Emprunte ou rembourse au panneau.`];
+    return ["Banque",`Tu peux emprunter pour investir — mais le crédit se rembourse avec intérêts (taux ${pct(state.tauxInteret)}). Choisis au panneau.`]; },
+  marcheMP(){ this.cargo='moyens'; return ["March\u00e9 des moyens",`Capital constant. Machines : niveau ${state.niveauMachine}. Ach\u00e8te des machines au panneau pour m\u00e9caniser. (M)`]; },
+  marcheTravail(){ this.cargo='moyens'; return ["March\u00e9 du travail",`Capital variable. Ouvriers : ${state.travailleurs}, salaire ${state.salaire} \u00a3. Ch\u00f4mage : ${pct(state.chomage)}.`]; },
+  usine(){ this.cargo='marchandises'; const p=productionPlaceLabel(); return ['Usine',`Journée de ${state.heures} h. Stade actuel : ${p.toLowerCase()}. C'est ici qu'on arrache le surtravail — règle la journée au panneau. (P)`]; },
+  entrepot(){ return ["Entrep\u00f4t", state.stocks>1?`${Math.round(state.stocks)} marchandises invendues s'accumulent (M\u2032).`:"Peu de stock \u2014 la valeur s'\u00e9coule pour l'instant."]; },
+  marcheVente(){ this.cargo='argent';
+    return ["March\u00e9 de vente","M\u2032\u2192A\u2032 : c'est ici que la valeur se r\u00e9alise en argent. Boucler le circuit ici termine le cycle."]; },
+  quartier(){ return ["Quartier ouvrier",`Ch\u00f4mage ${pct(state.chomage)}, col\u00e8re ${pct(state.colere)}, fatigue ${pct(state.fatigue)}.`+(state.enGreve?" GR\u00c8VE en cours.":"")]; },
+  etat(){ return ["\u00c9tat \u00b7 Tribunal", state.limiteJournee<18?`Loi en vigueur : journ\u00e9e plafonn\u00e9e \u00e0 ${state.limiteJournee} h. Posture : ${state.modeEtat}.`:`Aucune loi vot\u00e9e. Posture de l'\u00c9tat : ${state.modeEtat}.`]; },
+  terres(){ return ["Terres communes","Accumulation primitive : cl\u00f4turer les communs, expulser les paysans, fabriquer une population disponible pour le salariat."]; },
+  mines(){ this.cargo='moyens'; return ["Mines \u00b7 Champs","Charbon, fer, coton, bl\u00e9 : mati\u00e8res premi\u00e8res et rente entrent dans le circuit."]; },
+  port(){ return ["Port \u00b7 March\u00e9 mondial","Le circuit d\u00e9borde les fronti\u00e8res : d\u00e9bouch\u00e9s et mati\u00e8res mondiales, d\u00e9pendance coloniale."]; },
+  bourse(){ return ["Bourse",`Capital fictif et sp\u00e9culation. Risque de crise syst\u00e9mique : ${pct(state.d.risqueCrise||0)}.`]; },
+};const CARGO_COLOR = { argent:COL.or, moyens:COL.brun, marchandises:COL.rouge };
+
+/* ===================================================================
+   World / MapBuilder  —  sol, lumière, décor, zones
+   =================================================================== */
+let scene, renderer, camera;
+const zones = [];        // {name, pos, radius, key, mesh, label, action}
+const zoneGroups = {};   // name -> THREE.Group (pour les conséquences visibles)
+const obstacles = [];    // {pos, radius} pour collisions simples
+const HALF = 120;        // v49 : monde élargi mais compact — les quartiers d'entreprise s'insèrent ENTRE les institutions partagées
+
+function makeLabel(text){
+  const c=document.createElement('canvas'); c.width=640; c.height=160;
+  const x=c.getContext('2d');
+  let fs=50; x.font=`600 ${fs}px "Zilla Slab", serif`;
+  while(x.measureText(text).width>560 && fs>22){ fs-=4; x.font=`600 ${fs}px "Zilla Slab", serif`; }
+  const w=Math.min(600, x.measureText(text).width+72), h=104, px=(640-w)/2, py=(160-h)/2;
+  // ombre portée façon gravure
+  x.fillStyle='rgba(36,31,23,0.30)'; roundRect(x,px+7,py+8,w,h,7); x.fill();
+  // plaque papier
+  x.fillStyle='#e9ddc6'; roundRect(x,px,py,w,h,7); x.fill();
+  // double cadre encre
+  x.strokeStyle='#241f17'; x.lineWidth=5; roundRect(x,px,py,w,h,7); x.stroke();
+  x.strokeStyle='#241f17'; x.lineWidth=1.5; roundRect(x,px+8,py+8,w-16,h-16,4); x.stroke();
+  // texte encre
+  x.fillStyle='#241f17'; x.textAlign='center'; x.textBaseline='middle';
+  x.font=`600 ${fs}px "Zilla Slab", serif`; x.fillText(text,320,82);
+  const tex=new THREE.CanvasTexture(c); tex.anisotropy=4;
+  const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthTest:false}));
+  spr.scale.set(12,3,1);
+  return spr;
+}
+function roundRect(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);
+  c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath();}
+
+function box(w,h,d,color,x,y,z,castShadow=true){
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),
+    new THREE.MeshStandardMaterial({color,roughness:.9,metalness:.02,flatShading:true}));
+  m.position.set(x,y,z); m.castShadow=castShadow; m.receiveShadow=true; return m;
+}
+
+function createPaperGroundTexture(){
+  /* v66 — fini le papier quadrillé : une TERRE. Base brune-verte irrégulière,
+     grandes plaques d'usure, cailloutis, herbe rase par endroits. Le nom de la
+     fonction est conservé pour ne toucher aucun appelant. */
+  const c=document.createElement('canvas'); c.width=c.height=1024; const x=c.getContext('2d');
+  const g=x.createRadialGradient(512,512,120,512,512,760);
+  g.addColorStop(0,'#8d8062'); g.addColorStop(0.6,'#83775c'); g.addColorStop(1,'#776b52');
+  x.fillStyle=g; x.fillRect(0,0,1024,1024);
+  // grandes plaques organiques (terre plus sombre / plus claire / verdâtre)
+  for(let i=0;i<70;i++){
+    const px=Math.random()*1024, py=Math.random()*1024, r=40+Math.random()*150;
+    const tones=['141,128,96','120,108,80','116,118,84','152,140,104'];
+    const tone=tones[Math.floor(Math.random()*tones.length)];
+    const gr=x.createRadialGradient(px,py,r*0.2,px,py,r);
+    gr.addColorStop(0,`rgba(${tone},${0.10+Math.random()*0.14})`); gr.addColorStop(1,`rgba(${tone},0)`);
+    x.fillStyle=gr; x.beginPath(); x.arc(px,py,r,0,6.3); x.fill();
+  }
+  // cailloutis et brins
+  for(let i=0;i<900;i++){
+    const px=Math.random()*1024, py=Math.random()*1024;
+    x.fillStyle=Math.random()<0.5?`rgba(60,52,38,${0.10+Math.random()*0.18})`:`rgba(170,158,120,${0.08+Math.random()*0.14})`;
+    x.fillRect(px,py,1+Math.random()*2.4,1+Math.random()*2.4);
+  }
+  const tex=new THREE.CanvasTexture(c); tex.anisotropy=4; return tex;
+}
+
+function buildWorld(){
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0xcbbd9a);   // filet de sécurité derrière le dôme
+  buildSky();                                    // v59 : un vrai ciel
+  buildHorizon();                                // v65/v66 : le monde continue au-delà du cadre
+  buildNightLights();                            // v66 : les lumières qui peignent la nuit
+  scene.fog=new THREE.Fog(0xcbbd9a, 100, 310);   // v49
+
+  // lumières — soleil bas, chaud, poussiéreux + rebond doux (v57 : pilotés par DayCycle)
+  // r128 → r16x : intensités multipliées par π (cf. en-tête, LIGHT_GAIN).
+  hemiLight=new THREE.HemisphereLight(0xefe2c6, 0x5a4d38, physI(.72)); scene.add(hemiLight);
+  scene.add(new THREE.AmbientLight(0xb9a884, physI(.22)));
+  sunLight=new THREE.DirectionalLight(0xffe7bd, physI(1.0));
+  sunLight.position.set(58,72,42); sunLight.castShadow=true;
+  sunLight.shadow.mapSize.set(2048,2048); sunLight.shadow.bias=-0.0004;
+  sunLight.shadow.radius=3.5;           // v62 : pénombre douce, façon jouet
+  const s=160; const c=sunLight.shadow.camera;
+  c.left=-s;c.right=s;c.top=s;c.bottom=-s;c.near=1;c.far=360;
+  scene.add(sunLight);
+
+  // sol — carte économique sur papier ancien
+  const ground=new THREE.Mesh(new THREE.PlaneGeometry(HALF*2,HALF*2),
+    new THREE.MeshStandardMaterial({color:0xb6ab8e, map:createPaperGroundTexture(), roughness:1, metalness:0}));  // v66 : terre
+  ground.rotation.x=-Math.PI/2; ground.receiveShadow=true; scene.add(ground);
+
+  // bordure — v51 : le cadre est désormais un carré aligné à ±HALF (il contenait avant
+  // un losange de demi-côté HALF/√2 ≈ 85 : les quartiers d'entreprise flottaient HORS du cadre)
+  const edge=new THREE.Mesh(new THREE.RingGeometry((HALF-0.6)*Math.SQRT2,HALF*Math.SQRT2,4,1),
+    new THREE.MeshBasicMaterial({color:COL.encre}));
+  edge.rotation.x=-Math.PI/2; edge.rotation.z=Math.PI/4; edge.position.y=0.02; scene.add(edge);
+
+  // --- v52 : LA VILLE-RUE — la géographie raconte la direction du jeu ---
+  // Grand-rue est-ouest (z = 0). On la descend d'ouest en est : c'est le trajet A -> A'.
+  //   FAÇADE NORD (z ≈ -25) : la campagne d'origine puis les institutions du capital ;
+  //   2e RANGÉE NORD (z ≈ -60) : ce qui surplombe — Mines, Bourse, État ;
+  //   CÔTÉ SUD (z ≈ +30) : les parcelles industrielles ALIGNÉES (Halage · TOI · Brandt · Verrié) ;
+  //   2e RANGÉE SUD (z ≈ +62) : le quartier ouvrier, derrière les usines ;
+  //   EXTRÉMITÉ EST : le marché de vente puis le Port — la rue débouche sur le monde.
+  defineZone('Terres communes',           -105,-30, 0x6f7a45,   '',    buildTerresCommunes);
+  defineZone('Banque',                     -72,-25, COL.pierre, 'A',   buildBanque);
+  defineZone('Marché des moyens',          -40,-25, COL.brun,   'M',   buildMarcheMP);
+  defineZone('Marché du travail',           -8,-25, COL.froid,  'Ft',  buildMarcheTravail);
+  defineZone('Marché de vente',             55,-25, COL.vert,   "A'",  buildMarche);
+  defineZone('Mines · Champs',            -105,-62, 0x6b5a3f,   '',    buildMines);
+  defineZone('Bourse',                     -72,-60, COL.or,     '',    buildBourse);
+  defineZone('État · Tribunal',             -8,-60, COL.vert,   '',    buildEtat);
+  defineZone('Usine',                      -15, 30, COL.charbon,'P',   buildUsine);
+  defineZone('Entrepôt',                    18, 32, COL.brun,   'M′',  buildEntrepot);
+  defineZone('Quartier ouvrier',             0, 62, COL.froid,  '',    buildQuartier);
+  defineZone('Port · Marché mondial',      102,  2, COL.bleu,   '',    buildPort);
+
+  buildMainStreet();   // v52 : la grand-rue, épine dorsale visible dès le premier instant
+  buildWaterEast();    // v56 : le littoral — le port donne sur l'eau, la rue débouche sur le monde
+  Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
+  // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
+  // passe par la barre du circuit (UI), la balise, la flèche au sol et la ligne
+  // TEMPORAIRE du tutoriel (circuitLine), qui s'éteint après le premier circuit.
+}
+
+function defineZone(name,x,z,color,key,builder){
+  const group=new THREE.Group(); group.position.set(x,0,z);
+  builder(group,color);
+  group.children.forEach(m=>{ if(m.userData) m.userData.base=true; });  // structure de base (masquable)
+  const label=makeLabel(key?`${key} — ${name}`:name); label.position.set(0,8,0); group.add(label);
+  // halo au sol
+  const halo=new THREE.Mesh(new THREE.RingGeometry(7.4,8.2,40),
+    new THREE.MeshBasicMaterial({color,transparent:true,opacity:.35,side:THREE.DoubleSide}));
+  halo.rotation.x=-Math.PI/2; halo.position.y=0.04; group.add(halo);
+  scene.add(group);
+
+  const actionMap={
+    'Banque':'banque','Marché des moyens':'marcheMP','Marché du travail':'marcheTravail',
+    'Usine':'usine','Entrepôt':'entrepot','Marché de vente':'marcheVente',
+    'Quartier ouvrier':'quartier','État · Tribunal':'etat','Terres communes':'terres',
+    'Mines · Champs':'mines','Port · Marché mondial':'port','Bourse':'bourse'
+  };
+  zoneGroups[name]=group;
+  zones.push({name,pos:new THREE.Vector3(x,0,z),radius:8,key,group,halo,
+    action:()=>MiniCircuit[actionMap[name]]()});
+  obstacles.push({pos:new THREE.Vector2(x,z),radius:5.5});
+}
+
+/* --- silhouettes low-poly par zone --- */
+function buildBanque(g){
+  g.add(box(13,1,11,0xb8a986,0,0.5,0,false));                       // socle
+  const steps=createSteps(11,3); steps.position.set(0,0.5,1); g.add(steps);
+  const body=box(11,11,9,COL.pierre,0,6.5,-0.5); body.material.map=texBrick(); g.add(body); addOutline(body);
+  for(let i=0;i<4;i++){ const c=createColumn(8,0.5); c.position.set(-4.2+i*2.8,1.4,4.4); g.add(c); }
+  const ped=new THREE.Mesh(new THREE.ConeGeometry(7.4,2.6,3),stdMat(0xc2b186)); // fronton triangulaire
+  ped.position.set(0,11,3.4); ped.rotation.y=Math.PI/2; ped.scale.set(1,1,0.42); g.add(ped);
+  g.add(box(13.6,1,11,COL.or,0,12.6,-0.5,false));                   // corniche dorée
+  const dr=createDoor(2.2,3.6); dr.position.set(0,1,4.7); g.add(dr);
+  for(const x of[-3.6,3.6]){ const w=createWindow(1,1.5); w.position.set(x,6.5,4.05); g.add(w); }
+  const sp=createSign('£'); sp.scale.set(2.6,2.6,1); sp.position.set(0,9.7,4.7); g.add(sp);
+  const coffre=box(2.4,2,1.8,0x3a352c,4.4,1.5,-3,false); coffre.material.map=texMetal(); g.add(coffre);
+  g.add(box(2.5,0.4,1.9,COL.or,4.4,2.5,-3,false));
+  for(let i=0;i<3;i++) g.add(box(1.7,0.42,1.1,0xcdbd9a,-4.6,0.7+i*0.46,-3,false));   // registres empilés
+}
+/* ===== v64 — KIT DE FAÇADE : ce qui sépare une boîte d'un bâtiment =====
+   soubassement de pierre, corniche sous le toit, fenêtres à volets,
+   faîtage, lucarne, chapeau de cheminée, auvent de quai. Réutilisé par
+   les trois stades d'usine et la maison ouvrière. */
+function addPlinth(put,w,d,h=0.55){           // soubassement : pierre sombre, légèrement saillant
+  const m=put(box(w+0.34,h,d+0.34,0x7e7565,0,h/2,0)); m.material.map=texBrick(); return m; }
+function addCornice(put,w,d,y){               // corniche : bandeau saillant sous le toit
+  return put(box(w+0.5,0.28,d+0.5,0x6e6354,0,y,0,false)); }
+function addRidge(put,len,y,alongX=true){     // faîtage : baguette sur l'arête du toit
+  const r=new THREE.Mesh(new THREE.CylinderGeometry(0.14,0.14,len,6),
+    new THREE.MeshStandardMaterial({color:0x3a3028,flatShading:true}));
+  r.rotation.z=alongX?Math.PI/2:0; if(!alongX) r.rotation.x=Math.PI/2;
+  r.position.y=y; put(r); return r; }
+function createShutterWindow(w=0.9,h=1.0){    // fenêtre à volets entrouverts
+  const g=createWindow(w,h);
+  for(const sgn of [-1,1]){
+    const v=box(w*0.52,h+0.1,0.06,0x5a6a4a,sgn*(w/2+w*0.30),0,0.06,false);
+    v.rotation.y=sgn*0.5; g.add(v);
+  }
+  return g; }
+function createDormer(){                      // lucarne : petit volume + toit + fenêtre
+  const g=new THREE.Group();
+  g.add(box(1.2,1.1,1.0,0x9c8f74,0,0.55,0,false));
+  const t=new THREE.Mesh(new THREE.ConeGeometry(0.95,0.7,4),
+    new THREE.MeshStandardMaterial({color:0x46393b,flatShading:true}));
+  t.rotation.y=Math.PI/4; t.position.y=1.45; g.add(t);
+  const w=createWindow(0.6,0.6); w.position.set(0,0.55,0.53); g.add(w);
+  return g; }
+function addChimneyCap(put,x,y,z){            // chapeau + mitron
+  put(box(2.0,0.34,2.0,0x6e6354,x,y,z,false));
+  const pot=new THREE.Mesh(new THREE.CylinderGeometry(0.26,0.34,0.7,7),
+    new THREE.MeshStandardMaterial({color:0x8a5a3e,flatShading:true}));
+  pot.position.set(x+0.45,y+0.5,z); put(pot); }
+function addAwning(put,w,x,y,z){              // auvent de quai : toile inclinée + potences
+  const t=box(w,0.1,2.0,0x8a3b2a,x,y,z+1.0,false); t.rotation.x=0.3; put(t);
+  for(const sx of [-1,1]) put(box(0.12,0.12,2.0,0x3a3028,x+sx*w/2*0.9,y-0.28,z+1.0,false)).rotation.x=0.3; }
+
+/* =====================================================================
+   v53 — GRAMMAIRE ARCHITECTURALE COMMUNE.
+   Le monde applique les MÊMES règles à tous les capitaux : un atelier est
+   un atelier, qu'il soit à toi ou à Brandt. Trois stades, un seul
+   vocabulaire — la parcelle du joueur et celles des concurrents sont
+   construites par les mêmes fonctions, à la même échelle.
+     stade 1 : ATELIER (fondation)        stade 2 : MANUFACTURE
+     stade 3 : GRANDE INDUSTRIE (l'ancienne « grande usine » du joueur,
+               qui s'affichait à tort dès la fondation)
+   `put` est le placeur fourni par l'appelant : il décide du calque
+   ('plant' chez le joueur, 'cw' chez les firmes) — même pierre, autre main.
+   ===================================================================== */
+function buildPlantStage1(g,put){           // l'atelier : là où tout commence
+  addPlinth(put,8,6);
+  const corps=put(box(8,4.5,6,0x8b7d63,0,2.25+0.3,0)); addOutline(corps);
+  addCornice(put,8,6,4.85);
+  const roof=createRoof('pitched',9.6,7.6,0x46393b); roof.position.set(0,5.0,0); put(roof);  // débord de toit
+  addRidge(put,9.2,6.9);
+  const ch=createSmokeStack(7.4,COL.charbon); ch.position.set(2.8,0,-1.8); put(ch);
+  addChimneyCap(put,2.8,7.5,-1.8);
+  put(createDoor()).position.set(-0.6,0.55,3.1);
+  put(box(2.6,0.5,1.6,0x9a9183,-0.6,0.25,3.6,false));      // perron de pierre
+  put(box(2.4,1,1.2,COL.brun,-3.0,0.8,3.6,false));         // établi dehors
+  const w=createShutterWindow(0.9,1.0); w.position.set(2.4,2.9,3.22); put(w);
+  // tas de bois contre le mur : l'atelier travaille
+  for(let i=0;i<3;i++){ const b=new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.22,1.8,7),
+      new THREE.MeshStandardMaterial({color:0x6b513a,flatShading:true}));
+    b.rotation.z=Math.PI/2; b.position.set(-3.6,0.25+i*0.36,-2.2+i*0.1); put(b); }
+}
+function buildPlantStage2(g,put){           // la manufacture : division du travail sous un même toit
+  addPlinth(put,12,8);
+  const corps=put(box(12,6,8,0x847661,0,3+0.3,0)); corps.material.map=texBrick(); addOutline(corps);
+  addCornice(put,12,8,6.45);
+  const roof=createRoof('pitched',13.6,9.6,0x46393b); roof.position.set(0,6.6,0); put(roof);
+  addRidge(put,13.2,8.7);
+  const dor=createDormer(); dor.position.set(-2.5,6.9,2.6); put(dor);     // lucarne côté rue
+  const wing=put(box(5,4,6,0x7d705a,8,2.3,0.5)); wing.material.map=texBrick(); addOutline(wing);
+  const wroof=createRoof('pitched',5.6,6.6,0x3f3335); wroof.position.set(8,4.3,0.5); put(wroof);
+  const ch=createSmokeStack(9.4,COL.charbon); ch.position.set(-3.6,0,-3); put(ch);
+  addChimneyCap(put,-3.6,9.5,-3);
+  put(createDoor()).position.set(-1.5,0.55,4.1); put(createDoor()).position.set(1.5,0.55,4.1);
+  addAwning(put,4.6,0,3.4,4.1);                                            // auvent au-dessus des portes
+  for(let i=0;i<3;i++){ const w=createShutterWindow(0.9,1.0); w.position.set(-3.5+i*3.5,4.6,4.22); put(w); }
+  for(let i=0;i<4;i++){ const w=createWindow(0.7,0.7); w.position.set(-4.2+i*2.8,2.2,4.18); put(w); }  // rez-de-chaussée
+  const cl=createFenceSegment(6); cl.position.set(-8,0,2); cl.rotation.y=Math.PI/2; put(cl);
+  const sign=createPriceBoard('⚒'); sign.position.set(5.2,0,4.6); put(sign);
+}
+function buildPlantStage3(g,put){           // la grande industrie : machines, sheds, deux cheminées
+  addPlinth(put,15,11,0.7);
+  const main=put(box(15,8,11,0x5a4f3f,0,4+0.35,0)); main.material.map=texBrick(); addOutline(main);
+  // pilastres de brique : le rythme vertical de l'usine du XIXe
+  for(let i=0;i<4;i++){ const pil=put(box(0.55,8,0.3,0x4e4436,-5.6+i*3.7,4.35,5.62,false)); pil.material.map=texBrick(); }
+  addCornice(put,15,11,8.6);
+  const wing=put(box(7,5,8,0x554a3b,9,2.85,1)); wing.material.map=texBrick(); addOutline(wing);
+  const wc=addCornice(put,7,8,5.5); wc.position.x=9; wc.position.z=1;   // corniche de l'aile
+  const roof=createRoof('sawtooth',15,11,0x6b5f4b); roof.position.set(0,8.7,0); put(roof);
+  // verrières des sheds : vitres émissives — l'usine luit la nuit
+  for(let i=0;i<3;i++){ const vw=createWindow(3.6,0.8); vw.position.set(-4.5+i*4.5,9.6,-1.5);
+    vw.rotation.x=-0.55; put(vw); }
+  const stack=put(box(2.2,14,2.2,COL.charbon,-5,11,-3)); stack.material.map=texBrick();
+  put(box(2.7,0.7,2.7,0x2a241d,-5,18,-3,false));
+  const smoke=new THREE.Mesh(new THREE.SphereGeometry(0.9,8,8),
+    new THREE.MeshStandardMaterial({color:0x8a8275,transparent:true,opacity:.3,flatShading:true}));
+  smoke.position.set(-5,18.8,-3); smoke.userData.chimney=true; put(smoke);   // v63 : émetteur de bouffées
+  put(box(1.4,9,1.4,COL.charbon,11,4.5,-3));
+  const sm2=new THREE.Mesh(new THREE.SphereGeometry(0.7,8,8),
+    new THREE.MeshStandardMaterial({color:0x8a8275,transparent:true,opacity:.3,flatShading:true}));
+  sm2.position.set(11,9.8,-3); sm2.userData.chimney=true; put(sm2);
+  const pipe=createFactoryPipe(7); pipe.position.set(0,0,6.2); put(pipe);
+  const gA=createGear(1.4); gA.position.set(-6,3,6.3); put(gA);
+  const gB=createGear(1.0); gB.position.set(-3.4,2,6.5); put(gB);
+  put(box(3.2,4.2,0.3,0x2a221a,-3,2.1,5.55,false)); put(box(3.2,4.2,0.3,0x241d16,3,2.1,5.55,false));
+  for(let i=0;i<5;i++){ const w=createWindow(0.9,1.1); w.position.set(-6+i*3,5.8,5.55); put(w); }
+}
+const PLANT_BUILDERS={1:buildPlantStage1,2:buildPlantStage2,3:buildPlantStage3};
+
+/* La zone Usine du joueur : seulement la COUR (quai, machine extérieure, enseigne P).
+   Le bâtiment vient de refreshPlayerPlant, selon l'âge — comme chez les concurrents. */
+function buildUsine(g){
+  const dock=createDock(8,4,0.7); dock.position.set(-9,0,4); g.add(dock);
+  g.add(box(2,2,3,COL.fer,-9,1,4,false));
+  const sp=createSign('P'); sp.scale.set(2.2,2.2,1); sp.position.set(0,9.8,5.6); g.add(sp);
+}
+/* v53 — le bâtiment du joueur suit SON âge (atelier -> manufacture -> grande industrie) */
+function refreshPlayerPlant(){
+  const g=zoneGroups['Usine']; if(!g) return;
+  clearLayer(g,'plant');
+  if(!state.buildings || state.buildings.atelier<=0) return;       // terrain vide avant la fondation
+  const st=Math.min(3,Math.max(1,state.age||1));
+  const put=m=>{ tagLayer(m,'plant'); g.add(m); return m; };
+  PLANT_BUILDERS[st](g,put);
+  g._plantStage=st;
+}
+function buildMarche(g){
+  g.add(box(15,0.5,15,0xb6a982,0,0.25,0,false));                  // place pavée
+  const stall=(x,z,c)=>{ const s=createMarketStall(c); s.position.set(x,0,z); g.add(s); };
+  stall(-4,-2,COL.rouge); stall(4,-2,COL.bleu); stall(0,4,COL.vert);
+  const pb1=createPriceBoard('£'); pb1.position.set(-6,0,4.5); g.add(pb1);
+  const pb2=createPriceBoard('£'); pb2.position.set(6,0,4.5); pb2.rotation.y=0.3; g.add(pb2);
+  for(let i=0;i<3;i++){ const c=createCrate(1.1,i%2?0x8a6b49:0x9a7a55); c.position.set(-5+i*1.4,0,-5); g.add(c); }
+  const sp=createSign("A'"); sp.scale.set(2.6,1.7,1); sp.position.set(0,5.6,0); g.add(sp);
+}
+function buildEntrepot(g){
+  const hall=box(15,9,11,0x6b513a,0,4.5,0); hall.material.map=texBrick(); g.add(hall); addOutline(hall);
+  const roof=createRoof('pitched',15,11,0x4a3f33); roof.position.set(0,9,0); g.add(roof);
+  g.add(box(3,5.5,0.3,0x2a221a,-2,2.75,5.6,false)); g.add(box(3,5.5,0.3,0x241d16,2,2.75,5.6,false)); // double porte
+  g.add(box(7,0.4,0.5,COL.fer,0,5.6,5.7,false));
+  const aw=createAwning(8,COL.brun); aw.position.set(0,5.9,6.4); g.add(aw);
+  const dock=createDock(13,5,0.7); dock.position.set(0,0,8.6); g.add(dock);
+  const stk=createCrateStack(); stk.position.set(-9,0,3); g.add(stk);
+  const sp=createSign("M'"); sp.scale.set(2.4,1.6,1); sp.position.set(0,8.2,5.6); g.add(sp);
+}
+function buildQuartier(g){
+  const rows=[[-6,-3],[-2,-3],[2,-3],[-6,1],[-2,1],[2,1],[5,-1]];
+  rows.forEach((p,i)=>{ const h=createWorkerHouse(2.8+(i%3)*0.5, i%2?COL.froid:0x5f6d79);
+    h.position.set(p[0],0,p[1]); h.rotation.y=(i%2)*0.1; g.add(h); });
+  const rope=createRopeLine(5); rope.position.set(-1,0,4); g.add(rope);
+  const lamp=createLampPost(); lamp.position.set(6,0,3); g.add(lamp);
+  g.add(box(2.4,0.4,0.7,0x5a4530,-5,0.4,4,false));     // banc
+}
+function buildMarcheMP(g){            // moyens de production : halle, matières, machines
+  const hall=box(16,5.5,9,0x6e5c44,0,2.75,-1); hall.material.map=texBrick(); g.add(hall); addOutline(hall);
+  const roof=createRoof('pitched',16,9,0x4a3f33); roof.position.set(0,5.5,-1); g.add(roof);
+  g.add(box(4,4.2,0.3,0x2a221a,0,2.1,3.4,false));       // grande ouverture
+  const coal=createCoalPile(); coal.position.set(6,0,5); g.add(coal);
+  for(let i=0;i<3;i++){ const s=createSack(i%2?0xc9b78c:0xbfa97e); s.position.set(-7+i*1.2,0,5); g.add(s); }
+  const fer=createCrate(1.4,0x8a8076); fer.position.set(-7,0,3); g.add(fer);
+  const pulley=createPulley(); pulley.position.set(4,4,4); g.add(pulley);
+  const cart=createSmallCart(); cart.position.set(0,0,6); g.add(cart);
+  const sp=createSign('M'); sp.scale.set(2.1,1.6,1); sp.position.set(0,5.4,3.4); g.add(sp);
+}
+function buildMarcheTravail(g){       // place sociale : bureau d'embauche + file d'ouvriers
+  const office=box(6,4,4,0x6c7d8c,-3,2,-2); office.material.map=texBrick(); g.add(office); addOutline(office);
+  const roof=createRoof('pitched',6,4,0x46393b); roof.position.set(-3,4,-2); g.add(roof);
+  const dr=createDoor(1.4,2.4,0x281f17); dr.position.set(-3,0,0.05); g.add(dr);
+  const sp=createSign('Ft'); sp.scale.set(2.2,1.5,1); sp.position.set(-3,5.2,0); g.add(sp);
+  g.add(box(3.4,0.4,0.7,0x5a4530,2,0.4,-3,false));      // banc
+  const wk=(x,z,pose)=>{ const w=createWorkerFigure({pose}); w.position.set(x,0,z); w.rotation.y=Math.random()*0.6-0.3; g.add(w); };
+  wk(2,1,'idle'); wk(3.3,2.1,'slump'); wk(1.4,3,'idle');
+}
+function buildEtat(g){                // institution froide : fronton, sceau, tampon, décret
+  const body=box(13,9,9,0x8d9183,0,4.5,0); body.material.map=texBrick(); g.add(body); addOutline(body);
+  for(let i=0;i<5;i++){ const c=createColumn(6.5,0.45); c.position.set(-4.8+i*2.4,1,4.4); g.add(c); }
+  const ped=new THREE.Mesh(new THREE.ConeGeometry(8,2.6,3),stdMat(0x76796b));
+  ped.position.set(0,10.6,3); ped.rotation.y=Math.PI/2; ped.scale.set(1,1,0.42); g.add(ped);
+  g.add(box(14,0.9,9.5,0x6f7363,0,9.4,0,false));
+  const seal=cyl(1.1,1.1,0.3,COL.or,16); seal.rotation.x=Math.PI/2; seal.position.set(-2,6,4.7); g.add(seal);
+  g.add(box(1.3,1.3,0.12,COL.rouge,2.5,6,4.7,false));   // tampon rouge
+  g.add(box(0.16,5,0.16,0x2a241d,6,2.5,4,false)); g.add(box(2.2,1.3,0.08,COL.rouge,7.1,4.4,4,false)); // drapeau
+  const fence=createFenceSegment(7); fence.position.set(0,0,7); g.add(fence);
+  const sp=createSign('ÉTAT'); sp.scale.set(3,1.4,1); sp.position.set(0,8.3,4.7); g.add(sp);
+}
+function buildTerresCommunes(g){      // champs ouverts puis clôturés (enclosure)
+  for(let i=-1;i<=1;i++) g.add(box(7,0.3,7,0x77833f + i*0,i*8,0.15,0,false));
+  // clôtures : posts + rails (la séparation des producteurs et des moyens)
+  const fence=(x0,z0,x1,z1)=>{ const n=6;
+    for(let i=0;i<=n;i++){ const x=x0+(x1-x0)*i/n, z=z0+(z1-z0)*i/n; g.add(box(0.25,1.6,0.25,0x6b5436,x,0.8,z)); }
+    const dx=x1-x0,dz=z1-z0,len=Math.hypot(dx,dz);
+    const rail=box(len,0.2,0.15,0x6b5436,(x0+x1)/2,1.2,(z0+z1)/2,false);
+    rail.rotation.y=Math.atan2(dx,dz)-Math.PI/2; g.add(rail); };
+  fence(-9,-9,9,-9); fence(9,-9,9,9);
+}
+function buildMines(g){               // mine + wagons sur rail
+  const mound=new THREE.Mesh(new THREE.ConeGeometry(6,5,8),
+    new THREE.MeshStandardMaterial({color:0x6f5d44,flatShading:true})); mound.position.set(0,2.5,-2); g.add(mound);
+  g.add(box(3,3,2,COL.charbon,0,1.5,2));                 // entrée de mine sombre
+  // rail + wagons
+  g.add(box(12,0.2,0.4,0x4a4236,0,0.2,5,false)); g.add(box(12,0.2,0.4,0x4a4236,0,0.2,6.2,false));
+  const wagon=(x)=>{ g.add(box(2,1.4,1.6,0x3f3930,x,1,5.6));
+    g.add(box(2.1,0.6,1.7,COL.charbon,x,1.9,5.6)); };
+  wagon(-3);wagon(0);
+  const ore=new THREE.Mesh(new THREE.ConeGeometry(1.6,1.6,7),
+    new THREE.MeshStandardMaterial({color:0x5a4a36,flatShading:true})); ore.position.set(5,0.8,-1); g.add(ore);
+}
+function buildPort(g){                // marché mondial : eau, quai, bateau, containers
+  const water=new THREE.Mesh(new THREE.PlaneGeometry(34,22),
+    new THREE.MeshStandardMaterial({color:0x3c5566,transparent:true,opacity:.82,roughness:.4}));
+  water.rotation.x=-Math.PI/2; water.position.set(2,0.05,8); g.add(water);
+  g.add(box(20,0.8,7,0x7a6648,-2,0.4,-5,false));         // quai
+  // bateau stylisé
+  g.add(box(8,2.4,3,0x5a4636,3,1.4,9));
+  const mast=box(0.3,7,0.3,0x4a3c2c,3,5,9); g.add(mast);
+  const sail=box(0.2,3.4,2.6,0xcdbd9a,3.2,5.5,9); g.add(sail);
+  // containers (commerce extérieur)
+  g.add(box(2.4,2,2.2,COL.rouge,-7,1,-5)); g.add(box(2.4,2,2.2,COL.bleu,-7,3,-5));
+  g.add(box(2.4,2,2.2,COL.or,-4,1,-5));
+}
+function buildBourse(g){              // capital fictif : tour abstraite, chiffres, bulles dorées
+  const tower=box(9,13,8,0x4a4a52,0,6.5,0); tower.material.map=texMetal(); g.add(tower); addOutline(tower);
+  for(let i=0;i<3;i++){ const c=createColumn(7,0.4); c.position.set(-3+i*3,0,4); g.add(c); }
+  g.add(box(10,1,9,0x2c2c33,0,13.2,0,false));
+  g.add(box(6,3.2,0.3,0x20242a,0,9,4.2,false));         // panneau de chiffres
+  for(let i=0;i<5;i++) g.add(box(0.5,0.5+i*0.5,0.4,0x9ad17a,-2.2+i,8.2+i*0.25,4.4,false)); // courbe
+  for(let i=0;i<3;i++){ const b=new THREE.Mesh(new THREE.SphereGeometry(0.8+i*0.4,12,12),
+    new THREE.MeshStandardMaterial({color:COL.or,transparent:true,opacity:.7,flatShading:true}));
+    b.position.set(-3+i*3,11+i,3); b.userData.bubble=i; g.add(b); }
+  const sp=createSign('BOURSE'); sp.scale.set(3,1.3,1); sp.position.set(0,12.2,4.3); g.add(sp);
+}
+
+/* v61 — LA GRAND-RUE DÉTAILLÉE. Elle existe avant le capital, et se lit comme
+   une vraie rue du XIXe : chaussée PAVÉE (texture générée), caniveau central,
+   double ORNIÈRE de chariots, TROTTOIRS surélevés à bordures d'encre et joints
+   de dalles, PASSAGES pavés vers chaque institution (nord) et chaque parcelle
+   (sud), BORNES de pierre régulières, flaques sombres. Quasi que des plans :
+   coût de rendu négligeable. */
+function createCobbleTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=256; const x=c.getContext('2d');
+  x.fillStyle='#9a8d6e'; x.fillRect(0,0,256,256);   // v66 : pierre plus sombre
+  let row=0;
+  for(let y=0;y<256;y+=22){ row++;
+    for(let px=(row%2?0:16);px<256+32;px+=32){
+      const w=26+Math.random()*5, h=17+Math.random()*4;
+      x.fillStyle=['#94886a','#a09272','#8a7e62','#9c8f70'][Math.floor(Math.random()*4)];
+      x.beginPath();
+      if(x.roundRect) x.roundRect(px-w/2,y+2,w,h,4); else x.rect(px-w/2,y+2,w,h);
+      x.fill();
+      x.strokeStyle='rgba(36,31,23,0.22)'; x.lineWidth=1.4; x.stroke();
+    } }
+  const tex=new THREE.CanvasTexture(c);
+  tex.wrapS=tex.wrapT=THREE.RepeatWrapping; tex.anisotropy=4;
+  return tex;
+}
+/* v56 — le littoral est : bande d'eau, lignes de houle à l'encre, bateaux à quai.
+   C'est de la géographie (toujours visible), pas du décor d'époque. */
+let _boats=[];
+function buildWaterEast(){
+  const water=new THREE.Mesh(new THREE.PlaneGeometry(10,240),
+    new THREE.MeshStandardMaterial({color:0x5d6d7a,roughness:.85}));
+  water.rotation.x=-Math.PI/2; water.position.set(115.5,0.012,0); scene.add(water);
+  for(let i=0;i<7;i++){ const wl=new THREE.Mesh(new THREE.PlaneGeometry(5+Math.random()*3,0.28),
+      new THREE.MeshBasicMaterial({color:0xdfd5bb,transparent:true,opacity:.55}));
+    wl.rotation.x=-Math.PI/2; wl.position.set(114+Math.random()*4,0.018,-100+i*33+Math.random()*10); scene.add(wl); }
+  // berge : liseré
+  const berge=new THREE.Mesh(new THREE.PlaneGeometry(0.7,240),
+    new THREE.MeshBasicMaterial({color:0x241f17,transparent:true,opacity:.55}));
+  berge.rotation.x=-Math.PI/2; berge.position.set(110.7,0.02,0); scene.add(berge);
+  // deux bateaux à quai près du port (tangage doux via WorldBeauty)
+  for(const [bx,bz,r] of [[114,-8,0.4],[114.5,14,-0.5]]){
+    const b=createBoat(); b.position.set(bx,0,bz); b.rotation.y=r; scene.add(b); _boats.push(b); }
+  // on ne conduit pas sur l'eau : barrière invisible le long de la berge
+  for(let z=-116;z<=116;z+=11) obstacles.push({pos:new THREE.Vector2(111.5,z),radius:6});
+}
+function buildMainStreet(){
+  const x0=-112, x1=104, w=15, cx=(x0+x1)/2, L=x1-x0;
+  // — chaussée pavée
+  const tex=createCobbleTexture(); tex.repeat.set(L/13,w/13);
+  const road=new THREE.Mesh(new THREE.PlaneGeometry(L,w),
+    new THREE.MeshStandardMaterial({color:0xa89c80,map:tex,roughness:0.92}));  // v66 : plus sombre, à peine satinée
+  road.rotation.x=-Math.PI/2; road.position.set(cx,0.015,0); road.receiveShadow=true; scene.add(road);
+  const flat=(W,D,xp,zp,color,op,y)=>{ const m=new THREE.Mesh(new THREE.PlaneGeometry(W,D),
+      new THREE.MeshBasicMaterial({color,transparent:true,opacity:op,depthWrite:false}));
+    m.rotation.x=-Math.PI/2; m.position.set(xp,y||0.02,zp); scene.add(m); return m; };
+  // — caniveau central + ornières de roues
+  flat(L,0.5,cx,0,0x241f17,0.30);
+  flat(L,0.9,cx, 2.4,0x241f17,0.14);
+  flat(L,0.9,cx,-2.4,0x241f17,0.14);
+  // — trottoirs surélevés, bordures, joints de dalles
+  for(const sgn of [-1,1]){
+    const tw=3.0, tz=sgn*(w/2+tw/2);
+    const trot=new THREE.Mesh(new THREE.BoxGeometry(L,0.22,tw),
+      new THREE.MeshStandardMaterial({color:0xd4c49c,roughness:1}));
+    trot.position.set(cx,0.11,tz); trot.receiveShadow=true; scene.add(trot);
+    flat(L,0.4,cx,sgn*w/2,0x241f17,0.55,0.24);
+    flat(L,0.25,cx,sgn*(w/2+tw),0x241f17,0.35,0.24);
+    for(let jx=x0+4;jx<x1;jx+=8) flat(0.18,tw,jx,tz,0x241f17,0.18,0.23);
+  }
+  // — passages pavés clairs vers les institutions (nord) et les parcelles (sud)
+  const acces=[[-105,-1],[-72,-1],[-40,-1],[-8,-1],[55,-1],
+               [-60,1],[-15,1],[18,1],[52,1],[86,1],[0,1]];
+  for(const [ax,sgn] of acces){
+    flat(6,9,ax,sgn*(w/2+4.5),0xd8c8a0,0.55,0.022);
+    for(let i=0;i<4;i++) flat(6,0.14,ax,sgn*(w/2+1.5+i*2.1),0x241f17,0.20,0.024);
+  }
+  // — bornes de pierre le long des trottoirs
+  for(let bx=x0+8;bx<x1-4;bx+=24){
+    for(const sgn of [-1,1]){
+      const borne=new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.42,0.85,8),
+        new THREE.MeshStandardMaterial({color:0x9a9183,roughness:1,flatShading:true}));
+      borne.position.set(bx+(sgn>0?5:0),0.53,sgn*(w/2+2.6)); borne.castShadow=true; scene.add(borne);
+    } }
+  // — flaques sombres éparses
+  for(let i=0;i<6;i++){
+    const fx=x0+14+Math.random()*(L-28), fz=(Math.random()*2-1)*4.6;
+    const fl=flat(2.2+Math.random()*2.4,1.1+Math.random()*1.1,fx,fz,0x4a4e52,0.16,0.018);
+    fl.rotation.z=Math.random()*3;
+  }
+}
+/* v61 — drawCircuitLine supprimée : le tube doré permanent encombrait la lecture. */
+
+/* ===================================================================
+   Vehicle  —  chariot industriel, physique arcade (pas de Rapier ici)
+   =================================================================== */
+const Vehicle = {
+  group:null, cargoGroups:null, puff:null, wheels:[],
+  pos:new THREE.Vector3(-95,0,2), heading:Math.PI/2, speed:0,   // v52 : on arrive de la campagne, par la rue
+  build(){
+    const g=new THREE.Group();
+    // --- plateforme / châssis ---
+    g.add(box(3.2,0.3,4.8,COL.encre,0,0.45,0,false));     // dessous de châssis
+    const plateau=box(3,0.5,4.6,0x3a332a,0,0.78,0); addOutline(plateau); g.add(plateau);              // plateau
+    // ridelles autour du plateau
+    g.add(box(3,0.7,0.18,COL.brun,0,1.35,-2.2));          // ridelle avant
+    g.add(box(0.18,0.7,4.4,COL.brun,-1.5,1.35,0));        // ridelle gauche
+    g.add(box(0.18,0.7,4.4,COL.brun,1.5,1.35,0));         // ridelle droite
+    // bloc moteur + conduite à l'arrière (chariot "industriel motorisé")
+    g.add(box(2.4,1.1,1.2,0x2f2a22,0,1.45,2.1));          // bloc moteur
+    g.add(box(0.9,1.5,0.4,0x1f1b15,0,2.1,2.55));          // colonne de direction
+    g.add(box(0.4,1.5,0.4,0x33302a,0.85,2.1,2.5));        // cheminée d'échappement
+    this.puff=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,8),
+      new THREE.MeshStandardMaterial({color:0x8a8275,transparent:true,opacity:.3,flatShading:true}));
+    this.puff.position.set(0.85,3.05,2.5); g.add(this.puff);
+    // v62 — lanterne d'avant : potence + verre émissif + halo lumineux projeté au sol (la nuit)
+    g.add(box(0.1,0.9,0.1,0x2a241c,0,1.7,-2.35,false));
+    const verre=new THREE.Mesh(new THREE.BoxGeometry(0.34,0.42,0.34),
+      new THREE.MeshStandardMaterial({color:0x6b5530,emissive:0xffc878,emissiveIntensity:0,flatShading:true}));
+    verre.position.set(0,2.2,-2.35); g.add(verre); this.lampGlass=verre;
+    const haloTex=(()=>{ const c=document.createElement('canvas'); c.width=c.height=128;
+      const x=c.getContext('2d'); const gr=x.createRadialGradient(64,72,4,64,72,60);
+      gr.addColorStop(0,'rgba(255,206,128,0.55)'); gr.addColorStop(1,'rgba(255,206,128,0)');
+      x.fillStyle=gr; x.fillRect(0,0,128,128); return new THREE.CanvasTexture(c); })();
+    this.lampPool=new THREE.Mesh(new THREE.PlaneGeometry(7,9),
+      new THREE.MeshBasicMaterial({map:haloTex,transparent:true,opacity:0,depthWrite:false}));
+    this.lampPool.rotation.x=-Math.PI/2; this.lampPool.position.set(0,0.03,-5.2); g.add(this.lampPool);
+    // v63 — le conducteur : assis devant la colonne de direction (jambes dans le châssis),
+    // casquette d'origine, mains "au levier". C'est lui qui rend le chariot vivant.
+    const drv=createWorkerFigure({color:0x8a3b2a, scale:0.92, cap:0x241f17});
+    drv.position.set(0,0.42,1.55); drv.rotation.y=Math.PI;
+    if(drv.userData.armR) drv.userData.armR.rotation.x=-0.9;       // bras tendu vers la commande
+    if(drv.userData.armL) drv.userData.armL.rotation.x=-0.5;
+    g.add(drv); this.driver=drv;
+
+    // --- les trois cargaisons (une seule visible à la fois) ---
+    const bY=1.1, bZ=-0.3;
+    const argent=new THREE.Group();
+    const ingot=(x,z)=>argent.add(box(0.95,0.34,0.62,COL.or,x,bY+0.17,bZ+z));
+    ingot(-0.5,-0.5);ingot(0.5,-0.5);ingot(0,0.35);
+    argent.add(box(0.95,0.34,0.62,0xc9a85e,0,0.17+bY+0.34,bZ-0.5)); // lingot empilé
+    [[-0.55,0.7],[0.6,0.6]].forEach(([x,z])=>{ const s=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,6),
+      new THREE.MeshStandardMaterial({color:0xb9a06a,flatShading:true}));
+      s.scale.set(1,0.85,1); s.position.set(x,bY+0.42,bZ+z); argent.add(s); });   // sacs
+
+    const moyens=new THREE.Group();
+    const coal=new THREE.Mesh(new THREE.ConeGeometry(0.95,1.05,7),
+      new THREE.MeshStandardMaterial({color:COL.charbon,flatShading:true}));
+    coal.position.set(-0.55,bY+0.5,bZ-0.4); moyens.add(coal);                     // charbon
+    moyens.add(box(0.95,0.95,0.95,0x8a6b49,0.6,bY+0.48,bZ-0.3));                   // caisse matière
+    moyens.add(box(0.95,0.9,0.95,0xcdbd9a,0.5,bY+0.45,bZ+0.8));                    // balle de coton
+    moyens.add(box(0.85,0.8,0.85,0x8a8076,-0.6,bY+0.4,bZ+0.85));                   // fer
+
+    const march=new THREE.Group();
+    const crate=(x,z,y)=>{ march.add(box(0.88,0.86,0.88,0x9a5a3e,x,bY+0.43+y,bZ+z));
+      march.add(box(0.9,0.13,0.9,0x7a4530,x,bY+0.85+y,bZ+z,false)); };            // caisses + cerclage
+    crate(-0.5,-0.45,0);crate(0.5,-0.45,0);crate(-0.5,0.5,0);crate(0.5,0.5,0);crate(0,0.02,0.95);
+    this.cargoGroups={argent,moyens,marchandises:march};
+    Object.values(this.cargoGroups).forEach(grp=>g.add(grp));
+
+    // --- roues : jante + moyeu + rayons, grandes à l'arrière ---
+    const wmat=new THREE.MeshStandardMaterial({color:0x201c16,flatShading:true});
+    const hubMat=new THREE.MeshStandardMaterial({color:COL.fer,metalness:.4,roughness:.5,flatShading:true});
+    const addWheel=(x,z,r)=>{ const tire=new THREE.Mesh(new THREE.CylinderGeometry(r,r,0.4,16),wmat);
+      const hub=new THREE.Mesh(new THREE.CylinderGeometry(r*0.34,r*0.34,0.46,12),hubMat); tire.add(hub);
+      for(let i=0;i<4;i++){ const sp=box(r*1.7,0.09,0.12,0x3a342a,0,0,0,false); sp.rotation.y=i*Math.PI/4; tire.add(sp); }
+      tire.rotation.z=Math.PI/2; tire.position.set(x,r,z); g.add(tire); this.wheels.push(tire); };
+    addWheel(-1.6,1.7,0.8); addWheel(1.6,1.7,0.8);        // arrière
+    addWheel(-1.45,-1.7,0.54); addWheel(1.45,-1.7,0.54);  // avant
+    // essieux + garde-boue
+    for(const z of[1.7,-1.7]){ const ax=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,3.4,8),hubMat); ax.rotation.z=Math.PI/2; ax.position.set(0,z>0?0.8:0.54,z); g.add(ax); }
+    for(const x of[-1.6,1.6]) g.add(box(1.5,0.18,0.5,0x2f2a22,x,1.55,1.7,false));   // garde-boue arrière
+
+    // lanterne avant (le capital éclaire sa propre route)
+    this.lantern=new THREE.Mesh(new THREE.SphereGeometry(0.34,10,10),
+      new THREE.MeshStandardMaterial({color:0xffdf9a,emissive:0xffb347,emissiveIntensity:.9,flatShading:true}));
+    this.lantern.position.set(0,1.7,-2.35); g.add(this.lantern);
+    g.add(box(0.22,0.5,0.22,COL.fer,0,1.35,-2.35,false));   // potence de lanterne
+    // halo au sol : or (argent transporté) / rouge (crise, dette)
+    this.glow=new THREE.Mesh(new THREE.RingGeometry(2.0,3.6,28),
+      new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:.0,side:THREE.DoubleSide,depthWrite:false}));
+    this.glow.rotation.x=-Math.PI/2; this.glow.position.y=0.12; g.add(this.glow);
+
+    // emblème du capital (£) sur le flanc
+    const plaque=makeLabel('£'); plaque.scale.set(2.1,1.05,1); plaque.position.set(0,2.7,0.4); g.add(plaque);
+    // poussière au sol (pool)
+    this.dust=[]; this._dustT=0;
+    for(let i=0;i<6;i++){ const d=new THREE.Mesh(new THREE.SphereGeometry(0.42,6,6),
+      new THREE.MeshStandardMaterial({color:0xb9ad90,transparent:true,opacity:0,flatShading:true}));
+      d.visible=false; scene.add(d); this.dust.push({obj:d,life:0}); }
+
+    g.traverse(o=>{if(o.isMesh)o.castShadow=true;});
+    this.group=g; scene.add(g);
+    this.reset();
+  },
+  reset(){ this.pos.set(-95,0,2); this.heading=Math.PI/2; this.speed=0; },
+  update(dt,input){
+    const ACCEL=42, MAXF=26, MAXR=12, TURN=2.4;
+    if(input.fwd) this.speed+=ACCEL*dt;
+    if(input.back) this.speed-=ACCEL*dt;
+    if(!input.fwd && !input.back) this.speed*=Math.pow(0.12,dt); // frein moteur
+    this.speed=Math.max(-MAXR,Math.min(MAXF,this.speed));
+    const grip=Math.min(1,Math.abs(this.speed)/2.5);
+    if(input.left)  this.heading+=TURN*dt*grip*Math.sign(this.speed||1);
+    if(input.right) this.heading-=TURN*dt*grip*Math.sign(this.speed||1);
+
+    const nx=this.pos.x+Math.sin(this.heading)*this.speed*dt;
+    const nz=this.pos.z+Math.cos(this.heading)*this.speed*dt;
+    // collisions simples (cercles) + bornes
+    let blocked=false;
+    for(const o of obstacles){ if((nx-o.pos.x)**2+(nz-o.pos.z)**2 < (o.radius+1.6)**2){blocked=true;break;} }
+    if(!blocked && Math.abs(nx)<HALF-2 && Math.abs(nz)<HALF-2){ this.pos.x=nx; this.pos.z=nz; }
+    else this.speed*=-0.25;
+
+    // v63 — la caisse VIT : trépidation de pavés à la vitesse, roulis dans les
+    // virages, tangage à l'accélération/freinage. Pure cosmétique, zéro physique.
+    const vRatio=Math.min(1,Math.abs(this.speed)/9);
+    this.group.position.set(this.pos.x, 0.045*Math.sin(t*13)*vRatio, this.pos.z);
+    this.group.rotation.y=this.heading;
+    const lean=(input.left?1:input.right?-1:0)*grip*0.2;
+    this.group.rotation.z=THREE.MathUtils.lerp(this.group.rotation.z||0,lean,0.18);
+    const accel=(input.fwd?1:0)-(input.back?1:0);
+    this._pitch=THREE.MathUtils.lerp(this._pitch||0, -accel*0.05*grip, 0.12);
+    this.group.rotation.x=this._pitch;
+    if(this.driver) this.driver.rotation.z=-this.group.rotation.z*1.6;   // le conducteur compense le roulis
+    const spin=this.speed*dt*1.6; this.wheels.forEach(w=>w.rotation.x+=spin);
+    // afficher la cargaison correspondant à ce que transporte le capital
+    if(this.cargoGroups){ const cg=MiniCircuit.cargo;
+      for(const k in this.cargoGroups) this.cargoGroups[k].visible=(k===cg); }
+    // panache d'échappement selon la vitesse
+    if(this.puff){ const v=Math.abs(this.speed);
+      this.puff.material.opacity=0.18+Math.min(0.5,v/26);
+      this.puff.scale.setScalar(0.7+Math.min(0.9,v/18)); }
+    // identité réactive : or quand le capital est argent, rouge sous tension
+    const stress=Math.max((state.d&&state.d.declenche)?1:0,
+      Math.min(1,((state.d&&state.d.risqueCrise)||0)),
+      Math.min(1,(state.dette||0)/400));
+    if(this.glow){
+      const gold=MiniCircuit.cargo==='argent';
+      const pulse=0.5+0.5*Math.sin(t*3);
+      if(stress>0.35){ this.glow.material.color.setHex(COL.rouge);
+        this.glow.material.opacity=(0.18+0.30*stress)*pulse; }
+      else { this.glow.material.color.setHex(COL.or);
+        this.glow.material.opacity=(gold?0.30:0.10)*(0.6+0.4*pulse); }
+    }
+    if(this.lantern){ const stressed=stress>0.35;
+      this.lantern.material.emissive.setHex(stressed?0x8a2c1d:0xffb347);
+      this.lantern.material.emissiveIntensity=0.7+0.4*(0.5+0.5*Math.sin(t*4)); }
+    // traînée de poussière à vitesse + vibration moteur à l'arrêt
+    if(this.dust){ this._dustT-=dt;
+      if(Math.abs(this.speed)>8 && this._dustT<=0){ this._dustT=0.08;
+        const d=this.dust.find(x=>!x.obj.visible);
+        if(d){ d.obj.visible=true; d.life=0;
+          d.obj.position.set(this.pos.x-Math.sin(this.heading)*2.3,0.3,this.pos.z-Math.cos(this.heading)*2.3); } }
+      for(const d of this.dust){ if(!d.obj.visible) continue; d.life+=dt;
+        if(d.life>0.7){ d.obj.visible=false; continue; }
+        d.obj.position.y+=dt*1.2; d.obj.scale.setScalar(0.6+d.life*2.2);
+        d.obj.material.opacity=0.42*(1-d.life/0.7); } }
+    this.group.position.y = (Math.abs(this.speed)<0.4) ? Math.sin(t*38)*0.025 : 0;
+  }
+};
+
+/* ===================================================================
+   CameraController  —  caméra de poursuite
+   =================================================================== */
+const CameraController = {
+  update(){
+    if(typeof IntroCinematic!=='undefined' && IntroCinematic.active){ IntroCinematic.update(); return; }
+    if(typeof CycleCinematic!=='undefined' && CycleCinematic.active){ CycleCinematic.update(); return; }
+    const v=Vehicle;
+    const sp=Math.min(1,Math.abs(v.speed)/26);
+    const back=22+sp*5.5, up=13.2+sp*2.0;   // v59c : ~11° de ciel à l'écran
+    const dx=Math.sin(v.heading), dz=Math.cos(v.heading);
+    const desired=new THREE.Vector3(v.pos.x-dx*back, up, v.pos.z-dz*back);
+    camera.position.lerp(desired,0.07);
+    camera.lookAt(v.pos.x+dx*6, 5.2, v.pos.z+dz*6);
+  }
+};
+
+/* ===================================================================
+   Input  —  clavier (flèches + ZQSD/WASD)
+   =================================================================== */
+const Input={fwd:false,back:false,left:false,right:false};
+const KEYMAP={
+  ArrowUp:'fwd', KeyW:'fwd', KeyZ:'fwd',
+  ArrowDown:'back', KeyS:'back',
+  ArrowLeft:'left', KeyA:'left', KeyQ:'left',
+  ArrowRight:'right', KeyD:'right',
+};
+addEventListener('keydown',e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=true;e.preventDefault();}
+  if(e.code==='KeyR'){Vehicle.reset();}
+  if(e.code==='KeyV'){ if(voileUnlocked) toggleMarx(); }
+  if(e.code==='KeyL'){ VISUAL_LIFE=!VISUAL_LIFE; pushLog('Affichage','Vie visuelle : '+(VISUAL_LIFE?'complète':'réduite (performance)')+'.','plain'); }
+  if(e.code==='KeyK'){ GRAPHICS_QUALITY=(GRAPHICS_QUALITY==='low'?'medium':GRAPHICS_QUALITY==='medium'?'high':'low');
+    pushLog('Affichage','Qualité graphique : '+GRAPHICS_QUALITY+'.','plain'); }
+  if(e.code==='KeyJ'){ DETAIL_LEVEL=(DETAIL_LEVEL==='low'?'medium':DETAIL_LEVEL==='medium'?'high':'low');
+    pushLog('Affichage','Densité du décor : '+DETAIL_LEVEL+' (recharge la page pour l’appliquer pleinement).','plain'); }
+  if(e.code==='KeyH'){ toggleSettingsPanel(); }
+  if(e.code==='KeyB'){ AmbientSound.start(); AmbientSound.toggle(); }
+  if(e.code==='KeyE'){ e.preventDefault(); if(currentZone) interactZone(currentZone); }
+  if(e.code==='Backquote'){ e.preventDefault(); setQA(!QA_MODE); }
+});
+addEventListener('keyup',  e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=false;e.preventDefault();} });
+function toggleSettingsPanel(force){
+  const h=document.getElementById('help'); if(!h) return;
+  h.classList.toggle('open', force===undefined ? !h.classList.contains('open') : !!force);
+}
+const settingsToggle=document.getElementById('settings-toggle');
+if(settingsToggle){
+  settingsToggle.setAttribute('type','button');
+  settingsToggle.addEventListener('pointerdown',e=>{ e.stopPropagation(); });
+  settingsToggle.addEventListener('click',e=>{ e.preventDefault(); e.stopPropagation(); toggleSettingsPanel(); });
+}
+
+/* ===================================================================
+   HUD + interaction de zone
+   =================================================================== */
+function fmtMoney(x){return Math.round(x).toLocaleString('fr-FR')+' £';}
+/* v47 — HUD hiérarchisé : 7 variables structurantes toujours visibles.
+   Chaque ligne montre la valeur (colorée selon un seuil ok/ambre/rouge)
+   et le delta du dernier cycle (▲/▼). Le joueur lit l'état du système
+   d'un coup d'œil, sans ouvrir de panneau. */
+const HUDTrack={prev:null};
+function hudDelta(id,val,inverse){ // inverse=true : une hausse est "mauvaise" (dette, stocks, chômage…)
+  const el=document.getElementById(id); if(!el) return;
+  if(!HUDTrack.prev){ el.textContent=''; return; }
+  const pv=HUDTrack.prev[id];
+  if(pv==null||!isFinite(pv)){ el.textContent=''; return; }
+  const dv=val-pv;
+  if(Math.abs(dv)<0.004){ el.textContent=''; el.className='delta'; return; }
+  const good=inverse? dv<0 : dv>0;
+  el.className='delta '+(good?'up':'dn');
+  el.textContent=(dv>0?'▲':'▼');
+}
+function hudLevel(id,ratio){ // ratio 0..1 : <0.5 ok, <0.75 ambre, sinon rouge
+  const el=document.getElementById(id); if(!el) return;
+  el.classList.remove('warnv','dangerv');
+  if(ratio>=0.75) el.classList.add('dangerv');
+  else if(ratio>=0.5) el.classList.add('warnv');
+}
+function updateHUD(){
+  const m=MiniCircuit;
+  const o=objectifCourant();
+  if(gamePhase==='precapital'){
+    // Phase 0-1 : entrée sensible — un seul chiffre, presque pas de texte
+    set('h-argent',fmtMoney(m.argent)+' · dormant');
+    set('h-obj','créer les conditions');
+    ['h-dette','h-profit','h-stocks','h-chomage','h-colere','h-risque'].forEach(id=>set(id,'—'));
+    ['d-argent','d-dette','d-profit','d-stocks','d-chomage','d-colere','d-risque'].forEach(id=>{const e=document.getElementById(id); if(e) e.textContent='';});
+    return;
+  }
+  const d=state.d||{};
+  const profit=Math.round(d.resultatNet!=null?d.resultatNet:(d.profitRealise||0));
+  const vals={ 'd-argent':state.argent, 'd-dette':state.dette, 'd-profit':profit,
+    'd-stocks':state.stocks, 'd-chomage':state.chomage, 'd-colere':state.colere,
+    'd-risque':(d.risqueCrise||0) };
+  set('h-argent',fmtMoney(m.argent));
+  set('h-dette',fmtMoney(state.dette||0));
+  set('h-profit',(profit>=0?'+':'−')+fmtMoney(Math.abs(profit)));
+  set('h-stocks',Math.round(state.stocks)+' u.');
+  set('h-chomage',Math.round(state.chomage*100)+' %');
+  set('h-colere',Math.round(m.colere*100)+' %');
+  set('h-risque',Math.round((d.risqueCrise||0)*100)+' %');
+  set('h-obj',o.court||'—');
+  // deltas (▲▼) par rapport au dernier rafraîchissement de cycle
+  hudDelta('d-argent',vals['d-argent'],false);
+  hudDelta('d-dette',vals['d-dette'],true);
+  hudDelta('d-profit',vals['d-profit'],false);
+  hudDelta('d-stocks',vals['d-stocks'],true);
+  hudDelta('d-chomage',vals['d-chomage'],true);
+  hudDelta('d-colere',vals['d-colere'],true);
+  hudDelta('d-risque',vals['d-risque'],true);
+  // couleurs de seuil : la jauge dit où le système se tend
+  const pf=document.getElementById('h-profit');
+  if(pf){ pf.classList.remove('warnv','dangerv'); if(profit<0) pf.classList.add('dangerv'); }
+  hudLevel('h-dette', state.dette/Math.max(1,state.plafondCredit||600));
+  hudLevel('h-stocks', state.stocks/(STOCK_SEUIL+(state.stockCapaciteBonus||0)));
+  hudLevel('h-chomage', state.chomage/0.5);
+  hudLevel('h-colere', state.colere/0.8);
+  hudLevel('h-risque', (d.risqueCrise||0)/0.8);
+  HUDTrack.lastVals=vals;
+}
+/* mémorise les valeurs APRÈS chaque cycle : les deltas comparent cycle à cycle, pas image à image */
+function snapshotHUD(){ HUDTrack.prev=Object.assign({},HUDTrack.lastVals||null); }
+function set(id,v){document.getElementById(id).textContent=v;}
+
+let marxView=false;
+function toggleMarx(){ marxView=!marxView;
+  document.getElementById('marxbox').style.display=marxView?'block':'none';
+  document.getElementById('hud-title').textContent=marxView?'Sous le voile':'Tableau de bord';
+}
+function updateMarx(){
+  const d=state.d, g=id=>document.getElementById(id); if(!g('m-pv'))return;
+  g('m-pv').textContent=money(d.plusValue||0);
+  g('m-tx').textContent=pct(d.tauxExploitation||0);
+  g('m-c').textContent=money(d.c||0);
+  g('m-v').textContent=money(d.v||0);
+  g('m-tp').textContent=pct(d.tauxProfit||0);
+  g('m-co').textContent=(d.compoOrganique||0).toFixed(2);
+  g('m-part').textContent=pct(d.partJoueur||0);
+  g('m-stocks').textContent=Math.round(state.stocks)+' u.';
+}
+function renderLeviers(){
+  const g=id=>document.getElementById(id); if(!g('vh'))return;
+  const stage=productionPlaceLabel();
+  if(g('lev-title')) g('lev-title').textContent='État de l’usine';
+  if(g('lev-place')) g('lev-place').textContent='Usine';
+  if(g('lev-stage')) g('lev-stage').textContent=stage;
+  g('vh').textContent=state.heures+' h'+(state.limiteJournee<18?` (max ${state.limiteJournee})`:'');
+  g('vs').textContent=state.salaire+' £';
+  g('vl').textContent=state.travailleurs;
+  g('vm').textContent='niv. '+state.niveauMachine;
+}
+/* ===================================================================
+   MISSION  —  le circuit guidé A → M → Ft → P → M′ → A′
+   Le joueur boucle le trajet dans l'ordre ; arriver à A′ réalise le cycle.
+   =================================================================== */
+const CIRCUIT = [
+  {zone:'Banque',             sym:'A',   key:'A',   full:'Argent',                tip:'A = argent avancé'},
+  {zone:'Marché des moyens',  sym:'M',   key:'M',   full:'Machines et matières',  tip:'M = moyens de production'},
+  {zone:'Marché du travail',  sym:'Ft',  key:'Ft',  full:'Force de travail',      tip:'Ft = force de travail'},
+  {zone:'Usine',              sym:'P',   key:'P',   full:'Production',             tip:'P = production'},
+  {zone:'Entrepôt',           sym:'M′',  key:'M′',  full:'Marchandises',          tip:'M′ = marchandises produites'},
+  {zone:'Marché de vente',    sym:'A′',  key:"A'",  full:'Argent augmenté',       tip:'A′ = argent revenu augmenté'},
+];
+
+// Vocabulaire visible : le bâtiment reste toujours l'Usine sur la carte.
+// Le stade historique du procès de production est indiqué séparément :
+// Atelier → Manufacture → Grande industrie.
+function productionPlaceLabel(s=state){
+  const age=(s&&s.age)||1;
+  if(age>=3) return 'Usine';
+  if(age>=2) return 'Manufacture';
+  return 'Atelier';
+}
+function displayZoneName(name){ return name; }
+function displayZoneShort(name){ return displayZoneName(name).replace('Marché','M.'); }
+function productionPlaceInfo(){
+  const p=productionPlaceLabel();
+  if(p==='Atelier') return 'Usine — bâtiment de production (P). Stade actuel : atelier, avec quelques ouvriers, des outils et une discipline encore fragile.';
+  if(p==='Manufacture') return 'Usine — bâtiment de production (P). Stade actuel : manufacture, avec division du travail, surveillance et fatigue collective.';
+  return 'Usine — bâtiment de production (P). Stade actuel : grande industrie, avec machines, productivité massive, chômage et surproduction possibles.';
+}
+function zoneInfo(name){
+  const cf=(typeof CompetitorWorld!=='undefined')&&CompetitorWorld.byZone?CompetitorWorld.byZone(name):null;  // v48
+  if(cf) return CompetitorWorld.promptInfo(cf);
+  return name==='Usine' ? productionPlaceInfo() : (ZONE_INFO[name]||'');
+}
+function displayCircuitStep(c){ return displayZoneShort(c.zone); }
+let step = 0;                 // index du PROCHAIN lieu requis
+let voileUnlocked = false;
+let gameOver = false;
+let gamePhase = 'precapital';  // 'precapital' (argent dormant) puis 'circuit'
+const PRECAPITAL_STEPS = [
+  {sym:'£',  nm:'Argent dormant',     done:()=>true},
+  {sym:'At', nm:'Atelier',            done:()=>state.buildings.atelier>0},
+  {sym:'Ou', nm:'Outils',             done:()=>state.buildings.outils>0},
+  {sym:'Ft', nm:'Force de travail',   done:()=>state.travailleurs>0},
+  {sym:'M′', nm:'Première marchandise',done:()=>state.firstProduced},
+  {sym:'A′', nm:'Première vente',     done:()=>state.firstSold},
+];
+let crisisStreak = 0;         // cycles consécutifs à très haut risque
+
+// Progression pédagogique : un concept par cycle (cf. cahier des charges)
+// Objectif de la phase 0 (hors circuit)
+const OBJ_PRECAPITAL = {titre:'Argent dormant', concept:'argent vs capital',
+   but:'Transformer l’argent en capital : construis l’atelier, achète les outils, embauche, produis et vends.',
+   court:'Créer les conditions', rew:'+ le capital prend vie', risk:'rien ne se produit tant que tu n’as rien construit',
+   ok:s=>true,
+   lecture:'L’argent n’est pas du capital : il ne le devient qu’en se jetant dans le circuit pour en revenir augmenté.'};
+// Cycles du circuit — progression PÉDAGOGIQUE par objectifs atteignables (objectifIndex)
+// Chaque objectif : ok(s) condition · gauge(s) progression lisible · manque(s) ce qu'il reste
+const OBJECTIFS = [
+  {titre:'Premier profit', concept:'plus-value',
+   but:'Réalise un premier cycle profitable.',
+   court:'Profit productif > 0', rew:'+ l’accumulation démarre', risk:'coûts avancés à couvrir',
+   ok:s=>(s.d.resultatProductif||0)>0,
+   gauge:s=>`Résultat productif : ${money(s.d.resultatProductif||0)} / > 0`,
+   manque:s=>`Il manque ${money(Math.max(1,1-(s.d.resultatProductif||0)))} pour un atelier rentable.`,
+   lecture:'Le supplément A′ − A vient de la plus-value produite par la force de travail.'},
+  {titre:'Accumulation simple', concept:'A → A′',
+   but:'Fais revenir l’argent augmenté de manière visible (≥ 20 £ de résultat net).',
+   court:'Résultat net ≥ 20 £', rew:'+ trésorerie qui grossit', risk:'intérêts et impôts grignotent le net',
+   ok:s=>(s.d.resultatNet||0)>=20,
+   gauge:s=>`Résultat net : ${money(s.d.resultatNet||0)} / 20 £`,
+   manque:s=>`Il manque ${money(Math.max(1,20-(s.d.resultatNet||0)))} de résultat net.`,
+   lecture:'Le capital n’a de sens que s’il revient augmenté : A′ doit dépasser A.'},
+  {titre:'Stabiliser l’atelier', concept:'reproduction',
+   but:'Enchaîne deux cycles profitables au total.',
+   court:'2 cycles profitables', rew:'+ atelier viable', risk:'un cycle déficitaire ne compte pas',
+   ok:s=>s.cyclesProfitables>=2,
+   gauge:s=>`Cycles profitables : ${s.cyclesProfitables} / 2`,
+   manque:s=>`Il manque ${Math.max(1,2-s.cyclesProfitables)} cycle profitable.`,
+   lecture:'Un capital ne vit pas d’un coup isolé : il doit reproduire son profit cycle après cycle.'},
+  {titre:'Embaucher', concept:'coopération',
+   but:'Élargis l’atelier en employant au moins 3 ouvriers.',
+   court:'Ouvriers ≥ 3', rew:'+ capacité de production', risk:'+ salaires avancés',
+   ok:s=>s.travailleurs>=3,
+   gauge:s=>`Ouvriers : ${s.travailleurs} / 3`,
+   manque:s=>`Il manque ${Math.max(1,3-s.travailleurs)} ouvrier à embaucher (marché du travail).`,
+   lecture:'Réunir plusieurs ouvriers, c’est déjà créer une force productive collective que le capital s’approprie.'},
+  {titre:'Manufacture', concept:'division du travail',
+   but:'Transforme l’atelier en manufacture : 5 ouvriers et 250 £ de trésorerie.',
+   court:'5 ouvriers · 250 £', rew:'+ productivité collective', risk:'+ surveillance, + fatigue',
+   ok:s=>s.travailleurs>=5 && s.buildings.atelier>=1 && s.argent>=250,
+   gauge:s=>`Ouvriers : ${s.travailleurs} / 5 · Trésorerie : ${money(s.argent)} / 250 £`,
+   manque:s=>{const m=[]; if(s.travailleurs<5)m.push(`${5-s.travailleurs} ouvrier(s)`); if(s.argent<250)m.push(`${money(250-s.argent)} de trésorerie`); return 'Il manque : '+(m.join(' et ')||'rien')+'.';},
+   lecture:'En répartissant les tâches, le capital augmente la productivité collective sans payer davantage chaque ouvrier.'},
+  {titre:'Résister à la concurrence', concept:'contrainte concurrentielle',
+   but:'Reste compétitif : garde une part de marché ≥ 25 %.',
+   court:'Part ≥ 25 %', rew:'+ tu tiens tes débouchés', risk:'les concurrents baissent les prix',
+   ok:s=>(s.d.partJoueur||0)>=0.25,
+   gauge:s=>`Part de marché : ${pct(s.d.partJoueur||0)} / 25 %`,
+   manque:s=>`Ta part de marché est trop faible : ${pct(s.d.partJoueur||0)} / 25 %. Baisse ton prix ou mécanise.`,
+   lecture:'La concurrence force chaque capital à accumuler ou disparaître.'},
+  {titre:'Mécanisation', concept:'plus-value relative / machinisme',
+   but:'Introduis la machine : atteins le niveau de machine ≥ 2.',
+   court:'Machine niv. ≥ 2', rew:'+ productivité', risk:'+ dette, + chômage',
+   ok:s=>s.niveauMachine>=2,
+   gauge:s=>`Machine : niveau ${s.niveauMachine} / 2`,
+   manque:s=>`Il faut acheter une machine (carte « Acheter une machine à crédit » au lieu de production).`,
+   lecture:'La machine augmente la productivité, mais alourdit le capital constant et libère des bras.'},
+  {titre:'Gérer la dette', concept:'capital financier',
+   but:'Empêche le crédit de manger le profit : ramène la dette sous 150 £.',
+   court:'Dette < 150 £', rew:'+ profit net préservé', risk:'intérêts si tu laisses filer',
+   ok:s=>s.dette<150 || ((s.d.interets||0) < (s.d.resultatProductif||0)),
+   gauge:s=>`Dette : ${money(s.dette)} / < 150 £ · Intérêts ${money(s.d.interets||0)} vs atelier ${money(s.d.resultatProductif||0)}`,
+   manque:s=>`Ta dette reste trop élevée : ${money(s.dette)} / 150 £ maximum. Rembourse à la banque.`,
+   lecture:'Le capital financier prélève sa part : la dette doit rester soutenable pour que l’atelier profite.'},
+  {titre:'Gérer le conflit social', concept:'lutte des classes',
+   but:'Maintiens le circuit malgré la tension sociale.',
+   court:'Colère < 70 % · pas de grève', rew:'+ continuité de la production', risk:'grève, répression, concession',
+   ok:s=>s.argent>0 && !s.enGreve && (s.colere<0.70 || s.d.concession || s.d.repression),
+   gauge:s=>`Colère : ${pct(s.colere)} / < 70 % · Grève : ${s.enGreve?'oui':'non'}`,
+   manque:s=>(s.enGreve?'Une grève bloque le circuit : tranche le conflit (céder, réprimer ou attendre).':`Apaise la tension : colère ${pct(s.colere)} / < 70 % (salaires, journée, sécurité).`),
+   lecture:'Le capital ne doit pas seulement vendre ses marchandises : il doit aussi maintenir la force de travail dans le procès de production.'},
+  {titre:'Surproduction', concept:'réalisation / surproduction',
+   but:'Produis à grande échelle sans saturer le marché.',
+   court:'Production ≥ 60 · Stocks < 80', rew:'+ valeur réalisée à grande échelle', risk:'mévente, baisse des prix',
+   ok:s=>(s.d.Q||0)>=60 && s.stocks<80,
+   gauge:s=>`Production : ${Math.round(s.d.Q||0)} / 60 · Stocks : ${Math.round(s.stocks)} / < 80`,
+   manque:s=>((s.d.Q||0)<60 ? 'Tu ne produis pas encore à une échelle suffisante.' : 'Tu produis plus que tu ne réalises par la vente.'),
+   lecture:'La valeur produite doit être réalisée par la vente : invendue, elle s’accumule en stock.'},
+  {titre:'Première crise', concept:'crise de surproduction',
+   but:'Survis à une première tension de crise.',
+   court:'Tenir pendant la tension', rew:'+ tu encaisses le choc', risk:'krach, faillite',
+   ok:s=>(s.d.risqueCrise||0)>0.35 && s.argent>0,
+   gauge:s=>`Risque de crise : ${pct(s.d.risqueCrise||0)} · Solvabilité : ${money(s.argent)}`,
+   manque:s=>((s.d.risqueCrise||0)<=0.35 ? 'La crise n’est pas encore ouverte. Continue d’accumuler : les contradictions monteront avec l’échelle.' : 'Reste solvable pendant la tension.'),
+   lecture:'La crise n’est pas extérieure au système ; elle émerge de ses propres contradictions.'},
+];
+// Aides ciblées affichées quand le joueur reste bloqué sur un objectif (parallèle à OBJECTIFS)
+const OBJ_HINTS = [
+  'Va au lieu de production (P) régler la journée et le salaire pour dégager un profit.',
+  'Augmente le profit net : allonge la journée, embauche ou monte le prix — et limite la dette.',
+  'Enchaîne des cycles sans déficit : garde des coûts inférieurs à la recette.',
+  'Va au marché du travail pour embaucher (vise 3 ouvriers).',
+  'Embauche jusqu’à 5 ouvriers et garde 250 £ de trésorerie.',
+  'Baisse ton prix ou mécanise pour reprendre des parts de marché.',
+  'Va au lieu de production (P) et joue la carte « Acheter une machine à crédit ».',
+  'Va à la banque pour rembourser et ramener la dette sous 150 £.',
+  'Apaise le conflit : ajuste salaires/journée, améliore la sécurité, ou tranche la grève au panneau.',
+  'Va au lieu de production (P) pour produire davantage (embauche, journée, machine), puis écoule tes stocks.',
+  'Pousse l’accumulation : la tension de crise naîtra des stocks, de la dette et du chômage.',
+];
+function objHint(){ return OBJ_HINTS[state.objectifIndex]||''; }
+const OBJ_GENERIQUE = {titre:'Accumuler', concept:null,
+   but:'Continue d’accumuler : le circuit n’a pas de terme.',
+   court:'Accumuler encore', rew:'+ capital', risk:'les contradictions s’accumulent', ok:s=>true,
+   gauge:s=>`Argent : ${money(s.argent)} · Stade : ${state.niveauVille}`,
+   manque:s=>'',
+   lecture:'L’accumulation est sans terme : le capital ne connaît pas le « assez ».'};
+
+function objectifCourant(){
+  if(gamePhase==='precapital') return OBJ_PRECAPITAL;
+  return OBJECTIFS[state.objectifIndex] || OBJ_GENERIQUE;
+}
+
+// Sous-objectifs de la phase 0 (Argent dormant)
+const SOUS_OBJ_0 = [
+  {t:'Construire un atelier',            ok:()=>state.buildings.atelier>0},
+  {t:'Acheter outils et matières',       ok:()=>state.buildings.outils>0},
+  {t:'Ouvrir un marché du travail',      ok:()=>state.buildings.travail>0},
+  {t:'Embaucher le premier ouvrier',     ok:()=>state.travailleurs>0},
+  {t:'Produire la première marchandise', ok:()=>state.firstProduced},
+  {t:'Vendre la première marchandise',   ok:()=>state.firstSold},
+];
+function sousObjHTML(){
+  return SOUS_OBJ_0.map(o=>`<div class="so ${o.ok()?'done':''}">${o.ok()?'✓':'○'} ${o.t}</div>`).join('');
+}
+
+function makeCircuitStepButton(c, cls, label, labelClass, diagInfo){
+  const d=document.createElement('button');
+  d.type='button'; d.className=cls; d.dataset.sym=c.sym;
+  const info = diagInfo || circuitDiagnostic(c.sym,state);
+  d.title = `${c.sym} — ${c.full} · ${info.alert?'alerte : '+info.reasons.join(' / '):'pas de tension majeure'}`;
+  d.innerHTML=`<span class="sym">${c.sym}</span><span class="${labelClass}">${label}</span>`;
+  d.addEventListener('click',()=>openCircuitInfo(c.sym));
+  d.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); openCircuitInfo(c.sym); }});
+  return d;
+}
+function renderCircuitBar(){
+  const el=document.getElementById('circuit'); el.innerHTML='';
+  if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){
+    CIRCUIT.forEach((c,i)=>{
+      if(i>0){ const a=document.createElement('span'); a.className='arr'; a.textContent='→'; el.appendChild(a); }
+      const info=circuitDiagnostic(c.sym,state);
+      const d=makeCircuitStepButton(c,'stp done'+(info.alert?' alert':''),displayCircuitStep(c),'nm',info);
+      el.appendChild(d);
+    });
+    return;
+  }
+  if(gamePhase==='precapital'){
+    // barre spéciale de la phase 0
+    let firstUndone = PRECAPITAL_STEPS.findIndex(s=>!s.done());
+    if(firstUndone<0) firstUndone = PRECAPITAL_STEPS.length;
+    PRECAPITAL_STEPS.forEach((s,i)=>{
+      if(i>0){ const a=document.createElement('span'); a.className='arr'; a.textContent='→'; el.appendChild(a); }
+      const d=document.createElement('div');
+      const done=s.done();
+      d.className='stp'+(done?' done':'')+(i===firstUndone?' now':'');
+      d.innerHTML=`<span class="sym">${s.sym}</span><span class="full">${s.nm}</span>`;
+      el.appendChild(d);
+    });
+    return;
+  }
+  const showFull = state.cycle===0;   // premier circuit réel : noms complets
+  CIRCUIT.forEach((c,i)=>{
+    if(i>0){ const a=document.createElement('span'); a.className='arr'; a.textContent='→'; el.appendChild(a); }
+    const info=circuitDiagnostic(c.sym,state);
+    const label = showFull ? `${c.sym} — ${c.full}` : displayCircuitStep(c);
+    const cls = showFull ? 'full' : 'nm';
+    const d=makeCircuitStepButton(c,'stp'+(i<step?' done':'')+(i===step?' now':''),label,cls,info);
+    el.appendChild(d);
+  });
+}
+function renderQuest(){
+  const o=objectifCourant();
+  set('q-cycle', gamePhase==='precapital' ? 'Phase 0' : 'Cycle '+(state.cycle+1));
+  set('q-rew',o.rew); set('q-risk',o.risk);
+  const c=CIRCUIT[step];
+  if(gamePhase==='precapital'){
+    set('q-goal','Va vers le prochain lieu indiqué sur la carte.');
+    const tz=precapitalTargetZone();
+    const nextLine = tz ? `Prochaine étape : <b>${precapitalZoneLabel(tz)}</b>` : 'Toutes les conditions sont réunies — vends ta première marchandise.';
+    document.getElementById('q-next').innerHTML=
+      `<div class="solist">${sousObjHTML()}</div>${nextLine}`;
+  } else {
+    set('q-goal',o.but);
+    const g = o.gauge ? `<div class="qgauge">${o.gauge(state)}</div>` : '';
+    document.getElementById('q-next').innerHTML=`${g}Prochaine étape : <b>${displayZoneName(c.zone)} (${c.sym})</b>`;
+  }
+}
+
+/* ---- balise lumineuse au-dessus du prochain lieu ---- */
+let circuitLine=null;
+function buildCircuitLine(){
+  if(circuitLine){ scene.remove(circuitLine); }
+  const g=new THREE.Group();
+  const pts=CIRCUIT.map(c=>{ const z=zones.find(zz=>zz.name===c.zone); return z?z.pos:null; }).filter(Boolean);
+  for(let i=0;i<pts.length;i++){
+    const a=pts[i], b=pts[(i+1)%pts.length];
+    const dx=b.x-a.x, dz=b.z-a.z, len=Math.hypot(dx,dz);
+    const seg=box(0.5,0.04,len,COL.or,(a.x+b.x)/2,0.05,(a.z+b.z)/2,false);
+    seg.rotation.y=Math.atan2(dx,dz);
+    seg.material.transparent=true; seg.material.opacity=0.5;
+    g.add(seg);
+  }
+  g.visible=false; circuitLine=g; scene.add(g);
+}
+let targetMarker=null;
+function buildTargetMarker(){
+  const g=new THREE.Group();
+  const beam=new THREE.Mesh(new THREE.CylinderGeometry(0.6,1.8,16,12,1,true),
+    new THREE.MeshBasicMaterial({color:COL.rouge,transparent:true,opacity:.32,side:THREE.DoubleSide,depthWrite:false}));
+  beam.position.y=8; g.add(beam);
+  const cone=new THREE.Mesh(new THREE.ConeGeometry(1.5,2.6,4),
+    new THREE.MeshStandardMaterial({color:COL.rouge,flatShading:true}));
+  cone.rotation.x=Math.PI; cone.position.y=16; g.add(cone);
+  g.userData.beam=beam; g.userData.cone=cone;
+  targetMarker=g; scene.add(g);
+  buildGroundArrow();
+}
+/* trace pointillée discrète au sol, du chariot vers le prochain lieu (remplace l'ancienne flèche) */
+let groundArrow=null;
+function buildGroundArrow(){
+  const g=new THREE.Group();
+  for(let i=0;i<7;i++){
+    const dash=box(0.42,0.04,1.25,COL.or,0,0.06,0,false);
+    dash.material.transparent=true; dash.material.opacity=0; g.add(dash);
+  }
+  groundArrow=g; scene.add(g);
+}
+function updateGroundArrow(){
+  if(!groundArrow) return;
+  let targetName = gamePhase==='precapital' ? precapitalTargetZone() : (gameOver?null:CIRCUIT[step].zone);
+  if(gameOver || !targetName){ groundArrow.visible=false; return; }
+  const z=zones.find(zz=>zz.name===targetName);
+  if(!z){ groundArrow.visible=false; return; }
+  const px=Vehicle.pos.x, pz=Vehicle.pos.z;
+  const dx=z.pos.x-px, dz=z.pos.z-pz, dist=Math.hypot(dx,dz);
+  if(dist<9){ groundArrow.visible=false; return; }    // déjà sur place
+  groundArrow.visible=true;
+  const ang=Math.atan2(dx,dz);
+  const n=groundArrow.children.length, reach=Math.min(dist-6, 24);
+  for(let i=0;i<n;i++){
+    const f=(i+1)/(n+1);
+    const d=6+f*reach;
+    const dash=groundArrow.children[i];
+    dash.position.set(px+Math.sin(ang)*d, 0.06, pz+Math.cos(ang)*d);
+    dash.rotation.y=ang;
+    dash.material.opacity=0.08+0.14*(1-f)+0.05*Math.max(0,Math.sin(t*3 - i*0.6)); // discret, léger pouls
+  }
+}
+function moveTargetMarker(){
+  if(!targetMarker||gameOver) return;
+  if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){ targetMarker.visible=false; if(typeof groundArrow!=='undefined'&&groundArrow) groundArrow.visible=false; return; }
+  let targetName;
+  if(gamePhase==='precapital'){ targetName=precapitalTargetZone(); if(!targetName){ targetMarker.visible=false; return; } }
+  else targetName=CIRCUIT[step].zone;
+  const z=zones.find(zz=>zz.name===targetName);
+  if(z){ targetMarker.position.set(z.pos.x,0,z.pos.z); targetMarker.visible=true; }
+}
+
+/* ===================================================================
+   Conséquences visibles sur la carte
+   stocks → caisses · chômage → silhouettes · colère → banderoles
+   grève → usine bloquée · machines → machines visibles · crise → alerte
+   =================================================================== */
+function clearLayer(group,key){
+  if(!group) return;
+  for(let i=group.children.length-1;i>=0;i--){
+    if(group.children[i].userData && group.children[i].userData.layer===key) group.remove(group.children[i]);
+  }
+}
+function tagLayer(obj,key){ obj.traverse?.(o=>o.userData&&(o.userData.layer=key)); obj.userData.layer=key; return obj; }
+
+function updateConsequences(){
+  // --- machines visibles dans l'usine ---
+  const us=zoneGroups['Usine'];
+  if(us){ clearLayer(us,'mach');
+    const extra=Math.max(0,state.niveauMachine-1);
+    for(let i=0;i<Math.min(6,extra);i++){
+      const m=new THREE.Mesh(new THREE.CylinderGeometry(1,1,1.4,10),
+        new THREE.MeshStandardMaterial({color:0x4b4438,metalness:.35,roughness:.6,flatShading:true}));
+      m.rotation.z=Math.PI/2; m.position.set(-5+i*2.1,1.2,5.5); m.userData.layer='mach'; m.castShadow=true; us.add(m);
+    }
+    // --- chômage : silhouettes devant l'usine ---
+    clearLayer(us,'chom');
+    const nCh=Math.min(8,Math.round(state.chomage*state.populationActive));
+    for(let i=0;i<nCh;i++){
+      const s=new THREE.Group();
+      const body=box(0.8,1.6,0.5,0x46535e,0,0.95,0); body.userData.layer='chom';
+      const head=new THREE.Mesh(new THREE.SphereGeometry(0.42,8,8),
+        new THREE.MeshStandardMaterial({color:0x3a4750,flatShading:true}));
+      head.position.y=2.0; head.userData.layer='chom'; s.add(body); s.add(head);
+      s.position.set(-7+(i%4)*2.0, 0, 8.5+Math.floor(i/4)*1.8); s.userData.layer='chom'; us.add(s);
+    }
+    // --- grève : barrière qui bloque l'usine ---
+    clearLayer(us,'greve');
+    if(state.enGreve){
+      const bar=box(14,0.5,0.5,0x8a2c1d,0,2.4,7,false); bar.userData.layer='greve'; us.add(bar);
+      for(const x of [-6,6]){ const p=box(0.4,3,0.4,0x241f17,x,1.5,7,false); p.userData.layer='greve'; us.add(p); }
+      const sign=makeLabel('GRÈVE'); sign.scale.set(7,1.5,1); sign.position.set(0,5.5,7); sign.userData.layer='greve'; us.add(sign);
+    }
+  }
+  // --- stocks : caisses qui s'entassent dans l'entrepôt, débordent dehors si trop hautes ---
+  const ent=zoneGroups['Entrepôt'];
+  if(ent){ clearLayer(ent,'stock');
+    const n=Math.min(14,Math.floor(state.stocks/18));
+    for(let i=0;i<n;i++){
+      const col=i%3? 0x8a6b49:0x9a7a55;
+      const cx=-6+(i%5)*2.4, cz=-3+Math.floor(i/5%2)*2.4, cy=1.1+(i>=10?2.2:0);
+      const crate=box(2.1,2.1,2.1,col,cx,cy,cz); crate.userData.layer='stock'; ent.add(crate);
+    }
+    // débordement : au-delà du seuil, les caisses s'entassent DEHORS, devant l'entrepôt
+    const over=Math.min(10,Math.floor(Math.max(0,state.stocks-180)/22));
+    for(let i=0;i<over;i++){
+      const cx=-9+(i%5)*2.5, cz=10+Math.floor(i/5)*2.5;
+      const crate=box(2.1,2.1,2.1,0x7d6242,cx,1.1,cz); crate.userData.layer='stock'; crate.rotation.y=(i*0.3); ent.add(crate);
+    }
+  }
+  // --- colère : quartier qui s'assombrit + banderoles au-delà d'un seuil ---
+  const q=zoneGroups['Quartier ouvrier'];
+  if(q){ clearLayer(q,'col'); clearLayer(q,'dark');
+    // assombrissement : voile sombre au sol, d'autant plus marqué que la colère monte
+    if(state.colere>0.15){
+      const dark=new THREE.Mesh(new THREE.CircleGeometry(9,32),
+        new THREE.MeshBasicMaterial({color:0x1a1712,transparent:true,opacity:Math.min(0.55,state.colere*0.6),depthWrite:false}));
+      dark.rotation.x=-Math.PI/2; dark.position.y=0.05; dark.userData.layer='dark'; q.add(dark);
+    }
+    // banderoles seulement si la colère dépasse le seuil
+    const n = state.colere>0.4 ? Math.min(5,Math.floor(state.colere*6)) : 0;
+    for(let i=0;i<n;i++){
+      const ban=box(4.2,1.1,0.12,0x8a2c1d,-5+i*2.3,3.4+(i%2)*1.2,-4); ban.userData.layer='col';
+      ban.rotation.z=(i%2?1:-1)*0.05; q.add(ban);
+      const pole=box(0.18,3.6,0.18,0x3a2f22,-7+i*2.3,1.8,-4,false); pole.userData.layer='col'; q.add(pole);
+    }
+  }
+  // --- crise : alerte sur la banque + voile rouge ---
+  const bk=zoneGroups['Banque'];
+  const crise=(state.d.risqueCrise||0)>0.7 || state.d.declenche;
+  if(bk){ clearLayer(bk,'alert'); clearLayer(bk,'detteviz');
+    // v47 — la banque devient menaçante quand la dette pèse : ombre au sol ∝ dette/plafond.
+    const lev=state.dette/Math.max(1,state.plafondCredit||600);
+    if(lev>0.35){
+      const sh=new THREE.Mesh(new THREE.CircleGeometry(10,32),
+        new THREE.MeshBasicMaterial({color:0x1a1712,transparent:true,opacity:Math.min(0.5,lev*0.55),depthWrite:false}));
+      sh.rotation.x=-Math.PI/2; sh.position.y=0.05; sh.userData.layer='detteviz'; bk.add(sh);
+      if(lev>0.7){ const dl=makeLabel('DETTE'); dl.scale.set(5,1.3,1); dl.position.set(0,12,0); dl.userData.layer='detteviz'; bk.add(dl); }
+    }
+    if(crise){
+      const beacon=new THREE.Mesh(new THREE.SphereGeometry(0.9,12,12),
+        new THREE.MeshStandardMaterial({color:COL.rouge,emissive:0x8a2c1d,emissiveIntensity:.8,flatShading:true}));
+      beacon.position.set(0,14,0); beacon.userData.layer='alert'; beacon.userData.pulse=true; bk.add(beacon);
+    }
+  }
+  // --- crise : prix barrés au marché de vente ---
+  const mv=zoneGroups['Marché de vente'];
+  if(mv){ clearLayer(mv,'crisemkt');
+    if(crise){
+      const sign=makeLabel('PRIX ✗'); sign.scale.set(6,1.4,1); sign.position.set(0,7,0);
+      sign.userData.layer='crisemkt'; mv.add(sign);
+    }
+    // v47 — demande faible = marché qui se vide : les clients désertent les étals.
+    // (relation rendue visible : tauxVente bas -> moins de silhouettes, enseigne MARCHÉ ATONE)
+    clearLayer(mv,'demande');
+    const tv=(state.d&&state.d.tauxVente!=null)?state.d.tauxVente:1;
+    const clients=Math.round(5*clamp(tv));
+    for(let i=0;i<clients;i++){
+      const c=createWorkerFigure({color:i%2?0x6c7d8c:0x5a4530,scale:0.8});
+      c.position.set(-6+i*2.6,0,7.5+(i%2)*1.6); c.rotation.y=Math.PI+(i*0.4);
+      tagLayer(c,'demande'); mv.add(c);
+    }
+    if(tv<0.6 && !crise){
+      const sg=makeLabel('MARCHÉ ATONE'); sg.scale.set(7,1.4,1); sg.position.set(0,7,0);
+      sg.userData.layer='demande'; mv.add(sg);
+    }
+  }
+  // --- faillites de concurrents : panneaux FAILLITE au-dessus de la bourse ---
+  const bo=zoneGroups['Bourse'];
+  if(bo){ clearLayer(bo,'faillite');
+    const morts=(state.competitors||[]).filter(c=>!c.vivant);
+    morts.slice(0,3).forEach((c,i)=>{
+      const sign=makeLabel('FAILLITE'); sign.scale.set(6,1.4,1);
+      sign.position.set(-5+i*5,8+i*1.6,0); sign.userData.layer='faillite'; bo.add(sign);
+    });
+  }
+  document.getElementById('crisisVeil').classList.toggle('on', !!state.d.declenche || (state.d.risqueCrise||0)>0.85);
+  document.getElementById('crisisTag').classList.toggle('on', !!state.d.declenche);
+
+  renderLeviers();
+}
+
+/* ===================================================================
+   VILLE CAPITALISTE — niveaux de bâtiments, améliorations, évolution visuelle
+   Accumuler → construire → transformer → contredire.
+   =================================================================== */
+const STAGES = [
+  {n:'Argent dormant',     contradiction:''},
+  {n:'Atelier',            contradiction:'La production naît — et avec elle la dépendance au salariat.'},
+  {n:'Manufacture',        contradiction:'Plus de production — mais la discipline et la fatigue s’installent.'},
+  {n:'Grande industrie',   contradiction:'Les machines produisent en masse — mais aussi du chômage et de la dette.'},
+  {n:'Ville industrielle', contradiction:'Le marché s’élargit — mais la surproduction menace.'},
+  {n:'Capital financier',  contradiction:'Le crédit accélère l’accumulation — mais rend la crise plus violente.'},
+  {n:'Marché mondial',     contradiction:'Le capital conquiert le monde — mais étend la crise à l’échelle globale.'},
+];
+function computeNiveauVille(){
+  if(gamePhase==='precapital' || !state.productionActive) return 0;
+  const b=state.buildings, s=state;
+  let niv=1;                                                                   // 1 — Atelier
+  if(s.cyclesProfitables>=2 && s.travailleurs>=4 && s.argent>=250) niv=Math.max(niv,2);            // 2 — Manufacture
+  if(b.usine>0 && s.niveauMachine>=2) niv=Math.max(niv,3);                                          // 3 — Grande industrie
+  if(b.quartier>0 && b.entrepot>0 && b.rails>0 && (s.travailleurs>=8 || s.populationActive>=12))
+    niv=Math.max(niv,4);                                                                            // 4 — Ville industrielle
+  if(b.bourse>0) niv=Math.max(niv,5);                                                               // 5 — Capital financier (préparé)
+  if(b.port>0)   niv=Math.max(niv,6);                                                               // 6 — Marché mondial (préparé)
+  return niv;
+}
+function updateVilleBadge(){
+  let niv=state.niveauVille, st=STAGES[niv]||STAGES[0];
+  if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){ niv=state.age||1; st=STAGES[niv]||st; } // cohérence avec l'âge du panneau et du journal
+  const g=id=>document.getElementById(id);
+  if(g('ville-niv')) g('ville-niv').textContent=niv;
+  if(g('ville-stade')) g('ville-stade').textContent=st.n;
+}
+// recalcule le stade (MONOTONE : ne redescend jamais) ; si montée, renvoie le stade franchi
+function refreshNiveauVille(){
+  const avant=state.niveauVille;
+  const niv=Math.max(avant, computeNiveauVille());
+  state.niveauVille=niv; updateVilleBadge();
+  return niv>avant ? STAGES[niv] : null;
+}
+// à appeler après construction / embauche / machine : met à jour le stade ET la carte
+function updateCapitalStage(){
+  const monte=refreshNiveauVille();
+  if(monte){ updateBuildings(); updateZoneVisibility(); updateConsequences(); }
+  return monte;
+}
+
+// Améliorations disponibles (bâtiment, coût, effet éco, conséquence, transformation, lecture marxienne)
+const UPGRADES = [
+  // --- AMÉLIORATIONS FONDATRICES (phase 0 : créer les conditions du capital) ---
+  {id:'atelier', b:'atelier', t:'Construire un atelier', cost:150, once:true, founding:true,
+   eff:'débloque la production', cq:'l’argent commence à se fixer dans des moyens de production', vis:'un atelier s’élève sur le terrain vide',
+   marx:'L’argent commence à se fixer dans des moyens de production : il cesse d’être oisif.',
+   apply:s=>{ s.buildings.atelier=1; s.buildings.usine=Math.max(1,s.buildings.usine); }},
+  {id:'outils', b:'outils', t:'Acheter outils et matières', cost:100, once:true, founding:true,
+   eff:'+ capital constant minimal', cq:'les moyens de production ne créent pas seuls de la valeur', vis:'caisses, outils et matières dans l’atelier',
+   marx:'Les moyens de production transmettent leur valeur au produit, mais n’en créent aucune par eux-mêmes.',
+   apply:s=>{ s.buildings.outils=1; s.niveauMachine=Math.max(1,s.niveauMachine); }},
+  {id:'travail0', b:'travail', t:'Ouvrir le marché du travail', cost:50, once:true, founding:true,
+   eff:'main-d’œuvre disponible (+3)', cq:'la force de travail devient une marchandise', vis:'des silhouettes apparaissent près du marché du travail',
+   marx:'La force de travail devient disponible comme marchandise : des hommes n’ont plus que leurs bras à vendre.',
+   apply:s=>{ s.buildings.travail=Math.max(1,s.buildings.travail); s.populationActive+=3; }},
+  {id:'embauche0', t:'Embaucher le premier ouvrier', cost:0, founding:true,
+   avail:()=>state.populationActive>0 && state.travailleurs===0,
+   eff:'1er ouvrier (salaire 5 £/cycle)', cq:'le capital peut désormais acheter la force de travail', vis:'un ouvrier apparaît dans l’atelier',
+   marx:'Le capital peut maintenant acheter la force de travail — la seule marchandise qui crée plus de valeur qu’elle ne coûte.',
+   apply:s=>{ s.travailleurs=Math.max(1,s.travailleurs); }},
+  {id:'produire', t:'Produire la première marchandise', cost:0, founding:true,
+   avail:()=>state.buildings.atelier>0 && state.buildings.outils>0 && state.travailleurs>0 && !state.firstProduced,
+   eff:'1re production', cq:'le travail vivant transforme les matières en marchandise', vis:'une marchandise sort de l’atelier',
+   marx:'Dans l’atelier, l’ouvrier ajoute par son travail plus de valeur qu’il n’en coûte : c’est là, et non sur le marché, que naît la plus-value.',
+   apply:s=>{ precapitalProduce(); }},
+  {id:'vendre', t:'Vendre la première marchandise', cost:0, founding:true, final:true,
+   avail:()=>state.firstProduced && !state.firstSold,
+   eff:'1re vente — l’argent revient augmenté', cq:'la valeur produite se réalise en argent', vis:'la marchandise part au marché local',
+   marx:'La marchandise se change en argent : la plus-value, jusque-là virtuelle, est enfin réalisée. A est devenu A′.',
+   apply:s=>{ precapitalSell(); }},
+  // --- AMÉLIORATIONS AVANCÉES ---
+  {id:'usine', b:'usine', t:'Améliorer l’usine', cost:250, repeat:true,
+   eff:'+ productivité', cq:'+ capital constant, + risque de chômage', vis:'une cheminée de plus s’élève sur l’usine',
+   marx:'La productivité augmente, mais la domination du travail vivant par la machine s’approfondit.',
+   apply:s=>{ s.buildings.usine++; s.niveauMachine++; }},
+  {id:'machine', b:'usine', t:'Installer une machine', cost:300, repeat:true,
+   eff:'+ productivité', cq:'+ chômage, + capital constant, + risque de surproduction', vis:'une machine visible apparaît dans l’usine',
+   marx:'Chaque machine arrache plus de valeur en moins de temps — et rend une part des bras superflue.',
+   apply:s=>{ s.niveauMachine++; }},
+  {id:'entrepot', b:'entrepot', t:'Agrandir l’entrepôt', cost:180, repeat:true,
+   eff:'+ capacité de stockage', cq:'la surproduction reste, seulement différée', vis:'l’entrepôt grandit, les caisses s’alignent',
+   marx:'Stocker permet de retarder le problème, non de le résoudre : la marchandise doit encore se vendre.',
+   apply:s=>{ s.buildings.entrepot++; s.stockCapaciteBonus+=120; }},
+  {id:'quartier', b:'quartier', t:'Construire des logements ouvriers', cost:150, repeat:true,
+   eff:'− tension sociale', cq:'meilleure reproduction de la force de travail', vis:'de nouvelles maisons dans le quartier ouvrier',
+   marx:'Reproduire la force de travail devient une condition de la reproduction du capital.',
+   apply:s=>{ s.buildings.quartier++; s.reproSocial=Math.min(0.18,s.reproSocial+0.05); s.colere=clamp(s.colere-0.12); }},
+  {id:'marche', b:'marche', t:'Développer le marché', cost:220, repeat:true,
+   eff:'+ demande solvable', cq:'+ concurrence, + circulation', vis:'le marché s’étend, de nouveaux stands',
+   marx:'Élargir le marché repousse les limites de la vente — mais y attire d’autres capitaux.',
+   apply:s=>{ s.buildings.marche++; s.demandeBonus+=80; }},
+  {id:'travail', b:'travail', t:'Étendre le marché du travail', cost:160, repeat:true,
+   eff:'+ main-d’œuvre disponible', cq:'+ armée de réserve, pression sur les salaires', vis:'la file d’ouvriers s’allonge',
+   marx:'Plus de bras disponibles, c’est une armée de réserve qui pèse à la baisse sur tous les salaires.',
+   apply:s=>{ s.buildings.travail++; s.populationActive+=2; }},
+  {id:'banque', b:'banque', t:'Agrandir la banque', cost:280, repeat:true,
+   eff:'+ plafond de crédit', cq:'crédit facile, mais crise plus violente', vis:'la banque s’élève, son fronton dore',
+   marx:'Le crédit accélère l’accumulation, mais il rend la crise plus violente.',
+   apply:s=>{ s.buildings.banque++; s.creditBonus+=250; }},
+  {id:'rails', b:'rails', t:'Construire des rails', cost:350, repeat:true,
+   eff:'+ vitesse de circulation, + ventes', cq:'extension du marché', vis:'des rails relient usine, entrepôt et marché',
+   marx:'Accélérer la circulation, c’est raccourcir le temps où le capital dort : le marché s’étend avec les voies.',
+   apply:s=>{ s.buildings.rails++; s.railsBonus=Math.min(0.5,s.railsBonus+0.16); }},
+  {id:'port', b:'port', t:'Ouvrir le port', cost:500, once:true,
+   eff:'+ débouchés, + matières premières', cq:'dépendance au marché mondial', vis:'un quai, un bateau, des caisses d’import/export',
+   marx:'Le capital ne tient pas dans une frontière : le marché mondial est à la fois débouché et dépendance.',
+   apply:s=>{ s.buildings.port=1; s.portOuvert=true; s.demandeBonus+=120; }},
+  {id:'bourse', b:'bourse', t:'Ouvrir la bourse', cost:450, once:true,
+   eff:'+ crédit, + capital fictif', cq:'spéculation, risque financier', vis:'la bourse s’anime, les bulles dorées gonflent',
+   marx:'Le capital fictif promet de l’argent qui fait des petits sans passer par la production — jusqu’au krach.',
+   apply:s=>{ s.buildings.bourse=1; s.bourseActive=true; s.creditBonus+=150; }},
+];
+function upgradeCost(u){
+  if(u.once || u.founding) return u.cost;
+  const lvl = u.b==='usine'&&u.id==='machine' ? state.niveauMachine : (state.buildings[u.b]||1);
+  return Math.round(u.cost + (lvl-1)*u.cost*0.55);
+}
+function upgradeAvailable(u){
+  if(u.avail) return u.avail();
+  if(u.once && state.buildings[u.b]>0) return false;   // déjà construit
+  return true;
+}
+function recomputeProduction(){
+  state.productionActive =
+    state.buildings.atelier > 0 &&
+    state.buildings.outils  > 0 &&
+    state.travailleurs      > 0;
+}
+
+/* ---- Phase 0 jouée dans l'espace : chaque action fondatrice a son lieu ---- */
+const PRECAP_ZONE_CARDS = {
+  'Usine':            ['atelier','embauche0','produire'],
+  'Marché des moyens':['outils'],
+  'Marché du travail':['travail0'],
+  'Marché de vente':  ['vendre'],
+};
+// carte fondatrice disponible à cette zone (selon l'avancement), sinon null
+function precapitalAction(zoneName){
+  const ids=PRECAP_ZONE_CARDS[zoneName]; if(!ids) return null;
+  for(const id of ids){ const u=UPGRADES.find(x=>x.id===id);
+    if(u && (u.avail?u.avail():!(u.once&&state.buildings[u.b]>0))) return u; }
+  return null;
+}
+// prochaine zone fondatrice à viser (pour la balise au sol)
+function precapitalTargetZone(){
+  if(state.buildings.atelier===0) return 'Usine';
+  if(state.buildings.outils===0)  return 'Marché des moyens';
+  if(state.buildings.travail===0) return 'Marché du travail';
+  if(state.travailleurs===0)      return 'Usine';
+  if(!state.firstProduced)        return 'Usine';
+  if(!state.firstSold)            return 'Marché de vente';
+  return null;
+}
+// label “de terrain” affiché pendant la phase 0
+function precapitalZoneLabel(name){
+  if(name==='Usine') return state.buildings.atelier===0 ? 'Terrain vide' : 'Atelier';
+  if(name==='Marché des moyens') return 'Marché local — outils et matières';
+  if(name==='Marché du travail') return 'Place d’embauche';
+  if(name==='Marché de vente')   return 'Marché local';
+  return name;
+}
+// invite contextuelle de la phase 0 selon l'action disponible
+function precapitalPrompt(u){
+  switch(u.id){
+    case 'atelier':   return 'Appuie sur E pour construire le premier atelier.';
+    case 'outils':    return 'Appuie sur E pour acheter les premiers moyens de production.';
+    case 'travail0':  return 'Appuie sur E pour rendre disponible la force de travail.';
+    case 'embauche0': return 'Appuie sur E pour embaucher le premier ouvrier.';
+    case 'produire':  return 'Appuie sur E pour produire la première marchandise.';
+    case 'vendre':    return 'Appuie sur E pour vendre la première marchandise.';
+    default:          return 'Appuie sur E.';
+  }
+}
+// courte phrase de sens, montrée après l'action (le changement visible reste premier)
+const FOUNDING_FLASH = {
+  atelier:  'Un atelier s’élève sur le terrain.',
+  outils:   'Outils et matières entrent dans l’atelier.',
+  travail0: 'Des bras disponibles se rassemblent à la place d’embauche.',
+  embauche0:'La force de travail est maintenant achetée comme marchandise.',
+  produire: 'La première marchandise sort de l’atelier.',
+  vendre:   'La marchandise est vendue : l’argent revient augmenté.',
+};
+// exécuter une action fondatrice DANS L'ESPACE (sans passer par le panneau)
+function doFounding(u){
+  const cost=upgradeCost(u);
+  if(state.argent<cost){
+    showWhap({action:'Capital insuffisant pour : '+u.t+'.', fx:[['il manque '+money(cost-state.argent),'-']], chain:null,
+      marx:'L’argent disponible ne suffit pas encore à acheter cette condition du capital.'});
+    return;
+  }
+  state.argent-=cost; u.apply(state); recomputeProduction();
+  if(u.final){ state.firstSold=true; }
+  pushLog('Phase 0', `${u.t}${cost>0?` (−${money(cost)})`:''}. ${u.eff}.`,'plain');
+  updateBuildings(); updateZoneVisibility(); updateConsequences(); updateHUD();
+  renderCircuitBar(); renderQuest();
+  // effets visibles sur la carte (le monde change avant l'explication)
+  if(u.id==='atelier'){ fxPuff('Usine'); fxHalo('Usine'); flashTimer=0.5; animateConstruction(zoneGroups['Usine']); floatText('atelier construit',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'gain'); }
+  else if(u.id==='outils'){ fxPuff('Usine'); floatText('moyens de production',{x:zonePos('Usine').x,y:8,z:zonePos('Usine').z},'gain'); }
+  else if(u.id==='travail0'){ fxHalo('Marché du travail'); animateConstruction(zoneGroups['Marché du travail']); floatText('force de travail disponible',{x:zonePos('Marché du travail').x,y:8,z:zonePos('Marché du travail').z},'social'); }
+  else if(u.id==='embauche0'){ fxHalo('Usine'); floatText('ouvrier embauché',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'social'); }
+  else if(u.id==='produire'){ fxPing('Marché de vente'); floatText('+ marchandise',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'gain'); }   // clignote la prochaine destination
+  if(u.final){ fxCrate('Usine','Marché de vente'); birthOfCapital(); return; } // la vente fait naître le capital
+  showWhap({action:FOUNDING_FLASH[u.id]||(u.t+'.'), fx:[[u.eff,'+']], chain:null, marx:u.marx});
+  moveTargetMarker(); tutorialCoachRefresh(true);
+}
+
+/* ---- transformations visuelles (couche 'lvl', reconstruite à chaque fois) ---- */
+let railsGroup=null;
+function addLvl(group,mesh){ mesh.userData.layer='lvl'; group.add(mesh); return mesh; }
+function goldHalo(group,r=8.8){
+  const ring=new THREE.Mesh(new THREE.RingGeometry(r,r+0.7,40),
+    new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:.5,side:THREE.DoubleSide}));
+  ring.rotation.x=-Math.PI/2; ring.position.y=0.06; addLvl(group,ring);
+}
+function updatePrecapVisuals(){
+  const ug=zoneGroups['Usine'];
+  if(ug){
+    clearLayer(ug,'pc');
+    if(state.buildings.atelier>0){
+      // halo doré (bref/contextuel) autour de l'atelier naissant
+      if(gamePhase==='precapital'){
+        const ring=new THREE.Mesh(new THREE.RingGeometry(8.6,9.3,40),
+          new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:.4,side:THREE.DoubleSide}));
+        ring.rotation.x=-Math.PI/2; ring.position.y=0.07; ring.userData.layer='pc'; ug.add(ring);
+      }
+      if(state.buildings.outils>0){                  // outils, caisses, matières
+        const c1=box(1.8,1.3,1.8,COL.brun,-4.5,0.65,3.5,false); c1.userData.layer='pc'; ug.add(c1);
+        const c2=box(1.5,1.0,1.5,COL.brun,-2.6,0.5,4.6,false);  c2.userData.layer='pc'; ug.add(c2);
+        const c3=box(1.2,0.8,1.2,COL.pierre,-5.4,0.4,5.0,false); c3.userData.layer='pc'; ug.add(c3);
+      }
+      if(state.travailleurs>0){                       // un ouvrier dans l'atelier
+        const body=box(0.9,2.0,0.7,COL.bleu,2.6,1.0,3.4,false); body.userData.layer='pc'; ug.add(body);
+        const head=box(0.7,0.7,0.7,0xc9a06a,2.6,2.4,3.4,false); head.userData.layer='pc'; ug.add(head);
+      }
+      if(state.firstProduced && !state.firstSold){    // la première marchandise
+        const m=box(1.9,1.9,1.9,COL.or,0.5,0.95,5.2,false); m.userData.layer='pc'; ug.add(m);
+      }
+    }
+  }
+  // Place d'embauche : 2-3 silhouettes une fois le marché du travail ouvert
+  const tg=zoneGroups['Marché du travail'];
+  if(tg){
+    clearLayer(tg,'pc');
+    if(state.buildings.travail>0){
+      const xs=[-3,0,3.2], zs=[2.5,3.6,2.2];
+      for(let i=0;i<3;i++){
+        const b=box(0.8,1.9,0.6,COL.froid,xs[i],0.95,zs[i],false); b.userData.layer='pc'; tg.add(b);
+        const h=box(0.6,0.6,0.6,0xb9966a,xs[i],2.25,zs[i],false); h.userData.layer='pc'; tg.add(h);
+      }
+    }
+  }
+}
+function updateBuildings(){
+  const b=state.buildings, zg=zoneGroups;
+  updatePrecapVisuals();
+  // Banque : étages dorés + halo
+  if(zg['Banque']){ clearLayer(zg['Banque'],'lvl');
+    for(let i=1;i<b.banque;i++){ addLvl(zg['Banque'], box(11-i*1.2,2.4,9-i*1.2,COL.or,0,12.4+i*2.4,0)); }
+    if(b.banque>1) goldHalo(zg['Banque']);
+  }
+  // Usine : cheminées supplémentaires (avec fumée)
+  if(zg['Usine']){ clearLayer(zg['Usine'],'lvl');
+    const extra=Math.min(5,b.usine-1);
+    for(let i=0;i<extra;i++){ const x=6+i*2.4;
+      addLvl(zg['Usine'], box(1.8,11+i,1.8,COL.charbon,x,(11+i)/2,-2));
+      const smoke=new THREE.Mesh(new THREE.SphereGeometry(1.6,8,8),
+        new THREE.MeshStandardMaterial({color:0x8a8275,transparent:true,opacity:.5,flatShading:true}));
+      smoke.position.set(x,15.5+i,-2); smoke.userData.smoke=true; addLvl(zg['Usine'],smoke);
+    }
+    // mécanisation : l'usine se remplit de machines à mesure que niveauMachine monte (design qui évolue)
+    const nm=Math.min(7,state.niveauMachine||0);
+    for(let i=0;i<nm;i++){ const mx=-7+(i%4)*4, mz=4+Math.floor(i/4)*4;
+      const unit=box(2.6,2.0,1.8, i<4?COL.fer:COL.charbon, mx,1.0,mz, false); addLvl(zg['Usine'],unit);
+      const gear=new THREE.Mesh(new THREE.TorusGeometry(0.9,0.28,6,10),
+        new THREE.MeshStandardMaterial({color:COL.or,metalness:0.4,roughness:0.5,flatShading:true}));
+      gear.position.set(mx,2.6,mz); gear.rotation.x=Math.PI/2; gear.userData.gear=true; addLvl(zg['Usine'],gear);
+    }
+    if((state.niveauMachine||0)>=5){ goldHalo(zg['Usine']); }   // grande mécanisation : halo
+    else if(b.usine>1) goldHalo(zg['Usine']);
+  }
+  // Entrepôt : caisses de base supplémentaires + halo
+  if(zg['Entrepôt']){ clearLayer(zg['Entrepôt'],'lvl');
+    const extra=Math.min(5,b.entrepot-1);
+    for(let i=0;i<extra;i++){ addLvl(zg['Entrepôt'], box(2.2,2.2,2.2,0x70583e,-9+i*2.4,1.1,-5)); }
+    if(b.entrepot>1) goldHalo(zg['Entrepôt']);
+  }
+  // Marché : stands supplémentaires
+  if(zg['Marché de vente']){ clearLayer(zg['Marché de vente'],'lvl');
+    const extra=Math.min(5,b.marche-1);
+    const cols=[COL.or,COL.bleu,COL.rouge,COL.brun,COL.vert];
+    for(let i=0;i<extra;i++){ addLvl(zg['Marché de vente'], box(2.6,1.5,2,cols[i%5],-5+i*2.6,1,5)); }
+    if(b.marche>1) goldHalo(zg['Marché de vente']);
+  }
+  // Quartier ouvrier : maisons supplémentaires
+  if(zg['Quartier ouvrier']){ clearLayer(zg['Quartier ouvrier'],'lvl');
+    const extra=Math.min(6,b.quartier-1);
+    for(let i=0;i<extra;i++){ const x=-6+i*2.6, z=6+(i%2)*2.4, h=2.8+(i%3)*0.6;
+      addLvl(zg['Quartier ouvrier'], box(2.6,h,2.6,COL.froid,x,h/2,z));
+      const roof=new THREE.Mesh(new THREE.ConeGeometry(2.1,1.4,4),
+        new THREE.MeshStandardMaterial({color:0x4a5763,flatShading:true}));
+      roof.position.set(x,h+0.7,z); roof.rotation.y=Math.PI/4; addLvl(zg['Quartier ouvrier'],roof);
+    }
+  }
+  // Marché du travail : file d'ouvriers plus longue
+  if(zg['Marché du travail']){ clearLayer(zg['Marché du travail'],'lvl');
+    const extra=Math.min(8,(b.travail-1)*2);
+    for(let i=0;i<extra;i++){ const x=-2-(i%2)*1.3, z=-3+i*1.2;
+      addLvl(zg['Marché du travail'], box(0.9,1.7,0.6,COL.bleu,x,1.05,z));
+      const head=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,8),
+        new THREE.MeshStandardMaterial({color:0x42525f,flatShading:true}));
+      head.position.set(x,2.2,z); addLvl(zg['Marché du travail'],head);
+    }
+  }
+  // Port : activé -> halo + caisses d'import/export supplémentaires
+  if(zg['Port · Marché mondial']){ clearLayer(zg['Port · Marché mondial'],'lvl');
+    if(b.port>0){ goldHalo(zg['Port · Marché mondial']);
+      const cols=[COL.rouge,COL.bleu,COL.or];
+      for(let i=0;i<3;i++) addLvl(zg['Port · Marché mondial'], box(2.4,2,2.2,cols[i%3],-4+i*3,1,-2)); }
+  }
+  // Bourse : activée -> halo + bulles supplémentaires
+  if(zg['Bourse']){ clearLayer(zg['Bourse'],'lvl');
+    if(b.bourse>0){ goldHalo(zg['Bourse']);
+      for(let i=0;i<3;i++){ const bb=new THREE.Mesh(new THREE.SphereGeometry(0.9+i*0.4,12,12),
+        new THREE.MeshStandardMaterial({color:COL.or,transparent:true,opacity:.7,flatShading:true}));
+        bb.position.set(2+i*2,9+i,3); bb.userData.bubble=i+3; addLvl(zg['Bourse'],bb); } }
+  }
+  // Rails : relient Usine -> Entrepôt -> Marché de vente
+  if(railsGroup){ scene.remove(railsGroup); railsGroup=null; }
+  if(b.rails>0){
+    railsGroup=new THREE.Group();
+    const seq=['Usine','Entrepôt','Marché de vente'];
+    for(let i=0;i<seq.length-1;i++){
+      const a=zones.find(z=>z.name===seq[i]).pos, c=zones.find(z=>z.name===seq[i+1]).pos;
+      const dx=c.x-a.x, dz=c.z-a.z, len=Math.hypot(dx,dz), ang=Math.atan2(dx,dz);
+      for(const off of [-0.6,0.6]){
+        const rail=box(0.25,0.18,len, 0x4a4236, (a.x+c.x)/2+Math.cos(ang)*off, 0.2, (a.z+c.z)/2-Math.sin(ang)*off, false);
+        rail.rotation.y=ang; railsGroup.add(rail);
+      }
+      const ties=Math.floor(len/3);
+      for(let k=0;k<=ties;k++){ const tx=a.x+dx*k/ties, tz=a.z+dz*k/ties;
+        const tie=box(2,0.16,0.4,0x5a4a36,tx,0.18,tz,false); tie.rotation.y=ang; railsGroup.add(tie); }
+    }
+    scene.add(railsGroup);
+  }
+  if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
+}
+
+/* ---- visibilité des zones : rien n'est "déjà bâti" au départ ---- */
+// built? -> on montre la structure ; sinon -> plaque "Pas encore construit / Débloqué par l'accumulation"
+const ZONE_VIS = {
+  'Usine':              {built:()=>state.buildings.atelier>0,            txt:'Terrain disponible', vacant:true},
+  'Marché du travail':  {built:()=>state.buildings.travail>0,            txt:'Place d’embauche — non ouverte'},
+  'Entrepôt':           {built:()=>state.buildings.entrepot>0,           txt:'Débloqué par l’accumulation'},
+  'Quartier ouvrier':   {built:()=>state.travailleurs>0||state.buildings.quartier>0, txt:'Débloqué par l’accumulation'},
+  'Bourse':             {built:()=>state.buildings.bourse>0,             txt:'Débloqué par l’accumulation'},
+  'Port · Marché mondial':{built:()=>state.buildings.port>0,             txt:'Débloqué par l’accumulation'},
+  'Banque':             {built:()=>state.buildings.banque>0,             txt:'', comptoir:true},
+};
+function setBaseVisible(group,on){ group.children.forEach(m=>{ if(m.userData&&m.userData.base) m.visible=on; }); }
+/* v53 : chaque rafraîchissement de visibilité refait aussi le bâtiment du joueur selon son âge */
+function updateZoneVisibility(){
+  if(typeof refreshPlayerPlant==='function') refreshPlayerPlant();   // v53
+  for(const [name,cfg] of Object.entries(ZONE_VIS)){
+    const g=zoneGroups[name]; if(!g) continue;
+    const built=cfg.built();
+    setBaseVisible(g, built);
+    clearLayer(g,'ph');
+    if(!built){
+      if(cfg.comptoir){ // banque non développée : un simple comptoir / coffre
+        const chest=box(4,2,3,COL.brun,0,1,0,false); chest.userData.layer='ph'; g.add(chest);
+        const lid=box(4.2,0.5,3.2,COL.or,0,2.2,0,false); lid.userData.layer='ph'; g.add(lid);
+        const lab=makeLabel('Comptoir'); lab.scale.set(6,1.4,1); lab.position.set(0,5,0); lab.userData.layer='ph'; g.add(lab);
+      } else {
+        const plot=new THREE.Mesh(new THREE.CircleGeometry(6,24),
+          new THREE.MeshStandardMaterial({color:0x9d9170,transparent:true,opacity:.5}));
+        plot.rotation.x=-Math.PI/2; plot.position.y=0.05; plot.userData.layer='ph'; g.add(plot);
+        if(cfg.vacant){
+          // terrain vide : quelques piquets + panneau planté
+          const stakes=[[-5,-4],[5,-4],[-5,4],[5,4],[0,5.4]];
+          stakes.forEach(([sx,sz])=>{ const p=box(0.25,1.6,0.25,COL.brun,sx,0.8,sz,false); p.userData.layer='ph'; g.add(p); });
+          const post=box(0.3,2.4,0.3,COL.brun,-3,1.2,-1,false); post.userData.layer='ph'; g.add(post);
+          const sign=box(4.6,1.8,0.25,COL.papier,-1,2.6,-1,false); sign.userData.layer='ph'; g.add(sign);
+        }
+        const lab=makeLabel(cfg.txt); lab.scale.set(9,1.5,1); lab.position.set(0,4,0); lab.userData.layer='ph'; g.add(lab);
+      }
+    }
+  }
+}
+
+/* ---- Phase 0 : production et vente fondatrices (cycle allégé, sans concurrence/crise) ---- */
+function precapitalProduce(){
+  const prod = 1*(1+0.5*(state.niveauMachine-1));
+  const heuresEff = state.heures*(1-0.55*state.fatigue);
+  const Q = Math.max(1, Math.round(state.travailleurs*heuresEff*prod));
+  const v = state.travailleurs*state.salaire;        // salaire avancé
+  const matieres = Q*MAT_PAR_UNITE;                  // matières (pas d'usure : simples outils)
+  state.argent -= (v+matieres);                      // capital avancé
+  state.stocks += Q;
+  state._pcQ = Q; state._pcRecette = Q*state.prixUnitaire; state._pcCost = v+matieres;
+  state._pcPlus = Math.max(0, Q - v);                // plus-value approx (valeur nouvelle − salaire)
+  state.firstProduced = true;
+}
+function precapitalSell(){
+  const Q = state._pcQ||0;
+  state.argent += (state._pcRecette||0);             // l'argent revient augmenté
+  state.stocks = Math.max(0, state.stocks-Q);
+  state.firstSold = true;
+}
+// Transition : le capital est né -> on bascule en phase circuit
+let pendingBirth=false;
+function birthOfCapital(){
+  gamePhase='circuit';
+  if(typeof PlayerDistrict!=='undefined') PlayerDistrict.mark();   // v50 : ton quartier porte tes couleurs dès la fondation
+  showChantierBtn(false);
+  state.cycle=0;                       // le 1er circuit réel sera le cycle 1 (moteur doux)
+  recomputeProduction();
+  updateBuildings(); updateZoneVisibility(); updateConsequences(); updateHUD();
+  refreshNiveauVille(); renderCircuitBar();
+  if(circuitLine) circuitLine.visible=true;   // la ligne du circuit s'allume
+  flashTimer=0.9;                             // éclat à l'écran
+  ['Banque','Usine','Marché de vente'].forEach(n=>fxPing(n)); // le circuit s'éveille
+  afterConcept=()=>{ renderQuest(); renderCircuitBar(); moveTargetMarker(); updateHUD(); updateVilleBadge(); tutorialCoachRefresh(true); };
+  showConcept(BIRTH_SCREEN);           // "Le capital est né" (onClose: unlockVoile)
+}
+
+/* ---- panneau "Choisir une amélioration" ---- */
+let pendingAfterUpgrade=null, foundingMode=false;
+function refreshUpgradeChrome(){
+  const skip=document.getElementById('upgrade-skip');
+  const h2=document.getElementById('upgrade-h2'), sub=document.getElementById('upgrade-sub');
+  if(foundingMode){
+    document.getElementById('upgrade-stade').textContent='Phase 0 — Argent dormant';
+    if(h2) h2.textContent='Plan du chantier';
+    if(sub) sub.textContent='Les conditions du capital se construisent sur la carte. Voici ce qu’il reste à faire, et où aller.';
+    const checklist=`<div class="ucheck">${sousObjHTML()}</div>`;
+    document.getElementById('upgrade-capital').innerHTML=`Argent dormant : <b>${money(state.argent)}</b>${checklist}`;
+    skip.textContent='Voir la carte ▸';
+    skip.disabled=false;
+  } else {
+    const niv=state.niveauVille, st=STAGES[niv]||STAGES[0];
+    if(h2) h2.textContent='Choisir une amélioration';
+    if(sub) sub.textContent='Le profit réalisé peut être réinvesti : accumuler, c’est transformer l’espace social. Choisis une amélioration — ou garde ton capital.';
+    document.getElementById('upgrade-stade').textContent=`Développement du capital : niveau ${niv} / 7 — ${st.n}`;
+    document.getElementById('upgrade-capital').innerHTML=`Capital disponible : <b>${money(state.argent)}</b>`;
+    skip.textContent='Garder mon capital ▸';
+    skip.disabled=false;
+  }
+}
+function openUpgrade(after, mode){
+  if(mode!=='founding' && !upgradesUnlocked()){
+    const fn=after||resumePlay; if(fn) fn();
+    return;
+  }
+  pendingAfterUpgrade=after||null;
+  foundingMode = (mode==='founding');
+  document.getElementById('upanel-result').style.display='none';
+  document.getElementById('upanel-choose').style.display='block';
+  refreshUpgradeChrome();
+  renderUpgradeDeck();
+  document.getElementById('upgrade').classList.add('on');
+}
+function openFounding(){
+  pushLog('Développement','Le plan du chantier sera débloqué plus tard, avec la Grande industrie. Pour l’instant, construis directement sur la carte avec E.','plain');
+  resumePlay();
+}
+// où réaliser chaque action fondatrice (pour le « Plan du chantier »)
+const FOUNDING_PLACE = {atelier:'Terrain disponible', outils:'Marché local — moyens', travail0:'Place d’embauche',
+  embauche0:'Atelier', produire:'Atelier', vendre:'Marché local — vente'};
+function renderUpgradeDeck(){
+  const deck=document.getElementById('upgrade-deck'); deck.innerHTML='';
+  if(foundingMode){
+    // Plan du chantier : informatif uniquement — on agit sur la carte
+    UPGRADES.filter(u=>u.founding).forEach(u=>{
+      const cost=upgradeCost(u);
+      const done = u.avail ? (!u.avail() && (u.id==='embauche0'?state.travailleurs>0:(u.id==='produire'?state.firstProduced:(u.id==='vendre'?state.firstSold:state.buildings[u.b]>0)))) : (u.once&&state.buildings[u.b]>0);
+      const btn=document.createElement('button'); btn.className='ucard'; btn.disabled=true;
+      btn.innerHTML=`<div class="uct">${u.t}<span class="ulvl">${done?'✓ fait':'à faire'}</span></div>`+
+        `<div class="ucost">${cost>0?money(cost):'gratuit'} &nbsp;·&nbsp; sur la carte : <b>${FOUNDING_PLACE[u.id]||''}</b></div>`+
+        `<div class="ueff"><span class="ef">${u.eff}</span><br><span class="cq">${u.cq}</span></div>`;
+      deck.appendChild(btn);
+    });
+    return;
+  }
+  UPGRADES.filter(u=> !u.founding && upgradeAvailable(u)).forEach(u=>{
+    const cost=upgradeCost(u);
+    const tag = u.once?'nouveau':'niv. '+(u.b==='usine'&&u.id==='machine'?state.niveauMachine:state.buildings[u.b]);
+    const can = state.argent>=cost;
+    const btn=document.createElement('button'); btn.className='ucard'; btn.disabled=!can;
+    btn.innerHTML=`<div class="uct">${u.t}<span class="ulvl">${tag}</span></div>`+
+      `<div class="ucost">${cost>0?money(cost):'gratuit'}${can?'':' · capital insuffisant'}</div>`+
+      `<div class="ueff"><span class="ef">${u.eff}</span><br><span class="cq">${u.cq}</span></div>`+
+      `<div class="uvis">${u.vis}</div>`;
+    btn.onclick=()=>applyUpgrade(u);
+    deck.appendChild(btn);
+  });
+}
+function applyUpgrade(u){
+  const cost=upgradeCost(u);
+  if(state.argent<cost) return;
+  state.argent-=cost;
+  u.apply(state);
+  if(!u.founding) state._investedThisCycle = true;   // construire / élargir = investir
+  recomputeProduction();
+  if(u.final) pendingBirth=true;        // la vente fondatrice fait naître le capital
+  pushLog('Ville',`${u.t}${cost>0?` (−${money(cost)})`:''}. ${u.eff}. ${u.cq}.`,'plain');
+  updateBuildings(); updateZoneVisibility(); updateConsequences(); updateHUD();
+  if(typeof LivingWorld!=='undefined'){
+    const ZMAP={atelier:'Usine',outils:'Usine',usine:'Usine',machine:'Usine',entrepot:'Entrepôt',
+      quartier:'Quartier ouvrier',marche:'Marché de vente',travail:'Marché du travail',banque:'Banque',
+      rails:'Usine',port:'Port · Marché mondial',bourse:'Bourse'};
+    const zn=ZMAP[u.b||u.id];
+    if(zn&&zoneGroups[zn]){ animateConstruction(zoneGroups[zn]);
+      const ty=u.id==='quartier'?'social':((u.id==='bourse'||u.id==='port')?'crise':'gain');
+      const p=zonePos(zn); floatText((u.eff||u.t).replace(/^[+\u2212\-]\s*/,''),{x:p.x,y:8,z:p.z},ty); }
+  }
+  const monte = u.founding ? null : updateCapitalStage();
+  document.getElementById('ures-title').textContent=u.t;
+  document.getElementById('ures-effects').innerHTML=`<span class="ef">${u.eff}</span><span class="cq">${u.cq}</span>`;
+  let marx=`<b>Tu n’as pas seulement amélioré un bâtiment : tu as modifié le rapport social qu’il organise.</b> ${u.marx}`;
+  if(monte) marx+=`<br><br><b>Nouveau stade — ${monte.n}.</b> ${monte.contradiction}`;
+  document.getElementById('ures-marx').innerHTML=marx;
+  document.getElementById('upanel-choose').style.display='none';
+  document.getElementById('upanel-result').style.display='block';
+}
+function closeUpgrade(){
+  document.getElementById('upgrade').classList.remove('on');
+  const fn=pendingAfterUpgrade; pendingAfterUpgrade=null; if(fn) fn();
+}
+document.getElementById('upgrade-skip').addEventListener('click',()=>{
+  if(foundingMode){ closeUpgrade(); return; }   // "Voir la carte" : regarder le chantier
+  closeUpgrade();
+});
+document.getElementById('upgrade-continue').addEventListener('click',()=>{
+  if(pendingBirth){                       // la première vente vient d'avoir lieu
+    pendingBirth=false; foundingMode=false;
+    document.getElementById('upgrade').classList.remove('on');
+    birthOfCapital();
+    return;
+  }
+  if(foundingMode){                       // en phase 0 : revenir bâtir la suite
+    document.getElementById('upanel-result').style.display='none';
+    document.getElementById('upanel-choose').style.display='block';
+    refreshUpgradeChrome(); renderUpgradeDeck();
+  } else closeUpgrade();
+});
+
+/* ===================================================================
+   Cartes de décision (à l'usine)
+   =================================================================== */
+const DECK = [
+  {id:'jour', t:'Allonger la journée',
+   ups:['+ plus-value'], dns:['+ fatigue','+ colère'], cost:'+1 h de travail',
+   can:()=>state.heures<state.limiteJournee,
+   fx:[['production','+'],['fatigue +8 %','-'],['colère +5 %','-']],
+   chain:['Tu allonges la journée de travail','→ le surtravail augmente','→ plus de plus-value extraite','→ mais la fatigue et la colère montent'],
+   marx:'Tu augmentes la <b>plus-value absolue</b> : en allongeant la journée sans payer plus, tu arraches davantage de surtravail à la même force de travail.',
+   play:()=>{ state.heures=Math.min(state.limiteJournee,state.heures+1);
+     pushLog(productionPlaceLabel(),'La journée s’allonge d’une heure. On arrache plus de surtravail — mais les corps s’usent.','social'); }},
+  {id:'jour_down', t:'Réduire la journée',
+   ups:['− fatigue','− colère'], dns:['− production','− plus-value absolue'], cost:'−1 h de travail',
+   can:()=>state.heures>8,
+   fx:[['fatigue −10 %','+'],['colère −5 %','+'],['production','-']],
+   chain:['Tu réduis la journée de travail','→ les corps récupèrent','→ la colère retombe','→ mais le temps de surtravail diminue','→ la plus-value absolue baisse'],
+   marx:'Tu limites l’extraction de <b>plus-value absolue</b> : moins d’heures travaillées, c’est moins de surtravail, mais aussi une force de travail moins épuisée.',
+   play:()=>{ state.heures=Math.max(8,state.heures-1); state.fatigue=clamp(state.fatigue-0.10);
+     state.colere=clamp(state.colere-0.05); state.sante=clamp(state.sante+0.04);
+     pushLog(productionPlaceLabel(),`Journée ramenée à ${state.heures} h. La fatigue baisse, mais le surtravail disponible diminue.`,'social'); }},
+  {id:'sal', t:'Augmenter les salaires',
+   ups:['− colère','+ demande ouvrière'], dns:['− profit'], cost:'+1 £ / ouvrier',
+   can:()=>true,
+   fx:[['colère −7 %','+'],['demande ouvrière','+'],['profit','-']],
+   chain:['Tu augmentes les salaires','→ la colère ouvrière retombe','→ la demande solvable des ouvriers monte','→ mais le capital variable coûte plus cher','→ la part qui revient au capital diminue'],
+   marx:'Tu rends une part plus grande de la valeur au travail : la paix sociale et la demande ouvrière se paient d’une <b>plus-value</b> plus faible.',
+   play:()=>{ state.salaire+=1; state.colere=clamp(state.colere-0.07);
+     pushLog(productionPlaceLabel(),`Salaire porté à ${state.salaire} £. La colère retombe et la demande ouvrière se renforce, mais la part qui revient au capital diminue.`); }},
+  {id:'sal_down', t:'Baisser les salaires',
+   ups:['+ profit potentiel','+ taux d’exploitation'], dns:['+ colère','− demande ouvrière'], cost:'−1 £ / ouvrier',
+   can:()=>state.salaire>3,
+   fx:[['profit potentiel','+'],['taux d’exploitation','+'],['colère +9 %','-'],['demande ouvrière','-']],
+   chain:['Tu baisses les salaires','→ le capital variable diminue','→ la plus-value potentielle augmente','→ mais la colère ouvrière monte','→ la demande solvable se fragilise'],
+   marx:'Tu abaisses la valeur payée à la force de travail : la part du <b>travail nécessaire</b> diminue et le taux d’exploitation monte, mais la reproduction sociale et la paix ouvrière se fragilisent.',
+   play:()=>{ state.salaire=Math.max(3,state.salaire-1); state.colere=clamp(state.colere+0.09);
+     state.conscience=clamp(state.conscience+0.03);
+     pushLog(productionPlaceLabel(),`Salaire abaissé à ${state.salaire} £. Le capital variable diminue et le taux d’exploitation monte, mais la colère ouvrière monte et la demande se fragilise.`,'social'); }},
+  {id:'hire', t:'Embaucher',
+   ups:['+ production'], dns:['+ masse salariale'], cost:'+1 ouvrier',
+   can:()=>state.travailleurs<state.populationActive,
+   fx:[['production','+'],['masse salariale','-']],
+   chain:['Tu embauches un ouvrier','→ plus de travail vivant','→ plus de valeur créée','→ mais plus de salaires à avancer'],
+   marx:'Tu ajoutes du <b>travail vivant</b> — la seule source de valeur nouvelle. Plus de bras, donc plus de plus-value possible, mais aussi plus de capital variable à avancer.',
+   play:()=>{ state.travailleurs=Math.min(state.populationActive,state.travailleurs+1); state._investedThisCycle=true; recomputeProduction(); updateCapitalStage();
+     pushLog(productionPlaceLabel(),`Un ouvrier de plus (${state.travailleurs}). Plus de travail vivant — donc plus de valeur, et plus de salaires à avancer.`); }},
+  {id:'fire', t:'Licencier',
+   ups:['− masse salariale'], dns:['+ chômage','+ colère'], cost:'−1 ouvrier',
+   can:()=>state.travailleurs>1,
+   fx:[['masse salariale','+'],['chômage','-'],['colère +6 %','-']],
+   chain:['Tu licencies un ouvrier','→ la masse salariale baisse','→ l’armée de réserve grossit','→ le chômage et la colère augmentent'],
+   marx:'Tu grossis l’<b>armée industrielle de réserve</b> : ces sans-emploi font pression à la baisse sur les salaires de ceux qui restent.',
+   play:()=>{ state.travailleurs=Math.max(1,state.travailleurs-1); state.colere=clamp(state.colere+0.06); recomputeProduction();
+     pushLog(productionPlaceLabel(),`Un ouvrier jeté à la rue (${state.travailleurs} restants). L’armée de réserve grossit ; la colère monte.`,'social'); }},
+  {id:'mach', t:'Acheter une machine à crédit', whapAction:'Tu as mécanisé en t’endettant.',
+   ups:['+ productivité'], dns:['+ dette (+200 £)','+ chômage'], cost:'⚠ Dette +200 £ (achat à crédit)',
+   can:()=>state.cycle>2,
+   fx:[['productivité','+'],['dette +200 £','-'],['chômage','-']],
+   chain:['Tu achètes une machine à crédit','→ +200 £ de dette','→ la productivité augmente','→ le besoin de travail vivant diminue','→ le chômage augmente','→ pression à la baisse sur les salaires'],
+   marx:'Tu alourdis le <b>capital constant</b>, et à crédit : la composition organique monte, la machine remplace les bras — mais la dette ponctionnera le profit à venir.',
+   play:()=>{ state.niveauMachine++; state.dette+=200; state._cycleMachine=(state._cycleMachine||0)+1; state._investedThisCycle=true; updateCapitalStage();
+     pushLog(productionPlaceLabel(),`Machine installée à crédit (niveau ${state.niveauMachine}, +200 £ de dette). Le capital constant s’alourdit ; il faudra moins de bras, et la dette se rembourse avec intérêts.`,'warn'); }},
+  {id:'surv', t:'Intensifier la surveillance', can:()=>state.niveauVille>=2,
+   ups:['+ productivité (discipline)'], dns:['+ peur du chômage','+ colère'], cost:'discipline accrue',
+   fx:[['productivité','+'],['peur du chômage','-'],['colère','-']],
+   chain:['Tu intensifies la surveillance','→ le rythme se discipline','→ un peu plus de productivité','→ mais la peur et la colère montent'],
+   marx:'La discipline d’atelier extrait davantage de travail dans le même temps — mais elle aiguise l’antagonisme entre capital et travail.',
+   play:()=>{ state.disciplineBonus=Math.min(1.12,(state.disciplineBonus||1)+0.03); state.peurChomage=clamp(state.peurChomage+0.08); state.colere=clamp(state.colere+0.05); state.conscience=clamp(state.conscience+0.04);
+     pushLog(productionPlaceLabel(),'Surveillance renforcée : le rythme se discipline, mais la colère couve.','social'); }},
+  {id:'secu', t:'Améliorer la sécurité', can:()=>state.niveauVille>=2 && state.argent>=50,
+   ups:['− accidents','− colère','+ santé'], dns:['− trésorerie'], cost:'−50 £',
+   fx:[['accidents','+'],['colère','+'],['santé','+'],['trésorerie −50 £','-']],
+   chain:['Tu investis dans la sécurité','→ moins d’accidents','→ la colère retombe','→ mais la trésorerie baisse'],
+   marx:'Préserver la force de travail coûte aujourd’hui, mais entretient la source même de la valeur.',
+   play:()=>{ state.argent-=50; state.securiteNiveau=(state.securiteNiveau||0)+1; state.sante=clamp(state.sante+0.10); state.colere=clamp(state.colere-0.08);
+     if(state.revendication==='securite') state.revendication=null;
+     pushLog(productionPlaceLabel(),'Sécurité améliorée (−50 £) : moins d’accidents, colère apaisée.'); }},
+  {id:'prime', t:'Promettre une prime', can:()=>state.niveauVille>=2 && state.argent>=30,
+   ups:['− colère (temporaire)'], dns:['− trésorerie','colère ↑ plus tard si non renouvelée'], cost:'−30 £',
+   fx:[['colère','+'],['trésorerie −30 £','-']],
+   chain:['Tu promets une prime','→ la colère retombe maintenant','→ mais la promesse crée une attente','→ non renouvelée, la colère remonte'],
+   marx:'La prime achète une paix sociale provisoire : la concession différée ne supprime pas l’antagonisme, elle le reporte.',
+   play:()=>{ state.argent-=30; state.colere=clamp(state.colere-0.12); state._primeActive=2;
+     pushLog(productionPlaceLabel(),'Prime promise (−30 £) : la colère retombe — pour un temps.','social'); }},
+];
+// --- décisions à la banque : crédit volontaire, jamais automatique ---
+function emprunter(montant){
+  const place=Math.max(0, state.plafondCredit - state.dette);
+  const e=Math.min(montant, place);
+  if(e<=0) return;
+  state.dette+=e; state.argent+=e; state._cycleCredit+=e;
+  pushLog('Banque',`Emprunt de ${money(e)}. Dette : ${money(state.dette)} (taux ${pct(state.tauxInteret)}). Le crédit avance du capital — mais il se rembourse avec intérêts.`,'warn');
+}
+function rembourser(montant){
+  const m=Math.min(montant, state.dette, Math.max(0,state.argent));
+  if(m<=0) return;
+  state.dette-=m; state.argent-=m; state._cycleRepay+=m;
+  rememberEvent(state,'bankers','remboursement','remboursement');
+  pushLog('Banque',`Remboursement de ${money(m)}. Dette : ${money(state.dette)}. Les intérêts futurs diminuent.`);
+}
+const BANK_DECK = [
+  {id:'emp50', t:'Emprunter 50 £', ups:['+ trésorerie'], dns:['+ dette','+ intérêts futurs'], cost:'+50 £ de dette',
+   can:()=>state.plafondCredit-state.dette>=50,
+   fx:[['trésorerie +50 £','+'],['dette +50 £','-']],
+   chain:['Tu empruntes 50 £','→ du capital frais à avancer','→ mais une dette à rembourser','→ avec intérêts'],
+   marx:'Le crédit avance du capital que tu n’as pas encore : il accélère le circuit, mais le capital financier prélèvera sa part.',
+   play:()=>emprunter(50)},
+  {id:'emp100', t:'Emprunter 100 £', ups:['+ trésorerie'], dns:['+ dette','+ intérêts futurs'], cost:'+100 £ de dette',
+   can:()=>state.plafondCredit-state.dette>=100,
+   fx:[['trésorerie +100 £','+'],['dette +100 £','-']],
+   chain:['Tu empruntes 100 £','→ plus de capital à avancer','→ mais une dette plus lourde'],
+   marx:'Emprunter, c’est mobiliser le capital d’autrui : utile pour investir, mais la charge d’intérêt pèse sur le profit futur.',
+   play:()=>emprunter(100)},
+  {id:'emp200', t:'Emprunter 200 £', ups:['+ trésorerie'], dns:['+ dette','+ intérêts futurs'], cost:'+200 £ de dette',
+   can:()=>state.plafondCredit-state.dette>=200,
+   fx:[['trésorerie +200 £','+'],['dette +200 £','-']],
+   chain:['Tu empruntes 200 £','→ de quoi mécaniser','→ mais un service de la dette élevé'],
+   marx:'Le crédit permet d’investir au-delà de ses moyens — au prix d’une dépendance au capital financier.',
+   play:()=>emprunter(200)},
+  {id:'remb50', t:'Rembourser 50 £', ups:['− dette','− intérêts futurs'], dns:['− trésorerie'], cost:'−50 £',
+   can:()=>state.dette>0 && state.argent>=50,
+   fx:[['dette −50 £','+'],['trésorerie −50 £','-']],
+   chain:['Tu rembourses 50 £','→ la dette diminue','→ les intérêts futurs baissent','→ mais ta trésorerie baisse maintenant'],
+   marx:'Rembourser, c’est rendre au capital financier sa part : moins d’intérêts demain, mais moins de capital disponible aujourd’hui.',
+   play:()=>rembourser(50)},
+];
+let activeDeck='usine';
+function deckFor(which){ return which==='bank'?BANK_DECK:DECK; }
+function openCards(which){
+  activeDeck = which || 'usine';
+  const bank = activeDeck==='bank';
+  document.querySelector('#cards .panel h3').textContent = bank ? 'À la banque — le crédit' : 'À l’usine — le procès de production';
+  document.querySelector('#cards .panel .sub').textContent = bank
+    ? 'Le crédit est une décision volontaire : il avance du capital, mais se rembourse avec intérêts. Rien n’est emprunté automatiquement.'
+    : 'C’est ici que le capital se valorise. Chaque décision arrache plus de valeur — et produit ses propres contradictions.';
+  document.getElementById('cards-note').textContent = bank
+    ? 'Emprunte ou rembourse si tu le souhaites, puis reprends la route.'
+    : 'Joue autant de cartes que tu veux, puis reprends la route vers l’entrepôt (M′).';
+  renderCards();
+  closeWhap();
+  document.getElementById('cards').classList.add('on');
+}
+function renderCards(){
+  const bank = activeDeck==='bank';
+  document.getElementById('cards-now').innerHTML = bank
+    ? `Argent <b>${money(state.argent)}</b> · Dette <b>${money(state.dette)}</b> · Taux <b>${pct(state.tauxInteret)}</b> · Plafond <b>${money(state.plafondCredit||0)}</b>`
+    : `Journée <b>${state.heures} h</b> · Salaire <b>${state.salaire} £</b> · Ouvriers <b>${state.travailleurs}</b> · Machines <b>niv. ${state.niveauMachine}</b> · Argent <b>${money(state.argent)}</b>`;
+  const deck=document.getElementById('cards-deck'); deck.innerHTML='';
+  deckFor(activeDeck).forEach(c=>{
+    const b=document.createElement('button'); b.className='card'; b.disabled=!c.can();
+    b.innerHTML=`<div class="ct">${c.t}</div><div class="eff">`+
+      c.ups.map(u=>`<span><span class="up">▲</span> ${u.replace(/^[+\-−]\s*/,'')}</span>`).join('')+
+      c.dns.map(d=>`<span><span class="dn">▼</span> ${d.replace(/^[+\-−]\s*/,'')}</span>`).join('')+
+      `</div><div class="cost${c.id==='mach'?' debt':''}">${c.cost}</div>`;
+    b.onclick=()=>{ c.play(); renderCards(); updateHUD(); updateConsequences();
+      showWhap({action:c.whapAction||`Tu as joué : <b>${c.t.toLowerCase()}</b>.`, fx:c.fx, chain:c.chain, marx:c.marx}); };
+    deck.appendChild(b);
+  });
+}
+document.getElementById('cards-done').addEventListener('click',()=>{
+  document.getElementById('cards').classList.remove('on');
+  if(currentZone && currentZone.name!=='Usine') showLevers(false);
+});
+
+/* ===================================================================
+   Pédagogie : panneau "Ce qui vient de se passer", mode guidé, journal
+   =================================================================== */
+// niveau de dévoilement : 0 = geste simple (cycle 1) · 1 = plus-value révélée
+function revealLevel(){ return voileUnlocked ? 1 : 0; }
+
+// Pour chaque étape du circuit : le lieu, ce qu'on y fait, son sens,
+// et une lecture courte (simple au cycle 1, marxienne ensuite).
+const ZONE_GUIDE = {
+  'Banque':{ lieu:'La banque avance le capital de départ. C’est le point de départ et de retour du circuit.',
+    todo:'Appuie sur E pour avancer l’argent (A). Tu peux emprunter, mais la dette se rembourse avec intérêts.',
+    sens:'A — l’argent est avancé pour être mis en mouvement, pas pour dormir.',
+    whap:{a:'Tu as avancé le capital de départ (A).', fx:[['capital prêt à circuler','+']],
+      m0:'C’est le point de départ : ton argent va circuler pour revenir augmenté.',
+      m1:'A — l’argent-capital est avancé dans le seul but de revenir grossi : A → A′.'}},
+  'Marché des moyens':{ lieu:'Le marché des moyens de production : machines et matières premières.',
+    todo:'Appuie sur E pour acheter le capital constant (M) nécessaire à la production.',
+    sens:'M — sans matières ni machines, pas de production possible.',
+    whap:{a:'Tu as acheté des moyens de production (M).', fx:[['capital constant engagé','-']],
+      m0:'Tu transformes une partie de ton argent en machines et matières.',
+      m1:'M — l’argent se change en <b>capital constant</b> (c) : il transmet sa valeur au produit sans en créer de nouvelle.'}},
+  'Marché du travail':{ lieu:'Le marché du travail : on y embauche la force de travail.',
+    todo:'Appuie sur E pour engager la force de travail (Ft) : les ouvriers qui produiront.',
+    sens:'Ft — la force de travail est une marchandise particulière : elle crée de la valeur.',
+    whap:{a:'Tu as engagé la force de travail (Ft).', fx:[['capital variable engagé','-']],
+      m0:'Tu paies des ouvriers pour qu’ils travaillent pour toi.',
+      m1:'Ft — l’argent se change en <b>capital variable</b> (v). C’est la seule marchandise qui produit plus de valeur qu’elle ne coûte.'}},
+  'Usine':{ lieu:'L’usine : le procès de production. C’est ici que le capital se valorise.',
+    todo:'Appuie sur E pour ouvrir les cartes de décision : règle la journée, les salaires, les machines, les effectifs.',
+    sens:'P — c’est ici, et nulle part ailleurs, que la valeur nouvelle est créée.',
+    whap:null},
+  'Entrepôt':{ lieu:'L’entrepôt : les marchandises produites s’y entassent avant d’être vendues.',
+    todo:'Appuie sur E pour constater le stock produit (M′).',
+    sens:'M′ — la valeur est désormais incorporée dans des marchandises, mais pas encore réalisée.',
+    whap:{a:'Tu as produit des marchandises (M′).', fx:[['stock à vendre','+']],
+      m0:'Le travail a transformé les matières en marchandises prêtes à vendre.',
+      m1:'M′ — les marchandises contiennent c + v + plus-value, mais cette valeur n’est encore que potentielle : il faut la vendre.'}},
+  'Marché de vente':{ lieu:'Le marché de vente : c’est ici que les marchandises se changent en argent.',
+    todo:'Appuie sur E pour vendre (M′ → A′) et boucler le cycle. Le bilan s’affichera.',
+    sens:'A′ — si tout s’est bien passé, l’argent revient augmenté. La boucle est complète.',
+    whap:null},
+};
+
+let whapTimer=null;
+function showWhap({action,fx,chain,marx}){
+  const w=document.getElementById('whap');
+  document.getElementById('whap-action').innerHTML=action||'—';
+  // effets de jeu
+  const fxe=document.getElementById('whap-effect'); fxe.innerHTML='';
+  (fx||[]).forEach(([label,dir])=>{
+    const s=document.createElement('span');
+    s.className = dir==='+'?'up':(dir==='-'?'dn':'');
+    s.textContent=(dir==='+'?'▲ ':(dir==='-'?'▼ ':''))+label;
+    fxe.appendChild(s);
+  });
+  // enchaînement causal
+  const chBlk=document.getElementById('whap-chainblk'), ch=document.getElementById('whap-chain');
+  if(chain&&chain.length>1){ ch.innerHTML=chain.map((l,i)=>`<span class="lk${i===0?' head':''}">${l}</span>`).join('');
+    chBlk.style.display='block'; }
+  else chBlk.style.display='none';
+  // lecture marxienne
+  document.getElementById('whap-marx').innerHTML=marx||'—';
+  w.classList.add('on'); w.classList.remove('compact');     // déplié d'abord
+  clearTimeout(whapTimer);
+  whapTimer=setTimeout(()=>w.classList.add('compact'), 6500); // puis se replie en version compacte
+}
+function closeWhap(){ const w=document.getElementById('whap'); w.classList.remove('on','compact'); clearTimeout(whapTimer); }
+document.getElementById('whap-x').addEventListener('click',closeWhap);
+document.getElementById('whap-expand').addEventListener('click',()=>{
+  document.getElementById('whap').classList.remove('compact'); clearTimeout(whapTimer);
+});
+
+// journal complet — uniquement les événements réellement vécus, pas les anciennes consignes génériques
+let journalEntries=[];
+function isJournalWorthy(title,text,type){
+  const t=String(title||''), body=String(text||'');
+  if(t==='Affichage' || t==='Développement') return false;
+  if(body.includes('Le circuit ne passe pas encore') || body.includes('Ce lieu sera utile plus tard')) return false;
+  if(body.includes('Pas d’intervention directe') || body.includes('Va d’abord à')) return false;
+  if(body.includes('capital insuffisant') || body.includes('Capital insuffisant')) return false;
+  return true;
+}
+function renderJournalModal(){
+  const b=document.getElementById('journal-body');
+  if(!journalEntries.length){
+    b.innerHTML='<p><b>Journal historique —</b> Aucun événement vécu pour le moment. Les actions de la partie apparaîtront ici au fil du jeu.</p>';
+    return;
+  }
+  b.innerHTML = journalEntries.map(e=>`<p${e.col?` style="color:${e.col}"`:''}>${e.html}</p>`).join('');
+}
+document.getElementById('log-open').addEventListener('click',()=>{
+  renderJournalModal(); document.getElementById('journal').classList.add('on');
+});
+document.getElementById('chantier-btn').addEventListener('click',openFounding);
+function showChantierBtn(on){
+  const b=document.getElementById('chantier-btn');
+  if(b) b.style.display='none'; // v35 : retiré du début de partie ; reviendra plus tard avec la Grande industrie
+}
+document.getElementById('journal-close').addEventListener('click',()=>{
+  document.getElementById('journal').classList.remove('on');
+});
+
+// mode guidé
+let guideMode=true, pendingStep=null;
+// v47 : #guide-toggle n'existe plus dans le HTML (vestige d'une ancienne option) — garde inoffensive conservée.
+const guideToggle=document.getElementById('guide-toggle');
+if(guideToggle) guideToggle.addEventListener('change',e=>{ guideMode=e.target.checked; });
+function showGuide(zone, proceed){
+  const g=ZONE_GUIDE[zone.name]; if(!g){ proceed(); return; }
+  const c=CIRCUIT[step];
+  document.getElementById('guide-sym').textContent=c?c.sym:'';
+  document.getElementById('guide-place').textContent=zone.name;
+  document.getElementById('guide-lieu').textContent=g.lieu;
+  document.getElementById('guide-todo').textContent=g.todo;
+  document.getElementById('guide-sens').textContent=g.sens;
+  pendingStep=proceed;
+  document.getElementById('guide').classList.add('on');
+}
+document.getElementById('guide-ok').addEventListener('click',()=>{
+  document.getElementById('guide').classList.remove('on');
+  const fn=pendingStep; pendingStep=null; if(fn) fn();
+});
+// lecture courte d'une étape (simple au cycle 1, marxienne après)
+function whapForZone(zone){
+  const g=ZONE_GUIDE[zone.name]; if(!g||!g.whap) return;
+  const w=g.whap;
+  showWhap({action:w.a, fx:w.fx, chain:null, marx: revealLevel()===0 ? w.m0 : w.m1});
+}
+
+/* ===================================================================
+   Tutoriel progressif : le guide se retire au fil des cycles
+   Cycle 1 : à chaque étape · Cycle 2 : usine + vente · Cycle 3+ : jamais
+   (les concepts nouveaux passent alors par l'écran de concept)
+   =================================================================== */
+function displayCycle(){ return gamePhase==='precapital' ? 0 : state.cycle+1; }
+function stepGuideZones(){
+  const dc=displayCycle();
+  if(dc<=1) return null;                              // 1er circuit réel : tous les lieux
+  if(dc===2) return new Set(['Usine','Marché de vente']);
+  return new Set();                                   // ensuite : plus de pause d'étape
+}
+function shouldPauseAt(zone){ return false; }
+
+// Lieux verrouillés pendant le cycle 1 (tutoriel circuit pur)
+const LOCKED_C1=new Set(['Quartier ouvrier','État · Tribunal','Mines · Champs','Port · Marché mondial','Bourse']);
+function zoneLocked(name){ return state.cycle===0 && LOCKED_C1.has(name); }
+
+/* ===================================================================
+   Tutoriel v47 — parcours explicite en 6 phases
+   Le tutoriel ne décrit plus le jeu de l'extérieur : chaque phase est
+   un état dérivé de la partie elle-même, et règle la densité de
+   l'interface (classe CSS tuto-pN sur <body>).
+
+     0  Entrée sensible        : le joueur n'a pas encore bougé. Presque pas de texte.
+     1  Circuit par le corps   : phase 'precapital' — construire les conditions en se déplaçant.
+     2  Premier cycle dirigé   : phase 'circuit' — boucler A→M→Ft→P→M′→A′, chaque étape montre ses variables.
+     3  Première contradiction : 1re-2e période sociale — un écran montre la contradiction VÉCUE (cf. maybeShowFirstContradiction).
+     4  Jeu semi-libre         : formation sociale, 3 interventions/période, coach encore présent.
+     5  Lecture systémique     : le tutoriel s'efface — restent jauges, objectif, contradictions, bilans, journal.
+   =================================================================== */
+const Tuto={
+  phase(){
+    if(typeof gameMode!=='undefined' && gameMode==='commune') return 5;
+    if(gamePhase==='precapital') return (TutorialCoach.hasMoved||state.buildings.atelier>0)?1:0;
+    if(gamePhase==='circuit') return 2;
+    if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){
+      if((state.cycle||0)<=2 && !state._contradictionShown) return 3;
+      if((state.cycle||0)<=4) return 4;
+      return 5;
+    }
+    return 5;
+  },
+  _last:-1,
+  applyBodyClass(){
+    const ph=this.phase();
+    if(ph===this._last) return;
+    document.body.classList.remove('tuto-p0','tuto-p1','tuto-p2','tuto-p3','tuto-p4','tuto-p5');
+    document.body.classList.add('tuto-p'+ph);
+    this._last=ph;
+  }
+};
+const TutorialCoach={
+  active:false,
+  minimized:false,
+  lastKey:'',
+  pulseEl:null,
+  tourKey:'',
+  tourIndex:0,
+  startPos:null,
+  hasMoved:false,
+  zoneActionOpen(){ const z=document.getElementById('zoneact'); return !!(z&&z.classList.contains('on')); },
+  setResolveHint(on){
+    const h=document.getElementById('resolve-hint');
+    if(!h) return;
+    if(!on){ h.classList.remove('on'); return; }
+    const rb=document.getElementById('f-cyclebox')||document.getElementById('f-resolve');
+    if(!rb){ h.classList.remove('on'); return; }
+    const r=rb.getBoundingClientRect();
+    if(!r || r.width<=0 || r.height<=0){ h.classList.remove('on'); return; }
+    h.style.top=Math.round(r.top + r.height/2 - 28)+'px';
+    h.style.left=Math.max(8,Math.round(r.left - 232))+'px';
+    h.classList.add('on');
+  },
+  resetMovement(){
+    this.hasMoved=false;
+    try{ this.startPos = Vehicle && Vehicle.pos ? Vehicle.pos.clone() : null; }catch(e){ this.startPos=null; }
+  },
+  updateMovement(){
+    if(this.hasMoved || !this.startPos || !Vehicle || !Vehicle.pos) return;
+    const dx=Vehicle.pos.x-this.startPos.x, dz=Vehicle.pos.z-this.startPos.z;
+    if(Math.hypot(dx,dz)>5) this.hasMoved=true;
+  },
+  clearFocus(){
+    const f=document.getElementById('tuto-focus'); if(f) f.classList.remove('on');
+  },
+  setFocus(item,progressText=''){
+    const f=document.getElementById('tuto-focus'); const lab=document.getElementById('tuto-focus-label');
+    if(!f || !item || !item.sel) { this.clearFocus(); return; }
+    const el=document.querySelector(item.sel);
+    if(!el){ this.clearFocus(); return; }
+    const r=el.getBoundingClientRect();
+    if(!r || r.width<=0 || r.height<=0){ this.clearFocus(); return; }
+    f.style.left=Math.max(4,Math.round(r.left-8))+'px';
+    f.style.top=Math.max(4,Math.round(r.top-8))+'px';
+    f.style.width=Math.round(r.width+16)+'px';
+    f.style.height=Math.round(r.height+16)+'px';
+    if(lab) lab.textContent=(progressText?progressText+' · ':'')+(item.label||'Repère');
+    f.classList.add('on');
+  },
+  clearPulse(){
+    if(this.pulseEl){ this.pulseEl.classList.remove('coach-pulse'); this.pulseEl=null; }
+    this.setResolveHint(false); this.clearFocus();
+  },
+  setPulse(id){
+    if(!id) return;
+    const el=document.getElementById(id);
+    if(el){ el.classList.add('coach-pulse'); this.pulseEl=el; }
+    if(id==='f-resolve') this.setResolveHint(true);
+  },
+  hide(){
+    this.clearPulse();
+    document.body.classList.remove('tutorial-emphasis');
+    const el=document.getElementById('tutorial-coach'); if(el){ el.classList.add('hidden'); el.classList.remove('zoneact-help'); }
+  },
+  applyTour(step){
+    const nav=document.getElementById('coach-nav'); const prog=document.getElementById('coach-prog');
+    const prev=document.getElementById('coach-prev'); const next=document.getElementById('coach-next');
+    const hasTour=step.tour && step.tour.length;
+    if(!hasTour){ if(nav) nav.style.display='none'; this.setFocus(null); return step; }
+    if(this.tourKey!==step.key){ this.tourKey=step.key; this.tourIndex=0; }
+    this.tourIndex=Math.max(0,Math.min(this.tourIndex,step.tour.length-1));
+    const item=step.tour[this.tourIndex];
+    if(nav){ nav.style.display='flex'; }
+    if(prog) prog.textContent=(this.tourIndex+1)+' / '+step.tour.length;
+    if(prev) prev.disabled=this.tourIndex<=0;
+    if(next) next.disabled=this.tourIndex>=step.tour.length-1;
+    this.setFocus(item,(this.tourIndex+1)+'/'+step.tour.length);
+    return {
+      ...step,
+      title:item.title||step.title,
+      body:item.body||step.body,
+      keys:item.keys||step.keys,
+      pulse:item.pulse||step.pulse||null
+    };
+  },
+  render(force=false){
+    const el=document.getElementById('tutorial-coach'); if(!el) return;
+    const zoneModal=this.zoneActionOpen();
+    if(!this.active || gameOver || (anyModalOpen()&&!zoneModal)){ this.hide(); return; }
+    el.classList.toggle('zoneact-help', zoneModal);
+    let step=tutorialCoachStep();
+    if(!step){ this.hide(); return; }
+    step=this.applyTour(step);
+    document.body.classList.toggle('tutorial-emphasis', !!step.emphasis);
+    this.clearPulse();
+    this.setPulse(step.pulse||null);
+    el.classList.toggle('min',this.minimized);
+    el.classList.remove('hidden');
+    const k=document.getElementById('coach-k'); if(k) k.textContent=step.kicker||'Tutoriel';
+    const t=document.getElementById('coach-title'); if(t) t.innerHTML=step.title||'—';
+    const b=document.getElementById('coach-body'); if(b) b.innerHTML=step.body||'';
+    const keys=document.getElementById('coach-keys');
+    if(keys) keys.innerHTML=(step.keys||[]).map(x=>`<span>${x}</span>`).join('');
+  }
+};
+function tutorialCoachRefresh(force=false){
+  try{ Tuto.applyBodyClass(); TutorialCoach.render(force); }catch(e){}
+}
+function foundingCoachStep(){
+  TutorialCoach.updateMovement();
+  const tz=precapitalTargetZone();
+  if(!tz) return {key:'founding-sell',kicker:'Naissance du capital',title:'Vends la première marchandise.',body:'Va au marché local pour transformer la marchandise en argent revenu augmenté.',keys:['Suivre la balise','E : agir']};
+  const u=precapitalAction(tz);
+  const base={kicker:'Première mise en route',keys:['Z / ↑ : avancer','S / ↓ : reculer','Q-D / ←-→ : tourner','E : agir']};
+
+  if(!TutorialCoach.hasMoved && state.buildings.atelier===0){
+    return {...base,
+      key:'move-first',
+      title:'Commence par déplacer le chariot.',
+      body:'Avant de construire quoi que ce soit, prends la main : avance, tourne, recule. Le chariot est ton curseur dans le monde social.<div class="movegrid"><span class="ghost"></span><b>Z</b><span class="ghost"></span><b>Q</b><b>S</b><b>D</b></div>',
+      keys:['Z ou ↑ : avancer','S ou ↓ : reculer','Q/D ou ←/→ : tourner','R : replacer']
+    };
+  }
+
+  if(state.buildings.atelier===0){
+    const near = currentZone && currentZone.name===tz;
+    return {...base,
+      key: near?'press-e-workshop':'go-workshop',
+      title: near?'Appuie sur E pour construire.':'Suis maintenant la balise rouge.',
+      body: near
+        ? `Tu es au <b>${precapitalZoneLabel(tz)}</b>. Appuie sur <b>E</b> : cela construit le premier atelier.`
+        : `Va jusqu’à la <b>balise rouge</b>, vers le <b>${precapitalZoneLabel(tz)}</b>. Quand la description du lieu apparaît, tu pourras appuyer sur <b>E</b>.`,
+      keys: near?['E : construire l’atelier']:['Balise rouge = destination','E seulement quand tu es sur le lieu']
+    };
+  }
+
+  if(!u) return {...base,key:'go-next',title:'Suis la balise rouge.',body:`Approche-toi de <b>${precapitalZoneLabel(tz)}</b>. Le jeu t’indique le prochain lieu nécessaire.`};
+  const near = currentZone && currentZone.name===tz;
+  const map={
+    atelier:['Construis le premier atelier.','Le capital ne produit encore rien. Il lui faut d’abord un lieu de production.'],
+    outils:['Achète les moyens de production.','Outils et matières entrent dans l’atelier : sans eux, le travail ne peut rien transformer.'],
+    travail0:['Ouvre le marché du travail.','La force de travail doit devenir disponible avant d’être embauchée.'],
+    embauche0:['Embauche le premier ouvrier.','Le capital achète maintenant de la force de travail : la production peut commencer.'],
+    produire:['Produis la première marchandise.','L’atelier transforme outils, matières et travail vivant en marchandise.'],
+    vendre:['Vends la première marchandise.','La marchandise revient au marché : si elle se vend, l’argent revient augmenté.']
+  };
+  const m=map[u.id]||['Agis ici.','Cette action construit une condition du capital.'];
+  return {...base,
+    key:'founding-'+u.id+(near?'-near':'-far'),
+    title:near?m[0]:'Rejoins le prochain lieu.',
+    body:near ? `${m[1]}<br>Tu es au bon endroit : appuie sur <b>E</b>.` : `${m[1]}<br><b>Lieu à rejoindre :</b> ${precapitalZoneLabel(tz)}.`,
+    keys:near?['E : agir maintenant']:['Suis la balise rouge','Approche-toi du lieu']
+  };
+}
+/* v47 : une seule phrase courte par lettre — la compréhension passe par le trajet, pas par le texte */
+const CIRCUIT_COACH={
+  A:['A — Argent avancé','L’argent s’avance : il ne dort plus, il s’engage.'],
+  M:['M — Moyens de production','Outils, matières, machines : les conditions matérielles.'],
+  Ft:['Ft — Force de travail','Le capital achète la seule marchandise qui crée de la valeur.'],
+  P:['P — Production','Travail vivant + moyens de production = marchandises.'],
+  "M′":['M′ — Marchandises','La valeur existe — mais en caisses, pas en argent.'],
+  "A′":['A′ — Argent revenu','Vendre, ou rien : la valeur doit se réaliser.']
+};
+function circuitCoachStep(){
+  const c=CIRCUIT[step]||CIRCUIT[0];
+  const guide=CIRCUIT_COACH[c.sym]||[c.sym,c.full||''];
+  return {
+    key:'circuit-'+c.sym,
+    kicker:'Premier circuit guidé',
+    title:guide[0],
+    body:`${guide[1]}<br><b>Prochaine destination :</b> ${displayZoneName(c.zone)}. Approche-toi puis appuie sur <b>E</b>.`,
+    keys:['Suis la trace au sol','E : agir','Le bandeau du haut = le circuit'],
+    tour:[
+      {sel:'#circuit', label:'Étape du circuit', title:guide[0], body:`${guide[1]}<br>En ce moment, tu dois te rendre à <b>${displayZoneName(c.zone)}</b>.`, keys:['Le haut te rappelle où tu en es']},
+      {sel:'#quest', label:'Prochaine destination', title:'Repère la prochaine destination.', body:`Le panneau <b>Objectif actuel</b> te rappelle aussi la prochaine étape : <b>${displayZoneName(c.zone)}</b>.`, keys:['La balise + l’objectif guident ton trajet']}
+    ]
+  };
+}
+function zoneActionCoachStep(){
+  const z=document.getElementById('zoneact');
+  if(!z || !z.classList.contains('on')) return null;
+  const title=(document.getElementById('za-title')||{}).textContent||'Lieu';
+  const left=(document.getElementById('za-actions')||{}).textContent||'actions restantes';
+  const hasBtn=!!document.querySelector('#za-list .za:not(:disabled)');
+  return {
+    key:'zone-actions-'+title+'-'+left,
+    emphasis:true,
+    kicker:'Choisir une intervention',
+    title:'Voici les boutons d’action.',
+    body:`Tu es dans <b>${title}</b>. Les grandes cartes/boutons au centre sont les <b>interventions possibles</b>. Clique sur l’un d’eux pour dépenser une action.`,
+    keys:['Cliquer un bouton = 1 intervention','Fermer = ne rien faire ici'],
+    tour:[
+      {sel:'#zoneact .box', label:'Fenêtre du lieu', title:`Fenêtre : ${title}`, body:'Cette fenêtre apparaît quand tu appuies sur <b>E</b> dans un bâtiment. Elle sert à choisir une intervention dans ce lieu.', keys:['E ouvre cette fenêtre']},
+      {sel:'#za-actiontop', label:'Compteur d’actions', title:'Le compteur est ici.', body:`Ce badge rouge indique combien d’actions il reste : <b>${left}</b>. Il est placé en haut pour que tu le voies avant de choisir un bouton.`, keys:['Chaque clic consomme une action']},
+      {sel:'#za-state', label:'État du lieu', title:'Lis rapidement l’état du lieu.', body:'Cette zone décrit la situation locale : production, dette, travail, stocks, marché, conflit, selon le bâtiment ouvert.', keys:['État local = contexte de décision']},
+      {sel:'#za-list', label:'Interventions possibles', title:'Les actions sont ici.', body:`Chaque bouton est une intervention. Choisis une action utile, ou ferme la fenêtre si tu veux agir ailleurs.`, keys:['Boutons = actions jouables']},
+      {sel:hasBtn?'#za-list .za:not(:disabled)':'#za-close', label:hasBtn?'Bouton à cliquer':'Fermer', title:hasBtn?'Clique une intervention.':'Aucune action disponible ici.', body:hasBtn?'Clique sur un de ces boutons : c’est cela, utiliser une action. Après le clic, le compteur baisse ; s’il reste des actions, tu peux repartir vers un autre bâtiment et recommencer.':'Ce lieu n’a pas d’action utile maintenant : ferme la fenêtre et va dans un autre bâtiment.', keys:hasBtn?['Un clic = une action consommée']:['Fermer puis changer de lieu']}
+    ]
+  };
+}
+
+function socialCoachStep(){
+  if(state._socialTutorialDone) return null;
+  const zstep=zoneActionCoachStep(); if(zstep) return zstep;
+  const first=(state.cycle||0)<=2;
+  if(!first) return null;
+
+  if(state.actionsRestantes===3){
+    return {
+      key:'social-actions-start',
+      emphasis:true,
+      kicker:'Première période libre',
+      title:'Fais d’abord tes 3 interventions.',
+      body:'Une action ne se fait pas dans ce panneau : elle se fait sur la carte. Conduis vers un bâtiment, appuie sur <b>E</b>, puis clique un bouton d’intervention dans la fenêtre qui s’ouvre.',
+      keys:['Bâtiment → E → bouton','1 bouton cliqué = 1 action utilisée'],
+      tour:[
+        {sel:'#f-actiontop', label:'Actions restantes', title:'Tu as 3 actions pour cette période.', body:'Le badge rouge indique combien d’interventions tu peux encore faire. Au début : <b>3 / 3</b>.', keys:['3 / 3 = trois décisions possibles']},
+        {sel:'#f-howactions', label:'Mode d’emploi', title:'Voici comment dépenser une action.', body:'Suis ces trois gestes : <b>1</b> conduire vers un bâtiment, <b>2</b> appuyer sur E, <b>3</b> cliquer un bouton d’intervention.', keys:['C’est la procédure concrète']},
+        {sel:'#formation', label:'Panneau de suivi', title:'Puis reviens au compteur.', body:'Après chaque bouton d’intervention cliqué, le compteur descend : <b>3 / 3</b>, puis <b>2 / 3</b>, puis <b>1 / 3</b>, puis <b>0 / 3</b>.', keys:['Quand il arrive à 0 : lance le cycle']}
+      ]
+    };
+  }
+
+  if(state.actionsRestantes>0){
+    return {
+      key:'social-actions-left-'+state.actionsRestantes,
+      emphasis:true,
+      kicker:'Période en cours',
+      title:`Encore ${state.actionsRestantes} intervention(s).`,
+      body:'Pour utiliser l’action restante : conduis vers un bâtiment, appuie sur <b>E</b>, puis clique un bouton d’intervention. Tu peux changer de bâtiment pour agir sur une autre tension.',
+      keys:['Bâtiment → E → bouton','Le compteur baisse après le clic'],
+      tour:[
+        {sel:'#f-actiontop', label:'Actions restantes', title:`Il reste ${state.actionsRestantes} action(s).`, body:'Le badge rouge te dit combien d’interventions tu peux encore faire avant de lancer le cycle productif.', keys:['Tant qu’il en reste : agis sur la carte']},
+        {sel:'#f-howactions', label:'Comment faire', title:'Répète cette procédure.', body:'Chaque action restante se dépense de la même manière : <b>aller à un bâtiment</b>, <b>appuyer sur E</b>, <b>cliquer un bouton</b>.', keys:['Même logique pour chaque action']}
+      ]
+    };
+  }
+
+  return {
+    key:'social-end',
+    emphasis:true,
+    kicker:'Fin de période',
+    title:'Maintenant, lance le cycle productif.',
+    body:'Tu as utilisé tes interventions. Clique sur le bouton indiqué dans le panneau de droite : elles vont devenir production, vente, dette, stocks, conflit social et bilan.',
+    keys:['Clique le bouton indiqué','Animation → bilan'],
+    pulse:'f-resolve',
+    tour:[
+      {sel:'#f-cyclebox', label:'Lancer le cycle', title:'C’est ici : lance le cycle.', body:'Regarde cette zone sous les trois actions : la flèche et le bouton indiquent où cliquer pour transformer tes choix en <b>bilan</b>.', keys:['Ce bouton fait avancer l’histoire'], pulse:'f-resolve'},
+      {sel:'#formation', label:'Lecture finale des panneaux', title:'Avant d’être autonome, retiens ce panneau.', body:'Ici tu relis l’âge historique, l’objectif, la contradiction dominante, le régime, les groupes sociaux et les actions restantes.', keys:['Droite = synthèse de la société']},
+      {sel:'#circuit', label:'Diagnostic du circuit', title:'Et ici, le diagnostic du circuit.', body:'Les lettres ne sont plus seulement une route. Si elles deviennent rouges, elles signalent le lieu où le cycle se bloque.', keys:['Haut = diagnostic des tensions']}
+    ]
+  };
+}
+function tutorialCoachStep(){
+  if(gameMode==='commune') return null;
+  if(gameMode==='socialFormation') return socialCoachStep();
+  if(gamePhase==='precapital') return foundingCoachStep();
+  if(gamePhase==='circuit') return circuitCoachStep();
+  return null;
+}
+(function wireTutorialCoach(){
+  const b=document.getElementById('coach-min');
+  if(b) b.addEventListener('click',()=>{
+    TutorialCoach.minimized=!TutorialCoach.minimized;
+    b.textContent=TutorialCoach.minimized?'+':'—';
+    tutorialCoachRefresh(true);
+  });
+  const prev=document.getElementById('coach-prev');
+  const next=document.getElementById('coach-next');
+  if(prev) prev.addEventListener('click',()=>{ TutorialCoach.tourIndex=Math.max(0,TutorialCoach.tourIndex-1); tutorialCoachRefresh(true); });
+  if(next) next.addEventListener('click',()=>{ TutorialCoach.tourIndex=TutorialCoach.tourIndex+1; tutorialCoachRefresh(true); });
+})();
+
+
+/* ---- Écran de concept : révélations majeures, une seule fois ---- */
+// Écran de naissance du capital (fin de la phase 0) — déclenché manuellement
+const BIRTH_SCREEN = {stamp:'Fin de la phase 0', title:'Le capital est né',
+   body:`<p>Au départ, tu avais seulement de l’argent. Cet argent ne produisait rien.</p>
+     <p>Tu as construit un atelier, acheté des moyens de production et embauché de la force de travail. Une marchandise a été produite, puis vendue.</p>
+     <p>L’argent revient maintenant <b>augmenté</b>.</p>
+     <div class="formula">A → M → Ft → P → M′ → <b>A′</b></div>
+     <p>À partir de ce moment, il ne fonctionne plus seulement comme argent : il fonctionne comme <b>capital</b>.</p>`,
+   unlock:['Débloqué : circuit A → M → Ft → P → M′ → A′','Concept débloqué : PLUS-VALUE','Concept débloqué : TAUX D’EXPLOITATION','Touche V débloquée : lever le voile'],
+   onClose:()=>unlockVoile()};
+// Concepts introduisant chaque cycle (clé = index du prochain objectif OBJECTIFS)
+const CONCEPTS = {
+  5:{stamp:'Nouvel objectif', title:'La concurrence',
+     body:`<p>Tu n’es pas seul sur le marché. D’autres capitaux produisent la même marchandise et baissent leurs prix pour rafler la demande.</p>
+       <p>Pour garder tes débouchés, il te faut <b>accumuler</b> : produire plus, moins cher — ou perdre ta part.</p>`,
+     unlock:['Concept débloqué : CONTRAINTE CONCURRENTIELLE']},
+  6:{stamp:'Nouvel objectif', title:'Le machinisme',
+     body:`<p>La machine démultiplie ce qu’un ouvrier produit en une heure. C’est la <b>plus-value relative</b> : on arrache plus de valeur sans allonger la journée.</p>
+       <p>Mais la machine remplace des bras : elle peut produire du chômage, et trop de marchandises d’un coup.</p>`,
+     unlock:['Concept débloqué : PLUS-VALUE RELATIVE / MACHINISME']},
+  8:{stamp:'Nouvel objectif', title:'La lutte des classes',
+     body:`<p>Le capital dépend de la force de travail — mais il tend à l’épuiser, la discipliner et la comprimer.</p>
+       <p>La grève rappelle que la force de travail n’est pas une marchandise comme les autres : elle peut <b>cesser d’agir comme capital variable</b> et bloquer le circuit.</p>`,
+     unlock:['Concept débloqué : LUTTE DES CLASSES']},
+  9:{stamp:'Nouvel objectif', title:'La réalisation',
+     body:`<p>Produire de la valeur ne suffit pas : il faut la <b>réaliser</b>, c’est-à-dire vendre.</p>
+       <p>Ce qui ne se vend pas devient stock — du capital immobilisé qui ne revient pas augmenté.</p>`,
+     unlock:['Concept débloqué : RÉALISATION / SURPRODUCTION']},
+  10:{stamp:'Nouvel objectif', title:'La crise',
+     body:`<p>Quand trop de marchandises ne trouvent pas preneur, que la dette pèse et que le chômage monte, le circuit se grippe.</p>
+       <p>La crise n’est pas un accident venu du dehors : elle <b>émerge des contradictions</b> du système lui-même.</p>`,
+     unlock:['Concept débloqué : CRISE DE SURPRODUCTION']},
+};
+/* v47 — Phase 3 : la première contradiction n'est pas un cours, c'est un constat.
+   Après les premières périodes sociales, on choisit LA contradiction que la partie
+   du joueur a réellement produite, et on la montre comme chaîne causale vécue. */
+function maybeShowFirstContradiction(){
+  const st=state, d=st.d||{}, pv=st.prev||{};
+  if(st._contradictionShown) return false;
+  if(gameMode!=='socialFormation' || (st.cycle||0)<1) return false;
+  let chain=null, titre='', lecture='';
+  const stocksUp = st.stocks>(pv.stocks||0)+5 && (d.tauxVente??1)<0.95;
+  const colereUp = st.colere>(pv.colere||0)+0.04;
+  if(stocksUp){
+    titre='Produire ne suffit pas';
+    chain='Production ↑ → demande insuffisante → stocks ↑ → prix sous pression → profit menacé';
+    lecture='La valeur produite n’est rien tant qu’elle n’est pas vendue : la surproduction n’est pas un excès de zèle, c’est une tendance du système.';
+  } else if(colereUp && (st.heures>10 || st.salaire<5)){
+    titre='Le profit a un coût social';
+    chain=(st.heures>10?'Journée allongée':'Salaires comprimés')+' → plus-value ↑ → colère ouvrière ↑ → grève possible → circuit menacé au point P';
+    lecture='Le rapport qui produit le profit produit aussi la résistance : exploiter la force de travail, c’est armer son antagoniste.';
+  } else if((st.dette||0)>0){
+    titre='Le crédit accélère — et endette';
+    chain='Emprunt → investissement possible → intérêts chaque cycle → profit rogné → dépendance bancaire ↑';
+    lecture='La banque n’offre pas du temps : elle le vend. Le crédit qui accélère l’accumulation précipite aussi la chute.';
+  } else {
+    titre='L’équilibre ne supprime rien';
+    chain='Profit et paix sociale tenus ensemble → contradictions contenues → mais concurrence, stocks et dette continuent de travailler en silence';
+    lecture='Équilibrer le système, c’est gagner du temps — pas abolir ses contradictions : elles se déplacent.';
+  }
+  st._contradictionShown=true;
+  showConcept({stamp:'Première contradiction', title:titre,
+    body:`<p>Voici ce que <b>ta</b> partie vient de produire :</p><div class="formula" style="font-size:14px;line-height:1.6">${chain}</div><p>${lecture}</p><p>Chaque solution déplacera la contradiction au lieu de la supprimer. C’est cela, jouer.</p>`,
+    unlock:['Lecture débloquée : CONTRADICTION']});
+  return true;
+}
+const FREE_MODE_CONCEPT={stamp:'Mode accumulation libre', title:'Le circuit continue',
+  body:`<p>Parcours pédagogique terminé. Tu as traversé les grandes contradictions du capital : plus-value, concurrence, machine, dette, surproduction, crise.</p>
+   <p>Le capital n’a pas de fin interne : il ne « gagne » pas définitivement. Il continue d’accumuler, de produire des contradictions et de traverser des crises.</p>`,
+  unlock:['Mode accumulation libre — le circuit continue']};
+const conceptShown=new Set();
+// écrans de passage de stade (liés à niveauVille), une seule fois chacun
+const STAGE_CONCEPTS={
+  2:{stamp:'Passage de stade', title:'La manufacture',
+     body:`<p>Le capital ne se contente plus de réunir un ouvrier et des outils.</p>
+       <p>Il <b>organise plusieurs travailleurs</b> dans un même procès, divise les tâches et augmente la productivité collective.</p>`,
+     unlock:['Stade atteint : Manufacture','Objectif suivant : résister à la concurrence']},
+  3:{stamp:'Passage de stade', title:'Le machinisme',
+     body:`<p>La machine accroît la puissance productive du travail.</p>
+       <p>Mais elle augmente aussi le <b>capital constant</b>, la dette, l’usure et le risque de produire plus que le marché ne peut absorber.</p>`,
+     unlock:['Stade atteint : Grande industrie']},
+  4:{stamp:'Passage de stade', title:'La ville industrielle',
+     body:`<p>Le capital ne transforme plus seulement l’atelier.</p>
+       <p>Il transforme <b>l’espace social entier</b> : logements ouvriers, entrepôts, rails, marché, crédit et État deviennent les conditions de sa reproduction.</p>`,
+     unlock:['Stade atteint : Ville industrielle']},
+};
+let conceptOnClose=null;
+function showConcept(cfg){
+  document.getElementById('concept-stamp').textContent=cfg.stamp||'Concept';
+  document.getElementById('concept-title').textContent=cfg.title||'';
+  document.getElementById('concept-body').innerHTML=cfg.body||'';
+  const u=document.getElementById('concept-unlock');
+  if(cfg.unlock&&cfg.unlock.length){ u.innerHTML=cfg.unlock.map(l=>`<span>${l}</span>`).join(''); u.style.display='flex'; }
+  else u.style.display='none';
+  conceptOnClose=cfg.onClose||null;
+  document.getElementById('concept').classList.add('on');
+}
+function maybeShowConcept(enteringCycle){
+  const cfg=CONCEPTS[enteringCycle];
+  if(cfg && !conceptShown.has(enteringCycle)){ conceptShown.add(enteringCycle); showConcept(cfg); return true; }
+  return false;
+}
+function maybeShowStageConcept(){
+  refreshNiveauVille();                       // le stade peut monter par accumulation
+  const niv=state.niveauVille, key='stade'+niv, cfg=STAGE_CONCEPTS[niv];
+  if(cfg && !conceptShown.has(key)){ conceptShown.add(key); showConcept(cfg); return true; }
+  return false;
+}
+let afterConcept=null;
+document.getElementById('concept-ok').addEventListener('click',()=>{
+  document.getElementById('concept').classList.remove('on');
+  const fn=conceptOnClose; conceptOnClose=null; if(fn) fn();
+  const cont=afterConcept; afterConcept=null;
+  if(cont) cont(); else { renderQuest(); renderCircuitBar(); moveTargetMarker(); updateHUD(); }
+  tutorialCoachRefresh(true);
+});
+
+// affiche/masque l'atelier (lecture seule) — visible seulement à l'usine ou cartes ouvertes
+function showLevers(on){ const el=document.getElementById('levers'); if(el) el.style.display=on?'block':'none'; }
+
+
+/* ===================================================================
+   Interaction (touche E) + réalisation du cycle
+   =================================================================== */
+let currentZone=null, cooldownReal=0;
+
+function interactZone(zone){
+  if(gameOver || anyModalOpen()) return;
+  if(gameMode==='commune'){
+    if(COMMUNE_ACTIONS[zone.name]) openCommuneActions(zone);
+    else pushLog(zone.name,'Ce lieu appartient à l’ancien monde — il n’a plus de fonction dans la Commune.','warn');
+    return;
+  }
+  if(gameMode==='socialFormation'){
+    const cf=CompetitorWorld.byZone(zone.name);            // v48 : observation de la concurrence
+    if(cf){ CompetitorWorld.openPanel(cf); return; }
+    if(ZONE_ACTIONS[zone.name]) openZoneActions(zone);
+    else pushLog(zone.name, (typeof ZONE_INFO!=='undefined'&&ZONE_INFO[zone.name])||'Pas d’intervention directe ici — observe, ou agis ailleurs.','warn');
+    return;
+  }
+  if(gamePhase==='precapital'){
+    const u=precapitalAction(zone.name);
+    if(u){ doFounding(u); }
+    else {
+      const tz=precapitalTargetZone();
+      pushLog('Phase 0','Le circuit n’existe pas encore. Construis d’abord ses conditions'+(tz?` — va à ${precapitalZoneLabel(tz)}.`:'.'),'warn');
+    }
+    return;
+  }
+  if(canInteractWithZone(zone)){
+    const act=()=>performStep(zone);
+    if(shouldPauseAt(zone)) showGuide(zone, act); else act();
+    return;
+  }
+  // messages d'impossibilité utiles (prompt temporaire, pas de modale)
+  if(zoneLocked(zone.name))
+    pushLog(displayZoneName(zone.name),'Ce lieu sera utile plus tard : débloqué par l’accumulation.','warn');
+  else if(CIRCUIT_ZONES.has(zone.name)){
+    const need=CIRCUIT[step];
+    pushLog(displayZoneName(zone.name),`Le circuit ne passe pas encore par ici. Va d’abord à ${displayZoneName(need.zone)} (${need.sym}).`,'warn');
+  } else {
+    pushLog(displayZoneName(zone.name), zoneInfo(zone.name) || 'Le circuit ne passe pas par ici.','warn');
+  }
+}
+
+/* v47 : à chaque étape du premier circuit, le joueur voit IMMÉDIATEMENT
+   quelle variable monte (▲) et laquelle baisse (▼), sur le lieu même. */
+const STEP_FX={
+  'Banque':            [['▲ argent disponible','gain'],['dette possible','warn']],
+  'Marché des moyens': [['▼ argent','warn'],['▲ moyens de production','gain']],
+  'Marché du travail': [['▼ argent (salaires)','warn'],['▲ force de travail','gain']],
+  'Usine':             [['▲ marchandises','gain'],['▲ fatigue ouvrière','warn']],
+  'Entrepôt':          [['▲ stocks','warn'],['valeur non réalisée','warn']],
+};
+function stepFloatFx(zoneName){
+  const fx=STEP_FX[zoneName]; if(!fx||typeof floatText!=='function') return;
+  const pz=zonePos(zoneName);
+  fx.forEach((f,i)=> setTimeout(()=>floatText(f[0],{x:pz.x,y:9+i*3,z:pz.z},f[1]), 220+i*650));
+}
+// exécute réellement l'étape courante (après la pause guidée, le cas échéant)
+function performStep(zone){
+  if(zone.name==='Marché de vente'){ realizeCycle(); return; }
+  const [title,text]=zone.action(); pushLog(title,text);
+  stepFloatFx(zone.name);
+  if(typeof LWmicro!=='undefined') LWmicro(zone.name);
+  if(zone.name==='Usine'){
+    if(!state.productionActive){
+      showWhap({action:'Tu arrives au lieu de production.', fx:[['production impossible','-']], chain:null,
+        marx:'Il n’y a pas encore de production : il faut construire un atelier et embaucher de la force de travail.'});
+    } else { showLevers(true); openCards('usine'); }   // les cartes déclenchent leur propre "Ce qui vient de se passer"
+  }
+  else if(zone.name==='Banque' && state.cycle>2){ openCards('bank'); }  // crédit volontaire, jamais avant
+  else { whapForZone(zone); }
+  step++;
+  renderCircuitBar(); renderQuest(); moveTargetMarker();
+  updateHUD(); updateConsequences(); tutorialCoachRefresh(true);
+}
+
+function realizeCycle(){
+  if(cooldownReal>0) return;
+  cooldownReal=1.2;
+  runCycle();                       // moteur économique : P → M′ → A′
+  if(typeof checkAlerts==='function') checkAlerts();   // v47
+  step=0;
+  closeWhap();                      // pas de double explication : seul le bilan s'affiche
+  showLevers(false);
+  renderCircuitBar(); moveTargetMarker();
+  updateConsequences();
+  const toBilan=()=>{ showReport(); checkEndgame(); renderQuest(); tutorialCoachRefresh(true); };
+  if(state.enGreve){ showGreveConflict(toBilan); }   // conflit social : le joueur décide d'abord
+  else { toBilan(); }
+}
+
+/* ---- Conflit social : la grève comme événement et décision ---- */
+function showGreveConflict(after){
+  const s=state;
+  const rev = s.revendication ? (REVENDICATIONS[s.revendication]||'de meilleures conditions') : 'de meilleures conditions';
+  document.getElementById('greve-title').textContent='Grève';
+  document.getElementById('greve-body').innerHTML=
+    `<p>La force de travail cesse de fonctionner comme simple facteur de production. Le circuit du capital est bloqué au point même où il devait se valoriser.</p>`;
+  const rv=document.getElementById('greve-revend');
+  rv.innerHTML=`<span>Revendication ouvrière : ${rev}</span>`; rv.style.display='flex';
+  const box=document.getElementById('greve-choices'); box.innerHTML='';
+  const choices=[
+    {lab:'Céder partiellement', sub:'salaire ou journée concédés · colère ↓ · profit ↓ · la grève cesse',
+     act:()=>{
+       if(s.revendication==='journee' && s.heures>8){ s.heures-=1; }
+       else if(s.revendication==='securite'){ s.securiteNiveau++; s.argent-=40; }
+       else { s.salaire+=1; }
+       apaiserOuvriers(0.20,'grève : concession'); s.enGreve=false; s.revendication=null;
+       s.modeEtat='réforme'; s.d.concession=true;
+     }},
+    {lab:'Réprimer la grève', sub:'production reprend · colère ↓ un peu · conscience ↑ · explosion possible plus tard',
+     act:()=>{
+       s.argent-=30; s.colere=clamp(s.colere-0.10); s.conscience=clamp(s.conscience+0.10);
+       s.enGreve=false; s.modeEtat='répression'; s.d.repression=true;
+       rememberEvent(s,'workers','repression','grève réprimée');
+     }},
+    {lab:'Attendre', sub:'la production reste bloquée · la colère peut monter · rien n’est tranché',
+     act:()=>{
+       s.colere=clamp(s.colere+0.05); s.d.greveAttendue=true; /* enGreve reste vrai */
+     }},
+  ];
+  choices.forEach(c=>{
+    const b=document.createElement('button'); b.className='go'; b.style.textAlign='left';
+    b.innerHTML=`${c.lab}<br><span style="font-weight:400;font-size:11px;opacity:.8">${c.sub}</span>`;
+    b.onclick=()=>{ c.act(); updateHUD(); updateConsequences();
+      document.getElementById('greve').classList.remove('on'); after(); };
+    box.appendChild(b);
+  });
+  document.getElementById('greve').classList.add('on');
+}
+
+function unlockVoile(){
+  voileUnlocked=true;
+  const h=document.getElementById('help-voile'); if(h) h.style.opacity='1';
+}
+
+/* ---- bilan de fin de cycle ---- */
+function interpretation(s){
+  const phr=[];
+  if(s.d.invendus>5) phr.push('Tu as extrait de la plus-value à l’atelier, mais une partie des marchandises ne trouve pas preneur : produire ne suffit pas, encore faut-il vendre.');
+  else if((s.d.tauxExploitation||0)>0.6) phr.push('Le profit que tu encaisses ne sort pas de l’échange : il vient du surtravail, ces heures que l’ouvrier donne au capital sans contrepartie.');
+  else phr.push('L’argent est revenu augmenté : ce supplément, c’est la plus-value créée par le travail vivant et réalisée sur le marché.');
+  if(s.enGreve) phr.push('La force de travail vient de rappeler qu’elle n’est pas une simple marchandise : la grève bloque le circuit.');
+  else if(s.chomage>(s.prev.chomage||0)+0.03) phr.push('En économisant du travail, tu grossis l’armée de réserve des sans-emploi — la même qui fait pression à la baisse sur les salaires.');
+  else if((s.d.compoOrganique||0)>3) phr.push('Plus tu remplaces les bras par des machines, plus la part qui crée la valeur se réduit : c’est ce qui tend à comprimer le taux de profit.');
+  else if(s.d.declenche) phr.push('La crise n’est pas un accident venu du dehors : c’est le circuit lui-même qui se grippe quand la valeur produite ne peut plus se réaliser.');
+  else phr.push('Mais chaque profit laisse une trace : stocks, fatigue, chômage — les contradictions s’accumulent avec le capital.');
+  return phr.slice(0,2).join(' ');
+}
+// Une phrase courte : le concept-clé du cycle (staging pédagogique)
+function pourquoi(s){
+  if(s.cycle===1) return 'Tu viens de voir le geste de base : faire circuler l’argent (A → … → A′) pour qu’il revienne augmenté.';
+  if(s.enGreve) return 'La force de travail n’est pas une marchandise comme les autres : trop pressée, elle bloque le circuit.';
+  if((s.d.invendus||0)>20) return 'Produire ne suffit pas : tant que les marchandises ne sont pas vendues, la plus-value reste virtuelle.';
+  if((s.d.compoOrganique||0)>3) return 'Plus tu mécanises, plus la part de travail vivant (qui seul crée la valeur) se réduit : le taux de profit tend à baisser.';
+  if(s.d.declenche) return 'La crise vient du circuit lui-même : la valeur produite ne trouve plus à se réaliser.';
+  if(s.chomage>(s.prev.chomage||0)+0.03) return 'Le profit a un revers : l’armée de réserve des chômeurs grossit et pèse sur les salaires.';
+  return 'Le supplément d’argent ne sort pas de l’échange : il vient du surtravail extrait à l’usine — la plus-value.';
+}
+// Enchaînement causal éventuel du cycle (court, seulement si un phénomène domine)
+function bilanChaine(s){
+  if(s.enGreve) return ['Colère trop forte','→ grève','→ production bloquée'];
+  if(s.d.declenche) return ['Surproduction + dette','→ mévente','→ crise','→ licenciements'];
+  if((s.d.invendus||0)>40) return ['Trop produit','→ invendus','→ stocks qui s’accumulent'];
+  if(s.chomage>(s.prev.chomage||0)+0.05) return ['Moins de bras','→ chômage en hausse','→ pression sur les salaires'];
+  return null;
+}
+function fmtDeltaMoney(v){ const r=Math.round(v);
+  if(r>0) return `<span class="up">+${money(r)} ↑</span>`;
+  if(r<0) return `<span class="dn">−${money(Math.abs(r))} ↓</span>`;
+  return `<span class="flat">0 £ →</span>`; }
+function fmtDeltaPct(v){ const p=Math.round(v*100);
+  if(p>0) return `<span class="up">+${p} % ↑</span>`;
+  if(p<0) return `<span class="dn">${p} % ↓</span>`;
+  return `<span class="flat">0 % →</span>`; }
+function fmtDeltaInt(v){ const r=Math.round(v);
+  if(r>0) return `<span class="up">+${r} ↑</span>`;
+  if(r<0) return `<span class="dn">${r} ↓</span>`;
+  return `<span class="flat">0 →</span>`; }
+// une phrase qui explique le tour
+function bilanAuto(s,d){
+  const inv=d.invendus||0, prodres=d.resultatProductif||0, net=d.resultatNet||0, p=s.prev||{};
+  if(s.enGreve) return 'Le circuit est bloqué dans la production : la force de travail cesse d’agir comme capital variable.';
+  if(d.repression) return 'La production reprend, mais la contradiction sociale n’est pas supprimée : elle est seulement déplacée.';
+  if(d.concession) return 'Le capital concède une part de valeur pour préserver la continuité du circuit.';
+  if(d.accident) return 'La force de travail a été usée au-delà de ses conditions normales de reproduction.';
+  if(d.stagne) return 'Ton capital stagne pendant que les autres avancent : accumuler ou être dépassé.';
+  if((d.interets||0) > prodres && prodres > 0) return 'L’atelier est rentable, mais la dette absorbe tout le profit.';
+  if(net<0 && prodres<0) return 'Le cycle est déficitaire : les coûts avancés dépassent la recette de vente.';
+  if(inv>5) return 'Une partie de la valeur produite n’a pas été réalisée : les marchandises restent en stock.';
+  if((d.tauxExploitation||0) > (p.tauxExploitation||0)+0.05 && s.colere > (p.colere||0)+0.02)
+    return 'La baisse du capital variable augmente le taux d’exploitation, mais fragilise la reproduction de la force de travail.';
+  if(s.colere > (p.colere||0)+0.04) return 'La rentabilité immédiate s’accompagne d’une tension sociale plus forte.';
+  if(s.cycle>3 && (d.partJoueur||1) < 0.22) return 'Tes concurrents accumulent : sans réinvestir, ta part de marché s’érode — accumuler ou être dépassé.';
+  if(s.fatigue > (p.fatigue||0)+0.04) return 'La plus-value absolue augmente, mais la fatigue et la colère progressent.';
+  if(net>0 && inv<=5) return 'Le cycle est profitable : la marchandise a été vendue et l’argent revient augmenté.';
+  return 'Le supplément d’argent ne vient pas de l’échange, mais du surtravail extrait à l’usine.';
+}
+// 2 lectures marxiennes courtes, choisies selon le tour
+function bilanLecturesMarx(s,d){
+  const out=[]; const inv=d.invendus||0;
+  if((d.interets||0) > (d.resultatProductif||0) && (d.resultatProductif||0) > 0)
+    out.push('Le capital financier prélève une part du profit produit dans l’atelier : ici le cycle productif est rentable, mais la charge de la dette rend le résultat net négatif.');
+  if(s.chomage>0.2)
+    out.push('Le chômage n’est pas extérieur au système : il devient une réserve de main-d’œuvre qui pèse sur les salaires.');
+  out.push('Le profit monétaire vient de l’écart entre les coûts avancés et la recette obtenue.');
+  if(inv>3) out.push('Les stocks signalent une valeur produite mais non encore réalisée par la vente.');
+  else if(out.length<2) out.push('La valeur produite ne compte pour le capital que si elle est réalisée par la vente.');
+  return out.slice(0,3);
+}
+function showReport(){
+  const s=state, d=s.d, p=s.prev||{};
+  const obj=objectifCourant();
+  const reussi=obj.ok(s);
+  const gauge=obj.gauge?obj.gauge(s):'';
+  const manque=(!reussi && obj.manque)?obj.manque(s):'';
+  const aide=(!reussi && s.objectifCyclesSurPlace>=2)?objHint():'';
+  const sheet=document.getElementById('report-sheet');
+  const produites=Math.round(d.Q||0), vendues=Math.round(d.unitesVendues||0), stock=Math.round(s.stocks);
+  const invendus=Math.round(d.invendus||0);
+  const offre=(p.stocks||0)+(d.Q||0);
+  const tauxVente=offre>0 ? Math.round(vendues/offre*100) : 0;
+  const prixVente=vendues>0 ? d.recette/vendues : (d.nouveauPrix||s.prixUnitaire);
+  const prodres=d.resultatProductif||0, net=d.resultatNet||0;
+  const aDette=(d.detteFin||0)>0 || (d.creditPris||0)>0 || (d.detteRemb||0)>0;
+  const compte=`
+    <div class="repsec">Compte du cycle</div>
+    <div class="led compte">
+      <span class="k">Argent au début du cycle</span><span class="v">${money(p.argent||0)}</span>
+      <span class="k">Salaires avancés</span><span class="v red">− ${money(d.v||0)}</span>
+      <span class="k">Matières premières</span><span class="v red">− ${money(d.matieres||0)}</span>
+      <span class="k">Usure outils / machines</span><span class="v red">− ${money(d.usure||0)}</span>
+      <span class="k">Recette de vente</span><span class="v gold">+ ${money(d.recette||0)}</span>
+      <span class="k">Résultat productif (atelier)</span><span class="v tot ${prodres>=0?'gold':'red'}">${prodres>=0?'+ ':'− '}${money(Math.abs(prodres))}</span>
+      <span class="k">Intérêts</span><span class="v red">${(d.interets||0)>0?'− '+money(d.interets):'—'}</span>
+      <span class="k">Impôts</span><span class="v red">${(d.impot||0)>0?'− '+money(d.impot):'—'}</span>
+      <span class="k">Résultat net du cycle</span><span class="v tot ${net>=0?'gold':'red'}">${net>=0?'+ ':'− '}${money(Math.abs(net))}</span>
+      <span class="k">Argent final</span><span class="v tot gold">${money(s.argent)}</span>
+    </div>`;
+  const detteBloc = aDette ? `
+    <div class="repsec">Dette</div>
+    <div class="led">
+      <span class="k">Dette au début</span><span class="v">${money(d.detteDebut||0)}</span>
+      <span class="k">Nouveau crédit</span><span class="v ${(d.creditPris||0)>0?'red':''}">${(d.creditPris||0)>0?'+ '+money(d.creditPris):'—'}</span>
+      <span class="k">Dette remboursée</span><span class="v ${(d.detteRemb||0)>0?'gold':''}">${(d.detteRemb||0)>0?'− '+money(d.detteRemb):'—'}</span>
+      <span class="k">Dette finale</span><span class="v ${(d.detteFin||0)>0?'red':''}">${money(d.detteFin||0)}</span>
+      <span class="k">Taux d’intérêt</span><span class="v">${pct(d.taux||0)}</span>
+      <span class="k">Intérêts payés</span><span class="v red">${(d.interets||0)>0?'− '+money(d.interets):'—'}</span>
+    </div>${(d.machineAchat||0)>0?'<p class="dnote">La dette vient de l’achat de machine à crédit.</p>':''}` : '';
+  // --- Concurrence & réserve de main-d'œuvre : révélées une fois le circuit compris ---
+  let concurrence='', reserve='';
+  if(s.cycle>2){
+    const comp=(s.competitors||[]).filter(c=>c.vivant);
+    const part=s.d.partJoueur||0, prevPart=(p.partJoueur!=null?p.partJoueur:part);
+    const cheapest=comp.reduce((m,c)=>c.prix<m.prix?c:m,{prix:Infinity,nom:'—'});
+    const ecartPrix=Math.round((s.prixUnitaire-cheapest.prix)/Math.max(0.01,cheapest.prix)*100);
+    const pression = part>0.30?'faible':(part>=0.20?'moyenne':'forte');     // seuils par part de marché
+    let phrase='';
+    if(part < prevPart-0.01) phrase='Tes concurrents vendent moins cher : une partie de la demande se détourne de tes marchandises.';
+    else if(part > prevPart+0.01) phrase='Ton capital conquiert une plus grande part du marché.';
+    concurrence=`
+      <div class="repsec">Concurrence</div>
+      <div class="led">
+        <span class="k">Part de marché du joueur</span><span class="v ${part<0.20?'red':'gold'}">${pct(part)}</span>
+        <span class="k">Concurrent le moins cher</span><span class="v">${cheapest.nom} · ${money2(cheapest.prix)}</span>
+        <span class="k">Pression concurrentielle</span><span class="v ${pression==='forte'?'red':''}">${pression}</span>
+        <span class="k">Écart de prix</span><span class="v ${ecartPrix>0?'red':''}">${ecartPrix>=0?'+':''}${ecartPrix} %</span>
+      </div>${phrase?`<p class="dnote">${phrase}</p>`:''}`;
+    const emploi=s.travailleurs, chom=Math.max(0,Math.round((s.populationActive||0)-s.travailleurs));
+    const pSal=s.chomage<0.10?'faible':(s.chomage<0.25?'moyenne':'forte');
+    reserve=`
+      <div class="repsec">Réserve de main-d’œuvre</div>
+      <div class="led">
+        <span class="k">Employés</span><span class="v">${emploi}</span>
+        <span class="k">Chômeurs</span><span class="v ${chom>0?'red':''}">${chom}</span>
+        <span class="k">Pression sur les salaires</span><span class="v ${pSal==='forte'?'red':''}">${pSal}</span>
+      </div>`;
+  }
+  // --- Rapport de force social & État ---
+  let social='', etat='';
+  if(s.cycle>2){
+    const rapport=(d.rapportSocial!=null?d.rapportSocial:rapportDeForceSocial(s));
+    const rfLab=rapport<0.4?'faible':(rapport<0.68?'moyen':'fort');
+    const rev=s.revendication?(REVENDICATIONS[s.revendication]||'—'):'aucune';
+    social=`
+      <div class="repsec">Rapport de force social</div>
+      <div class="led">
+        <span class="k">Colère</span><span class="v ${s.colere>0.6?'red':''}">${pct(s.colere)}</span>
+        <span class="k">Conscience collective</span><span class="v">${pct(s.conscience)}</span>
+        <span class="k">Peur du chômage</span><span class="v">${pct(s.peurChomage)}</span>
+        <span class="k">Rapport de force</span><span class="v ${rfLab==='fort'?'red':''}">${rfLab}</span>
+        <span class="k">Revendication ouvrière</span><span class="v ${s.revendication?'red':''}">${rev}</span>
+      </div>`;
+    if(s.modeEtat || d.repression || d.concession || d.sauvetage || d.loiJournee){
+      const mode=s.modeEtat||'laisser-faire';
+      let raison='—';
+      if(d.sauvetage) raison='crise'; else if(d.repression||d.concession) raison='grève';
+      else if(d.accident) raison='accident'; else if(s.colere>0.6) raison='colère élevée';
+      let effet='—';
+      if(d.loiJournee) effet=`journée limitée à ${d.loiJournee} h`;
+      else if(d.concession) effet='concession (salaire/journée)';
+      else if(d.repression) effet='répression de la grève';
+      else if(d.sauvetage) effet='soutien de la demande, impôt';
+      etat=`
+      <div class="repsec">État</div>
+      <div class="led">
+        <span class="k">Mode</span><span class="v ${(mode==='répression')?'red':''}">${mode}</span>
+        <span class="k">Raison</span><span class="v">${raison}</span>
+        <span class="k">Effet</span><span class="v">${effet}</span>
+      </div>`;
+    }
+  }
+  const stk=Math.round(s.stocks);
+  const stockNiv = stk<40?{t:'normal',c:''}:(stk<100?{t:'inquiétant',c:'red'}:(stk<180?{t:'critique',c:'red'}:{t:'surproduction ouverte',c:'red'}));
+  const stockNote = stk>=40 ? `<p class="dnote">Stocks ${stockNiv.t} (${stk}) — une partie de la valeur est produite, mais non réalisée.</p>` : '';
+  const prodvente=`
+    <div class="repsec">Production et vente</div>
+    <div class="led">
+      <span class="k">Marchandises produites</span><span class="v">${produites}</span>
+      <span class="k">Marchandises vendues</span><span class="v">${vendues}</span>
+      <span class="k">Invendus</span><span class="v ${invendus>0?'red':''}">${invendus}</span>
+      <span class="k">Prix unitaire</span><span class="v">${money2(prixVente)}</span>
+      <span class="k">Taux de vente</span><span class="v">${tauxVente} %</span>
+      <span class="k">Niveau des stocks</span><span class="v ${stockNiv.c}">${stockNiv.t}</span>
+    </div>${stockNote}`;
+  const variations=`
+    <div class="repsec">Variations du tour</div>
+    <div class="led">
+      <span class="k">Argent</span><span class="v">${fmtDeltaMoney(s.argent-(p.argent||0))}</span>
+      <span class="k">Stocks</span><span class="v">${fmtDeltaInt(s.stocks-(p.stocks||0))}</span>
+      <span class="k">Taux d’exploitation</span><span class="v">${fmtDeltaPct((d.tauxExploitation||0)-(p.tauxExploitation||0))}</span>
+      <span class="k">Taux de profit</span><span class="v">${fmtDeltaPct((d.tauxProfit||0)-(p.tauxProfit||0))}</span>
+      <span class="k">Tension sociale</span><span class="v">${fmtDeltaPct(s.colere-(p.colere||0))}</span>
+      <span class="k">Fatigue</span><span class="v">${fmtDeltaPct(s.fatigue-(p.fatigue||0))}</span>
+      <span class="k">Chômage</span><span class="v">${fmtDeltaPct(s.chomage-(p.chomage||0))}</span>
+      <span class="k">Risque de crise</span><span class="v">${fmtDeltaPct((d.risqueCrise||0)-(p.risqueCrise||0))}</span>
+    </div>`;
+  const lectures=bilanLecturesMarx(s,d).map(l=>`<div>${l}</div>`).join('');
+  sheet.innerHTML=`
+    <div class="stamp">Registre · An ${1800+s.cycle} · ${obj.titre}</div>
+    <h3>Bilan du cycle ${s.cycle}</h3>
+    <p class="verdict ${reussi?'ok':'ko'}">${reussi?'✓ Objectif validé — étape pédagogique suivante débloquée':'✗ Objectif non atteint — le prochain cycle conserve le même objectif'}</p>
+    <p class="objline"><b>Objectif :</b> ${obj.but}${gauge?`<br><span class="gauge">${gauge}</span>`:''}${manque?`<br><span class="manque">Ce qu’il manque : ${manque}</span>`:''}${aide?`<br><span class="aide">💡 ${aide}</span>`:''}</p>
+    ${compte}
+    ${detteBloc}
+    ${prodvente}
+    ${concurrence}
+    ${reserve}
+    ${social}
+    ${etat}
+    ${variations}
+    <div class="auto">${bilanAuto(s,d)}</div>
+    <div class="interp"><div class="veilline">Lecture marxienne</div>${lectures}</div>
+    <button class="go" id="report-go">Repartir pour le cycle ${s.cycle+1} ▸</button>`;
+  document.getElementById('report').classList.add('on');
+  document.getElementById('report-go').onclick=()=>{
+    document.getElementById('report').classList.remove('on');
+    if(gameOver) return;
+    proceedAfterReport();
+  };
+}
+// après le bilan : éventuel écran de concept, puis reprise.
+function resumePlay(){ renderQuest(); renderCircuitBar(); moveTargetMarker(); updateHUD(); updateVilleBadge(); tutorialCoachRefresh(true); }
+function upgradesUnlocked(){ return (state.age||0)>=3; } // Grande industrie : les améliorations/planification avancée commenceront ici
+function maybeOpenUpgradeAfterCycle(){
+  if(upgradesUnlocked()) openUpgrade(resumePlay);
+  else resumePlay();
+}
+function proceedAfterReport(){
+  const reussi = objectifCourant().ok(state);
+  const toUpgrade=()=>maybeOpenUpgradeAfterCycle();
+  if(reussi){
+    state.objectifCyclesSurPlace = 0;
+    state.objectifIndex++;
+    if(state.objectifIndex>=OBJECTIFS.length){       // parcours pédagogique bouclé → accumulation libre
+      state.objectifIndex = OBJECTIFS.length;        // reste sur OBJ_GENERIQUE, le jeu continue
+      if(!conceptShown.has('libre')){ conceptShown.add('libre'); showConcept(FREE_MODE_CONCEPT); afterConcept=toUpgrade; }
+      else { toUpgrade(); }
+      return;
+    }
+    if(maybeShowStageConcept()){ afterConcept=toUpgrade; }
+    else if(maybeShowConcept(state.objectifIndex)){ afterConcept=toUpgrade; }
+    else { toUpgrade(); }
+  } else {
+    // le capital continue de tourner, mais la progression pédagogique reste bloquée
+    state.objectifCyclesSurPlace++;
+    toUpgrade();
+  }
+}
+
+/* ===================================================================
+   Conditions de victoire / défaite
+   =================================================================== */
+function endStreak(s,key,cond){ s._endStreaks=s._endStreaks||{}; s._endStreaks[key]=cond?((s._endStreaks[key]||0)+1):0; return s._endStreaks[key]; }
+function checkEndgame(){
+  const s=state;
+  crisisStreak = (s.d.risqueCrise||0)>0.95 ? crisisStreak+1 : 0;
+  // --- mode guidé / tutoriel : seulement les défaites dures ---
+  if(typeof gameMode==='undefined' || gameMode!=='socialFormation'){
+    let fin=null;
+    if(s.argent < -200) fin={win:false, t:'Défaite économique', d:'Le capital avancé ne revient plus : la dette a dépassé ce que le circuit pouvait nourrir. Faillite.'};
+    else if(s.colere>0.95 && s.enGreve) fin={win:false, t:'Défaite sociale', d:'Grève générale. La colère est devenue collective et la production s’est arrêtée. La force de travail a brisé le circuit.'};
+    else if(crisisStreak>=2) fin={win:false, t:'Défaite systémique', d:'La crise s’installe durablement : la valeur produite ne se réalise plus. Le circuit s’effondre sur lui-même.'};
+    if(fin) endGame(fin);
+    return;
+  }
+  // --- formation sociale : issues HISTORIQUES émergentes (pas seulement l'argent) ---
+  const g=s.groups||{}, r=s.regime||{}, rk=s.ranking||{};
+  const revo=(g.revolutionaries?g.revolutionaries.force:0), org=(g.workers?g.workers.organisation:0);
+  // DÉFAITES
+  if(s.argent < -200){ endGame({win:false,t:'Faillite',
+    d:'Le capital avancé ne revient plus : la dette a dépassé ce que le circuit pouvait nourrir. L’entreprise s’éteint, ses machines partent à vil prix — le capital se concentre ailleurs.'}); return; }
+  const collapse=(s.colere>0.85 && (r.legitimacy||0.5)<0.28 && revo>0.6 && (r.communistPossibility||0)<0.6);
+  if(endStreak(s,'collapse',collapse)>=2){ endGame({win:false,t:'Effondrement social',
+    d:'La colère est devenue insurrection sans projet : ni le capital ni une alternative ne parviennent à tenir le monde. La formation sociale se disloque dans le chaos.'}); return; }
+  if(crisisStreak>=3){ endGame({win:false,t:'Crise systémique prolongée',
+    d:'La valeur produite ne se réalise plus, cycle après cycle. Surproduction et dette nouent une crise dont le circuit ne sort plus : il s’effondre sur lui-même.'}); return; }
+  // ISSUES HISTORIQUES — configurations stabilisées, à partir de la Grande industrie
+  if((s.age||0)>=3){
+    if(endStreak(s,'commune', r.type==='communisteFragile' && (r.communistPossibility||0)>0.6 && org>0.55)>=2){
+      enterCommune(); return; }
+    if(endStreak(s,'socdem', r.type==='socialDemocrate' && (r.legitimacy||0)>0.6 && s.colere<0.36)>=3){
+      endGame({win:true,t:'Le capital réformé',
+        d:'Droits sociaux, salaires stabilisés, syndicats reconnus : le conflit de classe est canalisé dans des institutions. Le capital continue, mais sous compromis — un capitalisme régulé s’est stabilisé.'}); return; }
+    if(endStreak(s,'autoritaire', r.type==='autoritaire' && (r.repression||0)>0.6 && s.colere<0.42)>=3){
+      endGame({win:true,t:'Le capital durci',
+        d:'L’ordre règne par la force : la contestation est matée, l’État discipline le travail au service de l’accumulation. La paix sociale est imposée — fragile, mais tenue.'}); return; }
+    const triomphe=((rk.rankLevel||0)>=6) || (rk.productivePower>0.7 && rk.marketPower>0.7 && rk.financialPower>0.6);
+    if(endStreak(s,'monopole', triomphe)>=3){
+      endGame({win:true,t:'Le capital monopoliste',
+        d:'L’accumulation a tout absorbé : concurrents rachetés, marché dominé, finance maîtresse. Le capital triomphe — au prix d’un monde traversé de tensions qu’il devra contenir sans fin.'}); return; }
+  }
+}
+function endGame(fin){
+  gameOver=true;
+  if(targetMarker) targetMarker.visible=false;
+  const sheet=document.getElementById('report-sheet');
+  document.getElementById('report').classList.add('on','final');
+  sheet.innerHTML=`
+    <div class="stamp">${fin.win?'Issue historique':'Fin de partie'}</div>
+    <p class="grandtitle">${fin.t}</p>
+    <p class="verdict ${fin.win?'ok':'ko'}">Âge : ${AGES[state.age||1]||'—'} · Rang : ${(state.ranking&&state.ranking.rankName)||'—'}${state.regime?(' · '+(REGIME_LABEL[state.regime.type]||state.regime.type)):''}</p>
+    <div class="interp">${fin.d}</div>
+    <p style="opacity:.7;font-size:12px;margin-top:6px">Cycle ${state.cycle} · ${money(state.argent)} · ${historyLog.length} événements vécus</p>
+    <button class="go" id="report-go">Rejouer ▸</button>`;
+  document.getElementById('report-go').onclick=()=>location.reload();
+}
+
+/* ===================================================================
+   LA COMMUNE — mode post-capitaliste jouable (§16-17)
+   La logique s'inverse : on ne cherche plus à accumuler (A→A′), on cherche
+   à coordonner le travail pour couvrir les BESOINS. Trois tensions
+   nouvelles : la PÉNURIE (ajuster production et besoins sans marché),
+   la DÉMOCRATIE (la participation contre l'apathie), la BUREAUCRATIE
+   (la coordination qui se fige en appareil). Issues : la Commune tient,
+   ou elle dégénère (révolution confisquée), ou elle s'effondre.
+   =================================================================== */
+function initCommune(s){
+  const pop = Math.max(s.travailleurs+ (Math.max(0,Math.round((s.populationActive||0)-s.travailleurs))), 12);
+  s.commune={
+    an:1,
+    population: pop,
+    besoins: pop*1.0,                 // besoins sociaux ≈ population
+    production: s.travailleurs*1.0,    // ce que le travail collectif produit
+    stocksCommuns: 20,
+    participation: clamp(0.5 + (s.groups&&s.groups.workers?s.groups.workers.organisation*0.3:0)),
+    bureaucratie: 0.15,
+    penurie: 0,
+    coordination: 0.4,
+    planProd: s.travailleurs*1.0,      // niveau de production planifié par le joueur
+  };
+}
+function enterCommune(){
+  if(gameMode==='commune') return;
+  gameMode='commune';
+  initCommune(state);
+  state.actionsRestantes=3;
+  if(circuitLine) circuitLine.visible=false;
+  if(targetMarker) targetMarker.visible=false;
+  if(groundArrow) groundArrow.visible=false;
+  const cb=document.getElementById('circuit'); if(cb) cb.style.display='none';
+  const rp=document.getElementById('report'); if(rp) rp.classList.remove('on');
+  addHistoricalEvent('age','La Commune : l’accumulation cède la place à la coordination. Un autre monde commence.');
+  renderFormationPanel();
+  showConcept({stamp:'Un autre monde', title:'La Commune — le capital dépassé',
+    body:'<p>La classe ouvrière organisée a brisé le circuit du capital. Le but n’est plus d’<b>accumuler</b> : il est de <b>coordonner le travail pour couvrir les besoins</b>.</p><p>De nouvelles tensions surgissent. Sans marché ni profit, comment ajuster la production aux besoins sans <b>pénurie</b> ? Comment décider <b>démocratiquement</b> sans sombrer dans l’<b>apathie</b> — ni laisser la coordination se figer en <b>bureaucratie</b> ?</p><p>Les lieux changent de sens (touche <b>E</b>) : l’usine se planifie, le quartier délibère, l’entrepôt se répartit.</p>',
+    unlock:['Coordonner, ne plus accumuler','Couvrir les besoins · éviter la pénurie','Démocratie vs bureaucratie']});
+}
+function runCommuneCycle(){
+  const c=state.commune, s=state;
+  // la production effective suit le plan, tempérée par la participation (travail volontaire) et freinée par la bureaucratie
+  const effPart=0.6+0.5*c.participation;            // participation → entrain au travail
+  const effBur=1-0.35*c.bureaucratie;               // bureaucratie → gaspillage/friction
+  c.production = Math.max(0, c.planProd * effPart * effBur);
+  // les besoins croissent doucement avec la population
+  c.population = Math.round(c.population*(1+0.01));
+  c.besoins = c.population*1.0;
+  // bilan matériel : offre = production + stocks communs
+  const offre = c.production + c.stocksCommuns;
+  const solde = offre - c.besoins;
+  if(solde>=0){ c.stocksCommuns = Math.min(c.besoins*1.5, solde); c.penurie = clamp(c.penurie-0.18); }
+  else { c.stocksCommuns = 0; c.penurie = clamp(c.penurie + Math.min(0.4, -solde/Math.max(1,c.besoins))); }
+  // coordination = adéquation production/besoins (1 = parfaitement ajusté)
+  c.coordination = clamp(1 - Math.abs(c.production - c.besoins)/Math.max(1,c.besoins));
+  // dérives lentes : sans entretien démocratique, la participation s'érode et la bureaucratie monte
+  c.participation = clamp(c.participation - 0.04 - (c.penurie>0.5?0.04:0));
+  c.bureaucratie = clamp(c.bureaucratie + 0.03 + (c.participation<0.35?0.05:0) + (c.penurie>0.6?0.04:0) - (c.participation>0.65?0.03:0));
+  // chronique
+  const bits=[];
+  if(c.penurie>0.5) bits.push('la pénurie frappe les quartiers');
+  else if(c.stocksCommuns>c.besoins*0.6) bits.push('les réserves communes s’emplissent');
+  else bits.push('les besoins sont à peu près couverts');
+  if(c.bureaucratie>0.55) bits.push('l’appareil s’alourdit');
+  if(c.participation>0.6) bits.push('les assemblées sont vivantes');
+  addHistoricalEvent('chronique',`An ${c.an} de la Commune — ${bits.join(', ')}.`);
+}
+const COMMUNE_ACTIONS={
+ 'Usine':[
+   {label:'Planifier la production', sub:'ajuster le plan aux besoins · + coordination', can:()=>true, run:()=>{ const c=state.commune; c.planProd=c.besoins; c.coordination=clamp(c.coordination+0.12); pushLog('Usine','Le plan est calé sur les besoins recensés : produire ce qui est utile, pas ce qui se vend.'); }},
+   {label:'Pousser le rendement', sub:'+ production · − participation (travail contraint)', can:()=>true, run:()=>{ const c=state.commune; c.planProd=c.planProd*1.2; c.participation=clamp(c.participation-0.08); c.bureaucratie=clamp(c.bureaucratie+0.04); pushLog('Usine','On force la cadence : davantage produit, mais le travail redevient une contrainte.'); }},
+ ],
+ 'Mines · Champs':[
+   {label:'Mobiliser pour les besoins urgents', sub:'− pénurie · effort collectif', can:()=>true, run:()=>{ const c=state.commune; c.stocksCommuns+=c.besoins*0.25; c.penurie=clamp(c.penurie-0.2); c.participation=clamp(c.participation+0.04); pushLog('Mines · Champs','Brigades volontaires : on va chercher l’essentiel là où il manque.'); }},
+ ],
+ 'Quartier ouvrier':[
+   {label:'Tenir une assemblée', sub:'++ participation · − bureaucratie', can:()=>true, run:()=>{ const c=state.commune; c.participation=clamp(c.participation+0.18); c.bureaucratie=clamp(c.bureaucratie-0.1); pushLog('Quartier ouvrier','Assemblée de quartier : les décisions se discutent et se votent. La démocratie se réactive.','social'); }},
+   {label:'Rotation des tâches', sub:'− bureaucratie durable · − un peu de production', can:()=>true, run:()=>{ const c=state.commune; c.bureaucratie=clamp(c.bureaucratie-0.14); c.planProd=c.planProd*0.96; c.participation=clamp(c.participation+0.06); pushLog('Quartier ouvrier','Rotation des tâches : nul ne se rend indispensable, l’appareil ne se fige pas.','social'); }},
+ ],
+ 'Entrepôt':[
+   {label:'Répartir selon les besoins', sub:'− effet de la pénurie · + participation', can:()=>true, run:()=>{ const c=state.commune; c.penurie=clamp(c.penurie-0.16); c.participation=clamp(c.participation+0.05); pushLog('Entrepôt','Distribution selon les besoins : « de chacun selon ses moyens, à chacun selon ses besoins ».','social'); }},
+   {label:'Rationner d’en haut', sub:'− pénurie immédiate · + bureaucratie', can:()=>true, run:()=>{ const c=state.commune; c.penurie=clamp(c.penurie-0.26); c.bureaucratie=clamp(c.bureaucratie+0.12); c.participation=clamp(c.participation-0.06); pushLog('Entrepôt','Rationnement décrété d’en haut : efficace dans l’urgence, mais l’appareil décide à la place des gens.','warn'); }},
+ ],
+ 'Marché de vente':[
+   {label:'Convertir en maison du peuple', sub:'le marché n’a plus de sens · + participation', can:()=>true, run:()=>{ const c=state.commune; c.participation=clamp(c.participation+0.08); pushLog('Marché de vente','L’ancien marché devient un lieu commun : on n’y vend plus, on s’y réunit.','social'); }},
+ ],
+ 'État · Tribunal':[
+   {label:'Démocratie directe', sub:'++ participation · − bureaucratie · plus lent', can:()=>true, run:()=>{ const c=state.commune; c.participation=clamp(c.participation+0.14); c.bureaucratie=clamp(c.bureaucratie-0.12); pushLog('État · Tribunal','Les délégués sont révocables, mandatés, payés au salaire ouvrier : le pouvoir ne se sépare pas de la base.','social'); }},
+   {label:'Déléguer à un comité', sub:'décisions rapides · ++ bureaucratie', can:()=>true, run:()=>{ const c=state.commune; c.bureaucratie=clamp(c.bureaucratie+0.16); c.participation=clamp(c.participation-0.1); c.coordination=clamp(c.coordination+0.06); pushLog('État · Tribunal','Un comité tranche vite — mais un appareil séparé de la base commence à se constituer.','warn'); }},
+ ],
+};
+function openCommuneActions(zone){
+  const list=COMMUNE_ACTIONS[zone.name];
+  document.getElementById('za-title').textContent=displayZoneName(zone.name);
+  const left=state.actionsRestantes;
+  document.getElementById('za-actions').textContent=left+' action'+(left>1?'s':'')+' restante'+(left>1?'s':'');
+  const box=document.getElementById('za-list'); box.innerHTML='';
+  if(!list||!list.length){ box.innerHTML='<p style="opacity:.7;font-size:13px">Plus rien à décider ici : ce lieu appartient à l’ancien monde.</p>'; }
+  else list.forEach(a=>{ const b=document.createElement('button'); b.className='za';
+    const ok=(left>0)&&(!a.can||a.can(state)); b.disabled=!ok;
+    b.innerHTML=`<b>${a.label}</b><span class="s">${a.sub}</span>`;
+    b.onclick=()=>doCommuneAction(zone,a); box.appendChild(b); });
+  document.getElementById('zoneact').classList.add('on'); refreshModalMode(); tutorialCoachRefresh(true);
+}
+function communeVisual(zoneName,label){
+  if(typeof scene==='undefined'||!scene) return;
+  const L=(label||'').toLowerCase(), Z=zoneName;
+  const BLUE=COL.bleu, GREEN=COL.vert, RED=COL.rouge, GOLD=COL.or;
+  const ft=(txt,where,type)=>{ try{ floatText(txt, zonePos(where||Z), type||'social'); }catch(e){} };
+  const halo=(n,c)=>{ try{ fxHalo(n,c); }catch(e){} };
+  const ping=(n,c)=>{ try{ fxPing(n,c); }catch(e){} };
+  const crate=(a,b,c)=>{ try{ fxCrate(a,b,c); }catch(e){} };
+  if(L.includes('planifier')){ halo('Usine',BLUE); crate('Quartier ouvrier','Usine',BLUE); ft('plan ↔ besoins','Usine','social'); return; }
+  if(L.includes('rendement')){ halo('Usine',RED); ping('Quartier ouvrier',RED); ft('travail contraint','Usine','crise'); return; }
+  if(L.includes('mobiliser')){ crate('Mines · Champs','Entrepôt',GREEN); halo('Entrepôt',GREEN); ft('− pénurie','Entrepôt','social'); return; }
+  if(L.includes('assemblée')){ halo('Quartier ouvrier',GREEN); ft('+ démocratie','Quartier ouvrier','social'); return; }
+  if(L.includes('rotation')){ halo('Quartier ouvrier',GREEN); ft('− appareil','Quartier ouvrier','social'); return; }
+  if(L.includes('répartir')){ crate('Entrepôt','Quartier ouvrier',GREEN); halo('Quartier ouvrier',GREEN); ft('selon les besoins','Quartier ouvrier','social'); return; }
+  if(L.includes('rationner')){ halo('Entrepôt',GOLD); ping('Quartier ouvrier',RED); ft('+ bureaucratie','Entrepôt','crise'); return; }
+  if(L.includes('maison du peuple')){ halo('Marché de vente',GREEN); ft('lieu commun','Marché de vente','social'); return; }
+  if(L.includes('démocratie directe')){ halo('État · Tribunal',GREEN); crate('État · Tribunal','Quartier ouvrier',GREEN); ft('pouvoir à la base','État · Tribunal','social'); return; }
+  if(L.includes('comité')){ ping('État · Tribunal',RED); halo('État · Tribunal',GOLD); ft('appareil séparé','État · Tribunal','crise'); return; }
+  halo(Z,BLUE);
+}
+function doCommuneAction(zone,a){
+  if(state.actionsRestantes<=0 || (a.can&&!a.can(state))) return;
+  a.run(); state.actionsRestantes--;
+  if(typeof communeVisual==='function') communeVisual(zone.name, a.label);
+  if(typeof LWmicro!=='undefined') LWmicro(zone.name);
+  renderFormationPanel();
+  if(state.actionsRestantes<=0){ document.getElementById('zoneact').classList.remove('on'); refreshModalMode();
+    pushLog('Période','Plus d’actions. Résous la période depuis le panneau.','warn'); }
+  else openCommuneActions(zone);
+}
+function resolveCommunePeriod(){
+  if(gameOver||anyModalOpen()) return;
+  cooldownReal=1.0;
+  runCommuneCycle();
+  state.actionsRestantes=3; state.commune.an++;
+  if(typeof buildSocialTableau==='function') buildSocialTableau();
+  renderFormationPanel(); updateConsequences();
+  if(checkCommuneEndgame()) return;
+  showCommuneReport();
+}
+function showCommuneReport(){
+  const c=state.commune;
+  const couv = Math.round(Math.min(1,(c.production+c.stocksCommuns)/Math.max(1,c.besoins))*100);
+  const sheet=document.getElementById('report-sheet');
+  const row=(k,v,cls)=>`<span class="k">${k}</span><span class="v ${cls||''}">${v}</span>`;
+  let lecture;
+  if(c.bureaucratie>0.55) lecture='L’appareil se sépare de la base : le danger n’est plus le capital, mais une bureaucratie qui décide à la place des producteurs.';
+  else if(c.penurie>0.5) lecture='Sans marché ni profit, ajuster la production aux besoins reste un problème réel : la pénurie use la confiance dans la Commune.';
+  else if(c.participation>0.6 && c.penurie<0.3) lecture='Les producteurs associés règlent eux-mêmes la production selon un plan concerté : la liberté commence où cesse le travail contraint.';
+  else lecture='La Commune tient, fragile : tout repose sur la participation vivante de la base.';
+  sheet.innerHTML=`
+    <div class="stamp">Commune · An ${c.an-1}</div>
+    <h3>Bilan de la période</h3>
+    <p class="verdict ${couv>=90?'ok':(couv>=70?'':'ko')}">Besoins couverts : ${couv} %</p>
+    <div class="repsec">Coordination matérielle</div>
+    <div class="led compte">
+      ${row('Population',Math.round(c.population))}
+      ${row('Besoins sociaux',Math.round(c.besoins))}
+      ${row('Production',Math.round(c.production))}
+      ${row('Réserves communes',Math.round(c.stocksCommuns))}
+      ${row('Pénurie',Math.round(c.penurie*100)+' %',c.penurie>0.4?'red':'')}
+      ${row('Coordination',Math.round(c.coordination*100)+' %')}
+    </div>
+    <div class="repsec">Vie politique</div>
+    <div class="led">
+      ${row('Participation démocratique',Math.round(c.participation*100)+' %',c.participation<0.35?'red':'gold')}
+      ${row('Bureaucratie',Math.round(c.bureaucratie*100)+' %',c.bureaucratie>0.5?'red':'')}
+    </div>
+    <div class="interp"><div class="veilline">Lecture marxienne</div><div>${lecture}</div></div>
+    <button class="go" id="report-go">Continuer ▸</button>`;
+  document.getElementById('report').classList.add('on');
+  document.getElementById('report-go').onclick=()=>{ document.getElementById('report').classList.remove('on'); refreshModalMode(); };
+}
+function checkCommuneEndgame(){
+  const c=state.commune, s=state;
+  // dégénérescence bureaucratique
+  if(endStreak(s,'cBur', c.bureaucratie>0.7 && c.participation<0.35)>=3){
+    endGame({win:false,t:'La révolution confisquée',
+      d:'La coordination s’est figée en appareil. Un corps de fonctionnaires décide à la place des producteurs : la propriété privée a disparu, mais la séparation entre dirigeants et dirigés demeure. Ce n’était pas encore le communisme.'}); return true; }
+  // effondrement par pénurie prolongée
+  if(endStreak(s,'cPen', c.penurie>0.6)>=3){
+    endGame({win:false,t:'La Commune s’effondre',
+      d:'Faute d’avoir su ajuster la production aux besoins, la pénurie s’est installée. La confiance se délite, chacun se replie : sans abondance ni coordination, la Commune se défait.'}); return true; }
+  // la Commune tient : besoins couverts, démocratie vivante, bureaucratie contenue
+  const tient = (c.production+c.stocksCommuns)>=c.besoins*0.95 && c.participation>0.6 && c.bureaucratie<0.4 && c.penurie<0.25;
+  if(endStreak(s,'cWin', tient)>=4){
+    endGame({win:true,t:'La Commune tient',
+      d:'Les producteurs associés coordonnent leur travail selon un plan démocratique : les besoins sont couverts, le pouvoir ne s’est pas séparé de la base. L’association libre a remplacé l’accumulation. Le circuit du capital appartient à l’histoire.'}); return true; }
+  return false;
+}
+
+
+
+const INTRO_SCENES = [
+  {
+    kicker:'Prologue',
+    title:'Au départ : <b>l’argent dort</b>.',
+    body:'Une somme d’argent cherche à devenir capital.',
+    formula:'Argent dormant',
+    tags:['Banque','Trésorerie','Attente'],
+    dur:4300, shot:'bank'
+  },
+  {
+    kicker:'Le circuit',
+    title:'Le capital circule entre des <b>lieux construits</b>.',
+    body:'L’argent passe par la banque, le marché, le travail, l’usine, l’entrepôt, la vente.',
+    formula:'A → M → Ft → P → M′ → A′',
+    tags:['Banque','Marché','Travail','Usine','Entrepôt','Vente'],
+    dur:5000, shot:'cycle'
+  },
+  {
+    kicker:'Formation sociale',
+    title:'Le circuit finit par produire <b>un monde plein</b>.',
+    body:'Une ville capitaliste : flux, fumées, ouvriers, stocks, institutions.',
+    formula:'La formation sociale apparaît',
+    tags:['Ville','Flux','Fumées','Quartiers','État'],
+    dur:4700, shot:'wide'
+  },
+  {
+    kicker:'Contradictions',
+    title:'Accumuler, c’est aussi créer des <b>tensions</b>.',
+    body:'Dette. Stocks. Colère. Chômage. Crise.',
+    formula:'Les lettres rouges signalent ce qui bloque',
+    tags:['Dette','Stocks','Colère','Crise'],
+    dur:4700, shot:'contradiction'
+  },
+  {
+    kicker:'Âges historiques',
+    title:'<b>Atelier</b>. Manufacture. Grande industrie.',
+    body:'Le capital change d’échelle et transforme la production.',
+    formula:'Développement du capital',
+    tags:['Atelier','Manufacture','Grande industrie'],
+    dur:5600, shot:'ages'
+  },
+  {
+    kicker:'Horizon du jeu',
+    title:'Ville industrielle. Capital financier. <b>Marché mondial</b>.',
+    body:'Le monde s’étend — et les formes politiques avec lui.',
+    formula:'Des trajectoires historiques émergent',
+    tags:['Ville industrielle','Marché mondial','Libéral','Autoritaire','Révolution'],
+    dur:5600, shot:'worldmarket'
+  },
+  {
+    kicker:'Le jeu commence',
+    title:'Fais émerger le <b>monde produit par le capital</b>.',
+    body:'Observe. Interviens. Lance un cycle productif.',
+    formula:'Objectif proche : atteindre la Manufacture',
+    tags:['Observer','Intervenir','Lancer le cycle'],
+    dur:5200, shot:'handoff'
+  }
+];
+
+const IntroCinematic={
+  active:false, startedGame:false, start:0, sceneIndex:-1, total:0, points:[], lastPulse:0, savedVehicle:null, savedCargo:null, savedWorld:null, previewOn:false,
+  saveWorldPreview(){
+    this.savedWorld={
+      buildings:Object.assign({},state.buildings),
+      travailleurs:state.travailleurs,
+      populationActive:state.populationActive,
+      niveauMachine:state.niveauMachine,
+      productionActive:state.productionActive,
+      niveauVille:state.niveauVille,
+      age:state.age,
+      cyclesProfitables:state.cyclesProfitables,
+      stocks:state.stocks,
+      dette:state.dette,
+      argent:state.argent,
+      gamePhase:gamePhase
+    };
+  },
+  applyWorldPreview(){
+    // Prévisualisation purement cinématique : la carte montre le futur possible du jeu,
+    // mais l'état réel est restauré avant que le joueur prenne la main.
+    if(!this.savedWorld) this.saveWorldPreview();
+    this.previewOn=true;
+    state.buildings={banque:3, atelier:1, usine:6, entrepot:5, marche:5, quartier:5, travail:4, rails:1, port:1, bourse:1, terres:1, outils:1};
+    state.travailleurs=16; state.populationActive=24; state.niveauMachine=7; state.productionActive=true;
+    state.niveauVille=6; state.age=6; state.cyclesProfitables=5; state.stocks=90; state.dette=260; state.argent=1600;
+    gamePhase='socialFormation';
+    updateBuildings(); updateZoneVisibility(); updateVilleBadge();
+    if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
+  },
+  restoreWorldPreview(){
+    if(!this.savedWorld) return;
+    const w=this.savedWorld;
+    state.buildings=Object.assign({},w.buildings);
+    state.travailleurs=w.travailleurs; state.populationActive=w.populationActive; state.niveauMachine=w.niveauMachine;
+    state.productionActive=w.productionActive; state.niveauVille=w.niveauVille; state.age=w.age;
+    state.cyclesProfitables=w.cyclesProfitables; state.stocks=w.stocks; state.dette=w.dette; state.argent=w.argent;
+    gamePhase=w.gamePhase; this.savedWorld=null; this.previewOn=false;
+    updateBuildings(); updateConsequences(); updateZoneVisibility(); updateVilleBadge(); updateHUD(); updateMarx();
+    if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
+    clearTransientCinematicEffects();
+  },
+  begin(){
+    const overlay=document.getElementById('introtrailer');
+    if(!overlay) return;
+    document.body.classList.add('intro-open');
+    this.total=INTRO_SCENES.reduce((a,s)=>a+(s.dur||6000),0);
+    this.active=true; this.startedGame=false; this.start=performance.now(); this.sceneIndex=-1; this.lastPulse=0;
+    this.points=CIRCUIT.map(c=>{ const p=zonePos(c.zone); return new THREE.Vector3(p.x,0,p.z); });
+    this.savedVehicle={pos:Vehicle.pos.clone(), heading:Vehicle.heading, speed:Vehicle.speed};
+    this.savedCargo=(typeof MiniCircuit!=='undefined'?MiniCircuit.cargo:null);
+    this.applyWorldPreview();
+    Vehicle.speed=0; Input.fwd=Input.back=Input.left=Input.right=false;
+    CycleCinematic.buildActors();
+    overlay.classList.remove('hidden');
+    this.applyScene(0);
+  },
+  end(restoreVehicle=true){
+    this.active=false; this.sceneIndex=-1; this.points=[];
+    document.body.classList.remove('intro-open');
+    CycleCinematic.clearActors();
+    this.restoreWorldPreview();
+    clearTransientCinematicEffects();
+    if(restoreVehicle && this.savedVehicle && Vehicle){
+      Vehicle.pos.copy(this.savedVehicle.pos); Vehicle.heading=this.savedVehicle.heading; Vehicle.speed=0;
+      if(Vehicle.group){ Vehicle.group.position.set(Vehicle.pos.x,0,Vehicle.pos.z); Vehicle.group.rotation.y=Vehicle.heading; Vehicle.group.rotation.z=0; }
+    }
+    if(typeof MiniCircuit!=='undefined' && this.savedCargo!=null) MiniCircuit.cargo=this.savedCargo;
+    this.savedVehicle=null; this.savedCargo=null;
+  },
+  routePoint(p){
+    if(!this.points.length) return new THREE.Vector3();
+    const span=this.points.length-1;
+    const raw=clamp(p)*span, idx=Math.min(span-1,Math.floor(raw)), local=raw-idx;
+    return new THREE.Vector3().lerpVectors(this.points[idx], this.points[Math.min(idx+1,span)], local);
+  },
+  setVehicleAtSaved(){
+    if(!this.savedVehicle || !Vehicle || !Vehicle.group) return;
+    Vehicle.pos.copy(this.savedVehicle.pos);
+    Vehicle.heading=this.savedVehicle.heading;
+    Vehicle.speed=0;
+    Vehicle.group.position.set(Vehicle.pos.x,0,Vehicle.pos.z);
+    Vehicle.group.rotation.y=Vehicle.heading;
+    Vehicle.group.rotation.z=0;
+    if(typeof MiniCircuit!=='undefined') MiniCircuit.cargo='argent';
+    if(Vehicle.cargoGroups){ for(const k in Vehicle.cargoGroups) Vehicle.cargoGroups[k].visible=(k==='argent'); }
+  },
+  applyScene(i){
+    this.sceneIndex=i;
+    const s=INTRO_SCENES[i]||INTRO_SCENES[0];
+    const stamp=document.getElementById('intro-stamp'); if(stamp) stamp.textContent=s.kicker||'';
+    const title=document.getElementById('intro-title'); if(title) title.innerHTML=s.title||'';
+    const body=document.getElementById('intro-body'); if(body) body.innerHTML=s.body||'';
+    const formula=document.getElementById('intro-formula'); if(formula) formula.innerHTML=s.formula||'';
+    const tags=document.getElementById('intro-tags');
+    if(tags){ tags.innerHTML=''; (s.tags||[]).forEach(t=>{ const el=document.createElement('span'); el.textContent=t; tags.appendChild(el); }); }
+    if(s.shot==='handoff'){
+      if(this.previewOn) this.restoreWorldPreview();
+    } else {
+      if(!this.previewOn) this.applyWorldPreview();
+    }
+    const meta=document.getElementById('intro-meta'); if(meta) meta.textContent='séquence '+(i+1)+' / '+INTRO_SCENES.length;
+    const dots=document.getElementById('intro-dots');
+    if(dots){ dots.innerHTML=''; INTRO_SCENES.forEach((_,k)=>{ const d=document.createElement('i'); if(k===i)d.className='on'; dots.appendChild(d); }); }
+  },
+  pulseZones(names,color){
+    const now=performance.now();
+    if(now-this.lastPulse<900) return;
+    this.lastPulse=now;
+    names.forEach(n=>{ fxHalo(n,color); fxPing(n,color); });
+  },
+  updateSceneMotion(scene,local,elapsed){
+    const tt=elapsed*0.001;
+    const bank=zonePos('Banque'), usine=zonePos('Usine'), vente=zonePos('Marché de vente'), etat=zonePos('État'), qw=zonePos('Quartier ouvrier');
+    if(scene==='bank'){
+      const focus=new THREE.Vector3(bank.x,1.5,bank.z);
+      const desired=new THREE.Vector3(bank.x+22+Math.sin(tt)*2,13.5,bank.z+16+Math.cos(tt*0.8)*1.4);
+      camera.position.lerp(desired,0.08); camera.lookAt(focus);
+      CycleCinematic.positionVehicle(0.02); CycleCinematic.updateMoney(0.12); CycleCinematic.updateWorkers(0.02,0.04); CycleCinematic.updateGoods(0.02);
+      this.pulseZones(['Banque'],COL.or); return;
+    }
+    if(scene==='cycle'){
+      // Plan 2 : le mouvement du capital doit être lisible entre des bâtiments déjà construits.
+      const p=local;
+      const focus=this.routePoint(p);
+      const current=CIRCUIT[Math.min(CIRCUIT.length-1,Math.floor(p*CIRCUIT.length))];
+      const desired=new THREE.Vector3(focus.x-18+Math.sin(p*Math.PI*2)*6,30+Math.sin(p*Math.PI)*5,focus.z+18);
+      camera.position.lerp(desired,0.12); camera.lookAt(focus.x,1.2,focus.z);
+      CycleCinematic.positionVehicle(p); CycleCinematic.updateWorkers(p,0.04); CycleCinematic.updateMoney(p); CycleCinematic.updateGoods(p);
+      this.pulseZones([current.zone], COL.or);
+      if(p>0.06 && p<0.96 && current) floatText(current.sym,{x:focus.x,y:10,z:focus.z},p>0.55?'gain':'plain');
+      return;
+    }
+    if(scene==='wide'){
+      // Plan 3 : montrer le monde le plus rempli possible, comme une image promesse du jeu.
+      const p=0.50+Math.sin(tt*0.8)*0.18;
+      const focus=new THREE.Vector3(0,0,0);
+      const desired=new THREE.Vector3(-26+Math.sin(tt*0.55)*14,46+Math.sin(tt*0.35)*8,32+Math.cos(tt*0.5)*12);
+      camera.position.lerp(desired,0.075); camera.lookAt(focus.x,0,focus.z);
+      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(clamp(p)); CycleCinematic.updateGoods(clamp(p));
+      this.pulseZones(['Banque','Marché des moyens','Marché du travail','Usine','Entrepôt','Marché de vente','Quartier ouvrier','État','Bourse','Port · Marché mondial'],COL.or);
+      return;
+    }
+    if(scene==='contradiction'){
+      const p=0.58+Math.sin(tt*0.9)*0.08;
+      const focus=new THREE.Vector3(usine.x-2,0,usine.z);
+      const desired=new THREE.Vector3(usine.x-34,60,usine.z+28+Math.cos(tt*0.6)*5);
+      camera.position.lerp(desired,0.08); camera.lookAt(focus.x,0,focus.z);
+      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(0.86); CycleCinematic.updateGoods(clamp(p));
+      this.pulseZones(['Banque','Marché du travail','Usine','Entrepôt','Marché de vente'],COL.rouge); return;
+    }
+    if(scene==='ages'){
+      const phase=local;
+      let focus, desired, p;
+      if(phase<0.34){
+        p=0.34; // atelier / manufacture
+        focus=new THREE.Vector3(usine.x-1,0,usine.z);
+        desired=new THREE.Vector3(usine.x-18,18,usine.z+15);
+        this.pulseZones(['Usine'],COL.or);
+      } else if(phase<0.68){
+        p=0.48; // grande industrie
+        focus=new THREE.Vector3(usine.x,0,usine.z);
+        desired=new THREE.Vector3(usine.x-26,34,usine.z+22);
+        this.pulseZones(['Usine','Entrepôt'],COL.or);
+      } else {
+        p=0.56; // ville industrielle
+        focus=new THREE.Vector3(0,0,0);
+        desired=new THREE.Vector3(-34,60,36);
+        this.pulseZones(['Usine','Entrepôt','Quartier ouvrier','État'],COL.or);
+      }
+      camera.position.lerp(desired,0.08); camera.lookAt(focus.x,0,focus.z);
+      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(0.24); CycleCinematic.updateGoods(0.68);
+      return;
+    }
+    if(scene==='worldmarket'){
+      const phase=local;
+      let focus, desired, p;
+      if(phase<0.45){
+        p=0.62;
+        focus=new THREE.Vector3(0,0,0);
+        desired=new THREE.Vector3(-42+Math.sin(tt*0.5)*6,72,50+Math.cos(tt*0.45)*5); // ville industrielle élargie
+        this.pulseZones(['Usine','Entrepôt','Quartier ouvrier','État','Banque'],COL.or);
+      } else {
+        p=0.78;
+        focus=new THREE.Vector3(0,0,0);
+        desired=new THREE.Vector3(Math.sin(tt*0.38)*58,98,Math.cos(tt*0.38)*58); // horizon mondial / orbite large
+        this.pulseZones(['Banque','Marché de vente','État','Entrepôt','Bourse','Port · Marché mondial'],COL.bleu);
+      }
+      camera.position.lerp(desired,0.07); camera.lookAt(focus.x,0,focus.z);
+      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(0.42,0.04); CycleCinematic.updateMoney(0.82); CycleCinematic.updateGoods(0.82);
+      return;
+    }
+    // handoff : retour au monde de départ, puis contre-plongée vers le chariot
+    this.setVehicleAtSaved();
+    const focus=new THREE.Vector3(Vehicle.pos.x,1.6,Vehicle.pos.z);
+    const dx=Math.sin(Vehicle.heading), dz=Math.cos(Vehicle.heading);
+    const high=new THREE.Vector3(Vehicle.pos.x-26,26,Vehicle.pos.z+28);
+    const low=new THREE.Vector3(Vehicle.pos.x-dx*11,2.7,Vehicle.pos.z-dz*11);
+    const e=local<0.5 ? 2*local*local : 1-Math.pow(-2*local+2,2)/2;
+    const desired=new THREE.Vector3().lerpVectors(high,low,e);
+    camera.position.lerp(desired,0.12);
+    camera.lookAt(focus.x+dx*5,1.7+local*1.2,focus.z+dz*5);
+    this.pulseZones(['Banque'],COL.or);
+  },
+  update(){
+    if(!this.active) return;
+    const elapsed=performance.now()-this.start;
+    let sum=0, idx=INTRO_SCENES.length-1, local=1;
+    for(let i=0;i<INTRO_SCENES.length;i++){
+      const dur=INTRO_SCENES[i].dur||6000;
+      if(elapsed < sum + dur){ idx=i; local=(elapsed-sum)/dur; break; }
+      sum += dur;
+    }
+    if(elapsed>=this.total){ idx=INTRO_SCENES.length-1; local=1; }
+    if(idx!==this.sceneIndex) this.applyScene(idx);
+    const shot=INTRO_SCENES[idx].shot || 'wide';
+    this.updateSceneMotion(shot, clamp(local), elapsed);
+    if(elapsed>=this.total+450 && !this.startedGame){
+      this.startedGame=true; startGame({handoff:true});
+    }
+  }
+};
+
+function startIntroTrailer(){ IntroCinematic.begin(); }
+function startGame(opts={}){
+  const handoff=!!opts.handoff;
+  const intro=document.getElementById('introtrailer');
+  if(intro) intro.classList.add('hidden');
+  IntroCinematic.end(!handoff);
+  showChantierBtn(false);
+  TutorialCoach.active=true; TutorialCoach.minimized=false; TutorialCoach.resetMovement();
+  moveTargetMarker(); renderQuest(); renderCircuitBar(); tutorialCoachRefresh(true);
+  pushLog('Phase 0','Ton argent dort. Va sur le terrain vide et construis un atelier pour commencer.','plain');
+}
+const introSkip=document.getElementById('intro-skip'); if(introSkip) introSkip.addEventListener('click',()=>startGame());
+
+
+let activeZone=null, lastTriggered=null, cooldown=0;
+
+/* ============ Gestionnaire d'interface & cohérence du circuit ============ */
+const MODAL_IDS=['journal','guide','concept','greve','upgrade','cards','report','zoneact','cycleplay','circuit-info'];
+function anyModalOpen(){ return MODAL_IDS.some(id=>{const e=document.getElementById(id); return e&&e.classList.contains('on');}); }
+function closeFloatingPanels(){ closeWhap(); const p=document.getElementById('prompt'); if(p) p.classList.remove('on'); }
+function refreshModalMode(){
+  if(anyModalOpen()){ document.body.classList.add('modal-open'); closeFloatingPanels(); }
+  else document.body.classList.remove('modal-open');
+  tutorialCoachRefresh();
+}
+// catégories de zones : A) circuit obligatoire  B) secondaires (si construites)  C) décoratives
+const CIRCUIT_ZONES=new Set(CIRCUIT.map(c=>c.zone));
+function zoneExists(name){ return zones.some(z=>z.name===name); }
+function canInteractWithZone(zone){
+  if(!zone || gameOver) return false;
+  if(gamePhase==='precapital') return !!precapitalAction(zone.name);
+  if(zoneLocked(zone.name)) return false;
+  if(CIRCUIT_ZONES.has(zone.name)) return zone.name===CIRCUIT[step].zone;  // seulement l'étape courante
+  return false;                                                            // zones secondaires/déco : pas d'action E
+}
+function getCurrentDestination(){
+  if(gamePhase==='precapital') return precapitalTargetZone();
+  const c=CIRCUIT[step]; return c?c.zone:null;
+}
+let QA_MODE=false;
+function setQA(on){ QA_MODE=on; document.body.classList.toggle('qa',on); if(on) updateQA(); }
+function updateQA(){
+  if(!QA_MODE) return;
+  const dest=getCurrentDestination();
+  document.getElementById('qa').textContent=
+    `phase   : ${gamePhase}\ncycle   : ${state.cycle}  objIndex: ${state.objectifIndex}\nstep    : ${step}  dest: ${dest||'—'}\ndestOK  : ${dest?zoneExists(dest):'—'}\nzone    : ${currentZone?currentZone.name:'—'}  canE: ${canInteractWithZone(currentZone)}\nmodal   : ${anyModalOpen()}  niveauVille: ${state.niveauVille}`;
+}
+function debugFlow(){
+  const dest=getCurrentDestination();
+  console.table({ phase:gamePhase, cycle:state.cycle, objectifIndex:state.objectifIndex, step,
+    currentDestination:dest, targetBuilt:dest?zoneExists(dest):null,
+    canInteract:canInteractWithZone(currentZone), modalOpen:anyModalOpen(),
+    activeZone:currentZone?currentZone.name:null });
+}
+if(typeof window!=='undefined'){ window.debugFlow=debugFlow; window.setQA=setQA; }
+
+function colorFor(type){
+  if(type==='crisis') return 'var(--rouge)';
+  if(type==='warn') return '#8a6b1f';
+  if(type==='social') return 'var(--bleu)';
+  return '';
+}
+function pushLog(title,text,type){
+  if(title==='Usine') title='Usine';
+  const html=`<b>${title} —</b> ${text}`;
+  const col=colorFor(type);
+  if(isJournalWorthy(title,text,type)){
+    journalEntries.unshift({html, col});
+    if(journalEntries.length>120) journalEntries.pop();
+  }
+  // panneau compact : un seul événement visible, même pour une indication pratique
+  const body=document.getElementById('log-body');
+  body.innerHTML=`<p${col?` style="color:${col}"`:''}>${html}</p>`;
+  if(document.getElementById('journal').classList.contains('on')) renderJournalModal();
+}
+const ZONE_INFO={
+  'Banque':'Le capital est avancé ici (A). C’est le point de départ et de retour du circuit.',
+  'Marché des moyens':'On y achète le capital constant : machines et matières (M).',
+  'Marché du travail':'On y embauche la force de travail (Ft) — la seule marchandise qui crée de la valeur.',
+  'Usine':'Le bâtiment de production (P). Son stade historique peut être atelier, manufacture ou grande industrie.',
+  'Entrepôt':'Les marchandises produites s’y entassent (M′) en attendant d’être vendues.',
+  'Marché de vente':'M′→A′ : la valeur se réalise en argent. Boucler ici termine le cycle.',
+  'Quartier ouvrier':'Là vivent les ouvriers : fatigue, chômage et colère s’y lisent.',
+  'État · Tribunal':'L’État légifère, réprime ou concède selon le rapport de force.',
+  'Terres communes':'Accumulation primitive : clôturer les communs fabrique des salariés.',
+  'Mines · Champs':'Matières premières et rente entrent dans le circuit.',
+  'Port · Marché mondial':'Le circuit déborde les frontières : débouchés et matières mondiales.',
+  'Bourse':'Capital fictif et spéculation : le risque de crise s’y mesure.',
+};
+function handleZones(dt){
+  refreshModalMode();
+  if(QA_MODE) updateQA();
+  if(anyModalOpen()){ const p=document.getElementById('prompt'); if(p) p.classList.remove('on'); currentZone=null; return; }
+  let inside=null, best=1e9;
+  for(const z of zones){
+    if(CompetitorWorld.byZone(z.name)&&!CompetitorWorld.revealed) continue;   // v48 : pas encore dans le monde du joueur
+    const d2=(Vehicle.pos.x-z.pos.x)**2+(Vehicle.pos.z-z.pos.z)**2;
+    z.halo.material.opacity = zoneLocked(z.name) ? 0.08 : 0.22;
+    if(d2 < z.radius**2 && d2<best){ inside=z; best=d2; }
+  }
+  // halo accentué sur le prochain lieu requis
+  if(!gameOver){
+    const targetName = gamePhase==='precapital' ? precapitalTargetZone() : CIRCUIT[step].zone;
+    const nz=zones.find(z=>z.name===targetName);
+    if(nz) nz.halo.material.opacity=0.5+0.25*Math.sin(t*3);
+  }
+  const prompt=document.getElementById('prompt');
+  const cardsOpen=document.getElementById('cards').classList.contains('on');
+  showLevers(false); // ne s’ouvre plus au simple passage sur le lieu de production
+  if(inside){
+    // ---- PHASE 0 : prompts de fondation, sur la carte ----
+    if(gamePhase==='precapital'){
+      const u=precapitalAction(inside.name);
+      const lab=precapitalZoneLabel(inside.name);
+      prompt.classList.add('on'); currentZone=inside;
+      inside.halo.material.opacity=0.62;
+      if(u){
+        const cost=upgradeCost(u);
+        const can=state.argent>=cost;
+        prompt.innerHTML=`${lab} &nbsp;—&nbsp; <b>${precapitalPrompt(u)}</b>`+
+          `<small>${cost>0?money(cost):'gratuit'}${can?'':' · capital insuffisant'} — ${u.eff}</small>`;
+      } else {
+        const tz=precapitalTargetZone();
+        prompt.innerHTML=`${lab}<small>Le circuit n’existe pas encore. Construis d’abord ses conditions${tz?` — va à ${precapitalZoneLabel(tz)}.`:'.'}</small>`;
+      }
+      return;
+    }
+    // ---- v48 : FORMATION SOCIALE — prompts explicites (intervenir / observer) ----
+    if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){
+      prompt.classList.add('on'); currentZone=inside;
+      inside.halo.material.opacity=0.62;
+      const cf=CompetitorWorld.byZone(inside.name);
+      if(cf){
+        prompt.innerHTML=`${inside.name} &nbsp;—&nbsp; <b>Appuie sur E pour observer</b><small>${CompetitorWorld.promptInfo(cf)}</small>`;
+      } else if(ZONE_ACTIONS[inside.name]){
+        prompt.innerHTML=`${displayZoneName(inside.name)} &nbsp;—&nbsp; <b>Appuie sur E pour intervenir</b><small>${zoneInfo(inside.name)||''}</small>`;
+      } else {
+        prompt.innerHTML=`${displayZoneName(inside.name)}<small>${zoneInfo(inside.name)||'Observe — ou agis ailleurs.'}</small>`;
+      }
+      return;
+    }
+    const locked=zoneLocked(inside.name);
+    inside.halo.material.opacity = locked ? 0.14 : 0.62;
+    if(locked){
+      prompt.classList.add('on');
+      prompt.innerHTML=`${displayZoneName(inside.name)} &nbsp;—&nbsp; <b>🔒 Débloqué plus tard</b><small>Débloqué par l’accumulation, plus tard dans la partie.</small>`;
+      currentZone=inside;
+    } else {
+      const can = canInteractWithZone(inside);
+      const isCircuit = CIRCUIT_ZONES.has(inside.name);
+      inside.halo.material.opacity = can ? 0.62 : 0.30;
+      prompt.classList.add('on'); currentZone=inside;
+      if(can){
+        prompt.innerHTML=`${displayZoneName(inside.name)}${inside.key?` (${inside.key})`:''} &nbsp;·&nbsp; <b>étape actuelle</b> &nbsp;—&nbsp; Appuie sur <b>E</b>`+
+          `<small>${zoneInfo(inside.name)||''}</small>`;
+      } else if(isCircuit){
+        const need=CIRCUIT[step];
+        prompt.innerHTML=`${displayZoneName(inside.name)}${inside.key?` (${inside.key})`:''}<small>Le circuit passe d’abord par ${displayZoneName(need.zone)} (${need.sym}).</small>`;
+      } else {
+        prompt.innerHTML=`${displayZoneName(inside.name)}<small>${zoneInfo(inside.name)||'Le circuit ne passe pas par ici.'}</small>`;
+      }
+    }
+  } else {
+    prompt.classList.remove('on');
+    currentZone=null;
+  }
+}
+
+/* ===================================================================
+   Game  —  boucle principale
+   =================================================================== */
+let clock;
+export function init(opts={}){
+  if(opts.environment !== undefined) _bootedEnv = opts.environment;
+  buildWorld();
+  CompetitorWorld.build();          // v48 : districts concurrents (cachés jusqu'à la formation sociale)
+  Vehicle.build();
+  camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.1,400);
+  camera.position.set(0,16,-44);
+  renderer=new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.outputColorSpace=THREE.SRGBColorSpace;         // r128 → r16x : tag explicite
+  // v66 — composer + bloom : les émissifs (lampes, fenêtres, verrières, enseignes)
+  // débordent dans la brume. Seuil haut : le jour ne bloomera presque pas.
+  if(typeof THREE.EffectComposer!=='undefined' && typeof THREE.UnrealBloomPass!=='undefined'){
+    composer=new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene,camera));
+    bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.45,0.55,0.78);
+    composer.addPass(bloomPass);
+    composer.setSize(innerWidth,innerHeight);
+  }
+  renderer.setPixelRatio(Math.min(1.5,devicePixelRatio)); // v33 : cap léger pour retrouver une conduite fluide
+  renderer.toneMapping=THREE.ACESFilmicToneMapping;        // v57 : rendu plus riche, hautes lumières douces
+  renderer.toneMappingExposure=1.18;
+  renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+  document.getElementById('app').appendChild(renderer.domElement);
+  // M0 — IBL : si l'AssetManager a livré une texture équirectangulaire HDR,
+  // on compile son PMREM ici (le renderer existe) et on la pose sur la scène
+  // avec une intensité basse (ENV_INTENSITY = 0.25). La constante sera relevée
+  // en M1 ; M0 ne change PAS le rendu v66.
+  if(opts && opts.hdrTexture){
+    const pmrem=new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    const rt=pmrem.fromEquirectangular(opts.hdrTexture);
+    scene.environment=rt.texture;
+    scene.environmentIntensity=ENV_INTENSITY;
+    pmrem.dispose();
+    opts.hdrTexture.dispose();
+  }
+  clock=new THREE.Clock();
+  buildTargetMarker();
+  buildCircuitLine();
+  updateHUD(); updateMarx(); renderLeviers();
+  renderCircuitBar(); renderQuest(); moveTargetMarker(); updateConsequences();
+  updateBuildings(); updateZoneVisibility(); refreshNiveauVille(); updateVilleBadge();
+  LivingWorld.init();
+  WorldBeauty.init();      // v56
+  Atmosphere.init();       // v58 : brume + soleil visible
+  PuffTrains.init();       // v63 : bouffées de cheminées
+  // le son démarre au premier geste (politique d'autoplay des navigateurs)
+  const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
+  addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
+  populateEnvironment();
+  startIntroTrailer();
+  addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);
+    if(composer) composer.setSize(innerWidth,innerHeight);});
+  loop();
+}
+let t=0;
+/* ---- effets visuels éphémères (phase 0) — pas de mécanique, juste du décor vivant ---- */
+let fxList=[];
+function zonePos(name){ const z=zones.find(zz=>zz.name===name); return z?z.pos:{x:0,z:0}; }
+function fxHalo(name,color){ const p=zonePos(name);
+  const ring=new THREE.Mesh(new THREE.RingGeometry(2,3,40),
+    new THREE.MeshBasicMaterial({color:(color!=null?color:COL.or),transparent:true,opacity:.75,side:THREE.DoubleSide,depthWrite:false}));
+  ring.rotation.x=-Math.PI/2; ring.position.set(p.x,0.12,p.z); scene.add(ring);
+  fxList.push({obj:ring,born:t,ttl:1.1,kind:'halo'}); }
+function fxPuff(name){ const p=zonePos(name); const grp=new THREE.Group();
+  for(let i=0;i<7;i++){ const s=new THREE.Mesh(new THREE.SphereGeometry(0.8,6,6),
+    new THREE.MeshStandardMaterial({color:0xb9ad90,transparent:true,opacity:.75,flatShading:true}));
+    s.position.set(p.x+(Math.random()*7-3.5),1+Math.random()*2,p.z+(Math.random()*7-3.5)); grp.add(s); }
+  scene.add(grp); fxList.push({obj:grp,born:t,ttl:0.9,kind:'puff'}); }
+function fxPing(name,color){ const p=zonePos(name);
+  const ring=new THREE.Mesh(new THREE.RingGeometry(6,7.2,40),
+    new THREE.MeshBasicMaterial({color:(color!=null?color:COL.rouge),transparent:true,opacity:.85,side:THREE.DoubleSide,depthWrite:false}));
+  ring.rotation.x=-Math.PI/2; ring.position.set(p.x,0.13,p.z); scene.add(ring);
+  fxList.push({obj:ring,born:t,ttl:1.6,kind:'ping'}); }
+/* v54 — les marchandises voyagent en CHARIOT, et par la GRAND-RUE.
+   Trajet en polyligne : départ -> descendre jusqu'à la rue -> longer la rue -> arriver.
+   Vitesse constante (le monde a une matérialité), caisse colorée sur le plateau. */
+function fxCrate(fromName,toName,color){
+  const a=zonePos(fromName), b=zonePos(toName);
+  const cart=createSmallCart();
+  const load=box(1.2,1.2,1.2,(color!=null?color:COL.or),0,1.55,0,false); cart.add(load);
+  scene.add(cart);
+  // polyligne via la rue (z=0) si les points n'y sont pas déjà
+  const pts=[{x:a.x,z:a.z}];
+  if(Math.abs(a.z)>9) pts.push({x:a.x,z:0});
+  if(Math.abs(b.z)>9) pts.push({x:b.x,z:0});
+  pts.push({x:b.x,z:b.z});
+  let L=0; const cum=[0];
+  for(let i=1;i<pts.length;i++){ L+=Math.hypot(pts[i].x-pts[i-1].x,pts[i].z-pts[i-1].z); cum.push(L); }
+  fxList.push({obj:cart,born:t,ttl:Math.max(1.6,L/26),kind:'cart',pts,cum,L});
+}
+function updateFx(){
+  for(let i=fxList.length-1;i>=0;i--){ const f=fxList[i]; const k=(t-f.born)/f.ttl;
+    if(k>=1){ scene.remove(f.obj); fxList.splice(i,1); continue; }
+    if(f.kind==='halo'){ const s=1+k*3; f.obj.scale.set(s,s,s); f.obj.material.opacity=0.75*(1-k); }
+    else if(f.kind==='puff'){ f.obj.children.forEach(s=>{ s.position.y+=0.045; if(s.material)s.material.opacity=0.75*(1-k); s.scale.setScalar(1+k); }); }
+    else if(f.kind==='ping'){ const s=1+k*0.9; f.obj.scale.set(s,s,s); f.obj.material.opacity=0.85*(1-k); }
+    else if(f.kind==='cart'){
+      const d=k*f.L; let i=1; while(i<f.cum.length-1 && f.cum[i]<d) i++;
+      const a=f.pts[i-1], b=f.pts[i], segL=(f.cum[i]-f.cum[i-1])||1, kk=(d-f.cum[i-1])/segL;
+      const x=a.x+(b.x-a.x)*kk, z=a.z+(b.z-a.z)*kk;
+      f.obj.position.set(x, 0.04+Math.abs(Math.sin(d*1.7))*0.05, z);     // léger cahot de roulage
+      f.obj.rotation.y=Math.atan2(b.x-a.x,b.z-a.z);
+    }
+  }
+}
+
+/* ===================================================================
+   TABLEAU SOCIAL — la carte devient le portrait vivant d'une société
+   de classes. Restructuré à chaque âge ; reflète les conditions réelles :
+   paupérisation (immisération), armée de réserve, Bourses du travail,
+   coopératives et secours mutuel, répression d'État, et l'expansion du
+   quartier bourgeois. (Références : Marx, Capital I ; histoire ouvrière :
+   Bourses du travail 1887+, sociétés de secours mutuel, massacre de
+   Fourmies 1891, urbanisme haussmannien de la bourgeoisie.)
+   =================================================================== */
+let tableauGroup=null;
+function tabAdd(m){ if(tableauGroup&&m) tableauGroup.add(m); return m; }
+function tabHouse(x,z,kind){
+  const g=new THREE.Group();
+  if(kind==='riche'){ // hôtel particulier bourgeois : haut, pierre claire, toit mansardé, ornements dorés
+    const body=box(4.2,7,4.2,COL.pierre,0,3.5,0); g.add(body);
+    const roof=new THREE.Mesh(new THREE.ConeGeometry(3.4,2.4,4), stdMat(0x4a3b2c)); roof.position.set(0,8.2,0); roof.rotation.y=Math.PI/4; g.add(roof);
+    g.add(box(4.4,0.4,4.4,COL.or,0,7.05,0));                 // corniche dorée
+    g.add(box(0.6,1.4,0.3,COL.or,0,2,2.15));                 // porte cossue
+  } else if(kind==='bourse'){ // Bourse du travail : édifice civique ouvrier, fronton, drapeau rouge
+    const body=box(6,5,4.5,0x6f6450,0,2.5,0); g.add(body);
+    for(let i=-2;i<=2;i++) g.add(box(0.5,3.4,0.5,0xe9ddc6,i*1.2,2.2,2.3)); // colonnade
+    g.add(box(6.4,0.7,4.8,0xe9ddc6,0,5.1,0));                // fronton
+    const mast=box(0.18,4,0.18,0x33291d,2.6,7,0); g.add(mast);
+    g.add(box(1.6,1,0.1,COL.rouge,3.4,8.4,0));               // drapeau rouge
+  } else if(kind==='coop'){ // coopérative / secours mutuel : halle basse, enseigne
+    const body=box(5,3,3.6,0x7a6a4a,0,1.5,0); g.add(body);
+    const roof=box(5.4,0.4,4,COL.brun,0,3.1,0); g.add(roof);
+    g.add(box(3,0.8,0.1,COL.vert,0,2.4,1.85));               // bandeau « coopérative »
+  } else { // taudis ouvrier : bas, sombre, serré
+    const h=2.4+(Math.random()*0.8);
+    const body=box(2.6,h,2.6,COL.froid,0,h/2,0); g.add(body);
+    const roof=new THREE.Mesh(new THREE.ConeGeometry(2,1.1,4), stdMat(0x4a5763)); roof.position.set(0,h+0.55,0); roof.rotation.y=Math.PI/4; g.add(roof);
+  }
+  g.position.set(x,0,z); return tabAdd(g);
+}
+function tabFigure(x,z,color,pose,rotY){
+  const f=createWorkerFigure({color:color, scale:0.95, pose:pose}); f.position.set(x,0,z); if(rotY)f.rotation.y=rotY; return tabAdd(f);
+}
+function buildSocialTableau(){
+  if(typeof scene==='undefined'||!scene) return;
+  if(gameMode!=='socialFormation' && gameMode!=='commune') return;
+  try{
+    if(!tableauGroup){ tableauGroup=new THREE.Group(); scene.add(tableauGroup); }
+    else { for(let i=(tableauGroup.children?tableauGroup.children.length:0)-1;i>=0;i--) tableauGroup.remove(tableauGroup.children[i]); }
+    const s=state, g=s.groups||{}, r=s.regime||{}, age=s.age||1;
+    const QO=zonePos('Quartier ouvrier');
+    // ---- 1. LA VILLE : la grande industrie suppose la ville ; la carte se densifie par âge ----
+    if(age>=3){
+      const blocks=Math.min(22, 6+(age-2)*5);                 // de plus en plus dense
+      const ring=[ [ -30,-30],[-18,-38],[-6,-44],[10,-42],[22,-34],[34,-22],
+                   [40,-6],[42,8],[36,24],[24,36],[8,42],[-8,40],[-22,34],[-34,22],
+                   [-40,6],[-38,-10],[18,18],[-18,18],[18,-14],[-14,-18],[0,30],[30,0] ];
+      for(let i=0;i<blocks && i<ring.length;i++){ const [bx,bz]=ring[i];
+        if(Math.abs(bz)<12) continue;   // v52 : la grand-rue reste dégagée
+        const tall=age>=4 ? (2+(i%4)) : 1;
+        const blk=box(3.4,3+tall*1.6,3.4, i%3? COL.pierre:0x9c8f74, bx, (3+tall*1.6)/2, bz, false);
+        tabAdd(blk);
+        if(age>=4 && i%2===0){ const rf=box(3.6,0.5,3.6,COL.brun,bx,3+tall*1.6+0.25,bz,false); tabAdd(rf); }
+      }
+      // pavé central (la place de la ville)
+      const plaza=new THREE.Mesh(new THREE.CircleGeometry(26,40), new THREE.MeshStandardMaterial({color:0xbcae8c,roughness:1}));
+      plaza.rotation.x=-Math.PI/2; plaza.position.set(0,0.04,0); tabAdd(plaza);
+    }
+    // ---- 2. QUARTIER BOURGEOIS : s'enrichit et s'étend avec le capital (urbanisme haussmannien) ----
+    const prosp = clamp(capitalProductif(s)/3200 + Math.max(0,s.argent)/4000 + ((s.d&&(s.d.resultatNet||0)>0)?0.15:0));
+    const nRiche = Math.round(clamp(prosp)* (age>=5?7:5));
+    if(nRiche>0){
+      const BX=30, BZ=-78;
+      tabAdd(makeLabelMesh('Beaux quartiers', BX, 11, BZ-2));
+      for(let i=0;i<nRiche;i++){ const hx=BX-8+(i%4)*5.5, hz=BZ-4+Math.floor(i/4)*6; tabHouse(hx,hz,'riche'); }
+      if(prosp>0.5){ tabFigure(BX-2,BZ+5,0x6b2f2f,'idle',Math.PI); tabFigure(BX+2,BZ+5,0x3a3a55,'idle',Math.PI); } // bourgeois en promenade
+    }
+    // ---- 3. QUARTIER OUVRIER : grandit avec le nombre, s'organise, ou s'enfonce dans la misère ----
+    const pop = Math.max(s.travailleurs, Math.round(s.populationActive||s.travailleurs));
+    const nTaudis = Math.min(14, Math.round(pop*0.6));
+    for(let i=0;i<nTaudis;i++){ const hx=QO.x-10+(i%5)*4.2, hz=QO.z+6+Math.floor(i/5)*4.2; tabHouse(hx,hz,'taudis'); }
+    // organisation ouvrière : coopérative puis Bourse du travail
+    const org=(g.workers?g.workers.organisation:0), unionF=(g.unions?g.unions.force:0);
+    if(org>0.30 || unionF>0.30) tabHouse(QO.x+12, QO.z-2, 'coop');
+    if(org>0.45 || unionF>0.45){ tabHouse(QO.x+12, QO.z+8, 'bourse'); }
+    // ---- 4. MISÈRE / PAUPÉRISATION : files de pain, bagarres, ouvriers qui s'effondrent ----
+    const sat=(g.workers&&g.workers.satisfaction!=null)?g.workers.satisfaction:0.5;
+    const penurie=(s.commune?s.commune.penurie:0);
+    const misere = clamp(s.colere*0.4 + s.chomage*0.4 + (1-sat)*0.4 + penurie*0.5 - (s.reproSocial||0)*0.05);
+    if(misere>0.5){
+      // file de pain (figures voûtées en rang) — armée de réserve sans travail
+      const n=Math.min(6, 2+Math.round(misere*5));
+      for(let i=0;i<n;i++) tabFigure(QO.x-12+i*1.6, QO.z-10, 0x5b5346, 'slump', 0.2);
+    }
+    if(misere>0.62){
+      // bagarre pour le pain
+      tabFigure(QO.x+2, QO.z-12, 0x6b5040, 'strike', 1.6);
+      tabFigure(QO.x+3.4, QO.z-12, 0x4a4636, 'strike', -1.6);
+    }
+    if(misere>0.78){
+      // mourir de faim : une silhouette à terre
+      const fallen=createWorkerFigure({color:0x55504a, scale:0.95}); fallen.position.set(QO.x-2, 0.4, QO.z-13); fallen.rotation.z=Math.PI/2; tabAdd(fallen);
+      tabAdd(makeLabelMesh('La faim', QO.x-2, 3, QO.z-15));
+    }
+    // ---- 5. RÉPRESSION D'ÉTAT : gendarmes en charge sur le quartier ouvrier ----
+    const repress = (r.repression||0);
+    if(repress>0.45 || s.modeEtat==='répression'){
+      const n=Math.min(4, 1+Math.round(repress*4));
+      for(let i=0;i<n;i++){ const f=tabFigure(QO.x+8+i*1.5, QO.z+0, 0x222c3a, 'strike', Math.PI); // gendarmes face aux ouvriers
+        if(f){ const baton=box(0.12,1.4,0.12,0x20160e,0.6,1.9,0.3,false); f.add(baton); } }
+      tabAdd(makeLabelMesh('Répression', QO.x+10, 4, QO.z-4));
+    }
+  }catch(e){ /* purement visuel : ne jamais casser le jeu */ }
+}
+function makeLabelMesh(text,x,y,z){
+  try{ const lab=makeLabel(text); lab.scale.set(8,1.6,1); lab.position.set(x,y,z); return tabAdd(lab); }catch(e){ return null; }
+}
+
+/* ===================================================================
+   MONDE VIVANT  —  couche purement visuelle, réactive à l'état.
+   Aucune mécanique économique ici : on ne fait que TRADUIRE l'état
+   du moteur en mouvement. Pools réutilisés (jamais d'objet créé par
+   frame). « Le capital ne doit plus seulement être calculé : il doit
+   circuler sous les yeux du joueur. »
+   =================================================================== */
+let VISUAL_LIFE = true;
+let GRAPHICS_QUALITY = 'medium';   // 'low' | 'medium' | 'high'
+function gQual(){ return GRAPHICS_QUALITY==='high'?1.0:GRAPHICS_QUALITY==='low'?0.45:0.75; }
+
+/* --- vocabulaire architectural modulaire + contours gravure --- */
+const stdMat=(c,o={})=>new THREE.MeshStandardMaterial(Object.assign({color:c,flatShading:true,roughness:.9,metalness:.02},o));
+/* v66 — addOutline NEUTRALISÉE. L'identité « gravure » (contours d'encre sur
+   chaque volume) tirait tout le rendu vers le dessin à plat. La nouvelle
+   identité « Charbon et lumière » modèle par la LUMIÈRE, pas par la ligne.
+   On garde la signature pour ne rien casser : elle ne fait plus rien. */
+function addOutline(mesh,color){ return mesh; }
+/* v62 — chaque vitre créée s'enregistre : la nuit, DayCycle les allume toutes
+   (verre froid le jour -> lueur chaude de lampe à huile la nuit). Chaque fenêtre
+   a sa petite personnalité : un déphasage fait qu'elles ne s'allument pas
+   exactement ensemble. */
+const windowPanes=[];
+function createWindow(w=0.8,h=1.0,frame=THEME.ink){ const g=new THREE.Group();
+  g.add(box(w+0.18,h+0.18,0.1,frame,0,0,0,false));
+  const pane=box(w,h,0.06,0x33414c,0,0,0.05,false);
+  pane.material.emissive=new THREE.Color(0x12202a); pane.material.emissiveIntensity=.5;
+  pane.userData.glowPhase=Math.random();
+  windowPanes.push(pane);
+  if(windowPanes.length>520){                                        // purge exacte des vitres démolies
+    const vivantes=windowPanes.filter(p=>p.parent);
+    windowPanes.length=0; for(const v of vivantes) windowPanes.push(v);
+  }
+  g.add(pane);
+  g.add(box(w,0.06,0.08,frame,0,0,0.08,false)); g.add(box(0.06,h,0.08,frame,0,0,0.08,false)); return g; }
+const _glowCold=new THREE.Color(0x12202a), _glowWarm=new THREE.Color(0xffb45e);
+function updateWindowGlow(){
+  const night=Math.max(0,1-DayCycle.kDay*1.7);            // 0 le jour, 1 la nuit
+  if(Vehicle.lampGlass){ Vehicle.lampGlass.material.emissiveIntensity=night*2.2;
+    if(Vehicle.lampPool) Vehicle.lampPool.material.opacity=night*0.5; }
+  for(const m of distantGlows) m.emissiveIntensity=night*1.6;  // v66 : les villes lointaines veillent
+  for(const L of nightLights) L.intensity=physI(night*1.35);
+  for(const L of gasLamps){                                   // v65 : halos et flaques de gaz
+    const fl=0.9+0.1*Math.sin(t*6+L.ph);                      // souffle de la flamme
+    L.halo.material.opacity=night*0.6*fl;
+    L.pool.material.opacity=night*0.42*fl;
+  }
+  for(const p of windowPanes){
+    if(!p.parent||!p.material) continue;
+    const on=night*(p.userData.glowPhase<0.85?1:0.25);    // ~15 % de foyers restent éteints
+    p.material.emissive.copy(_glowCold).lerp(_glowWarm,on);
+    p.material.emissiveIntensity=0.5+on*(1.6+0.5*Math.sin(t*0.8+p.userData.glowPhase*9));
+  }
+}
+function createDoor(w=1.6,h=2.6,c=0x281f17){ const g=new THREE.Group();
+  g.add(box(w+0.24,h+0.18,0.12,COL.brun,0,h/2,0,false));
+  const dr=box(w,h,0.12,c,0,h/2,0.06,false); dr.material.map=texWood(); g.add(dr);
+  g.add(box(0.13,0.13,0.16,COL.or,w*0.3,h*0.5,0.12,false)); return g; }
+function createColumn(h=7,r=0.5){ const g=new THREE.Group();
+  const sh=cyl(r,r*1.08,h,COL.pierre,12); sh.position.y=h/2; g.add(sh);
+  g.add(box(r*2.7,0.45,r*2.7,0xdcd1b0,0,h+0.1,0,false));
+  g.add(box(r*2.9,0.45,r*2.9,0xb8a986,0,0.22,0,false)); return g; }
+function createSteps(w=11,n=3){ const g=new THREE.Group();
+  for(let i=0;i<n;i++) g.add(box(w-i*1.4,0.42,3.4-i*0.7,0xb8a986,0,0.21+i*0.42,3.4-i*0.4,false)); return g; }
+function createRoof(type,w,d,c=0x46393b){ const g=new THREE.Group();
+  if(type==='pitched'){ const half=w/2, rise=2.1, len=Math.hypot(half,rise), slope=Math.atan2(rise,half);
+    const a=box(len,0.26,d,c,-half/2,rise/2,0,false); a.rotation.z=slope; g.add(a);
+    const b=box(len,0.26,d,c, half/2,rise/2,0,false); b.rotation.z=-slope; g.add(b);
+    g.add(box(0.22,0.22,d+0.2,THEME.ink,0,rise,0,false)); }
+  else if(type==='sawtooth'){ const n=Math.max(2,Math.floor(w/3.2));
+    for(let i=0;i<n;i++){ const x=-w/2+(i+0.5)*(w/n);
+      g.add(box(w/n*0.5,1.9,d,c,x-w/n*0.22,0.95,0,false));
+      const gl=box(w/n*0.62,1.7,d*0.98,0x33414c,x+w/n*0.18,1.05,0,false); gl.rotation.z=-0.66; gl.material.emissive=new THREE.Color(0x14222c); g.add(gl); } }
+  else { g.add(box(w,0.32,d,c,0,0.16,0,false)); }
+  return g; }
+function createSign(text){ const lab=makeLabel(text); lab.scale.set(6,1.5,1); return lab; }
+function createAwning(w=4,c=COL.rouge){ const g=new THREE.Group();
+  const a=box(w,0.18,2.2,c,0,0,0,false); a.rotation.x=0.2; g.add(a);
+  for(let i=0;i<Math.max(2,Math.floor(w));i++){ const s=new THREE.Mesh(new THREE.ConeGeometry(0.34,0.5,3),stdMat(c));
+    s.rotation.x=Math.PI; s.position.set(-w/2+0.5+i,-0.22,1.02); g.add(s); } return g; }
+function createDock(w=12,d=6,h=0.8){ const g=new THREE.Group();
+  const slab=box(w,h,d,0x8d7c58,0,h/2,0,false); slab.material.map=texWood(); g.add(slab);
+  for(let x=-w/2+0.7;x<w/2;x+=2.2) g.add(box(0.3,h+0.5,0.3,COL.brun,x,(h+0.5)/2,d/2-0.3,false)); return g; }
+function createPipe(len=5){ return createFactoryPipe(len); }
+function createFence(len=4){ return createFenceSegment(len); }
+function createPoster(text){ return createPosterBoard(text); }
+
+/* --- objets modulaires réutilisables --- */
+function createCrate(size=1.5,color=COL.brun){
+  const m=box(size,size,size,color,0,size*0.8,0,false); m.material.map=texWood();
+  const band=size*1.02, th=size*0.1;
+  m.add(box(band,th,band,0x2c2113,0,0,0,false));
+  m.add(box(th,band,band,0x2c2113,0,0,0,false));
+  return m;
+}
+/* ouvrier articulé low-poly — compatible avec les pools (userData.head pour le bob) */
+function createWorkerFigure(opt){
+  const o=(opt&&typeof opt==='object')?opt:{color:opt};
+  const cloth=o.color||THEME.worker, skin=0xb9966a, cap=(o.cap!=null?o.cap:0x2f3a44);
+  const sc=o.scale||(0.92+Math.random()*0.16);
+  const g=new THREE.Group();
+  const torso=box(0.78,0.95,0.5,cloth,0,1.35,0,false);
+  const hips=box(0.7,0.3,0.46,0x3a3128,0,0.85,0,false);
+  const legL=box(0.3,0.85,0.34,0x33291d,-0.2,0.43,0,false);
+  const legR=box(0.3,0.85,0.34,0x33291d, 0.2,0.43,0,false);
+  const armL=box(0.2,0.8,0.24,cloth,-0.49,1.4,0,false);
+  const armR=box(0.2,0.8,0.24,cloth, 0.49,1.4,0,false);
+  const head=new THREE.Mesh(new THREE.SphereGeometry(0.3,10,8),stdMat(skin)); head.position.set(0,2.06,0); head.scale.set(1,1.08,1);
+  const capM=box(0.52,0.18,0.52,cap,0,2.3,0,false);
+  const brim=box(0.52,0.07,0.22,cap,0,2.23,0.3,false);
+  const nose=box(0.08,0.08,0.12,skin,0,2.03,0.31,false);
+  [torso,hips,legL,legR,armL,armR,head,capM,brim,nose].forEach(m=>g.add(m));
+  g.scale.setScalar(sc);
+  g.userData.head=head; g.userData.legL=legL; g.userData.legR=legR; g.userData.armL=armL; g.userData.armR=armR; g.userData.torso=torso;
+  if(o.pose) setWorkerPose(g,o.pose);
+  return g;
+}
+function createDetailedWorker(opt){ return createWorkerFigure(opt); }
+function setWorkerPose(w,pose){ const u=w.userData; if(!u||!u.torso) return;
+  if(pose==='idle'){ u.torso.rotation.x=0.04; }
+  else if(pose==='slump'){ u.torso.rotation.x=0.22; u.head.rotation.x=0.22; u.head.position.z=0.1; }
+  else if(pose==='strike'){ u.armR.rotation.z=2.35; u.armR.position.set(0.55,1.75,0); }
+  else if(pose==='walk'){ u.legL.rotation.x=0.4; u.legR.rotation.x=-0.4; }
+}
+function animateWorker(w,dt,moving){ const u=w.userData; if(!u||!u.legL) return;
+  u.armR.rotation.z*=0.85;
+  if(moving){ const ph=(u._ph=(u._ph||0)+dt*8), s=Math.sin(ph)*0.5;
+    u.legL.rotation.x=s; u.legR.rotation.x=-s; u.armL.rotation.x=-s*0.7; u.armR.rotation.x=s*0.7;
+    w.position.y=(u._baseY||0)+Math.abs(Math.cos(ph))*0.06;
+  } else { u.legL.rotation.x*=0.8; u.legR.rotation.x*=0.8; u.armL.rotation.x*=0.8; u.armR.rotation.x*=0.8; }
+}
+function createSmokeStack(h=11,color=COL.charbon){
+  const g=new THREE.Group(); g.add(box(1.8,h,1.8,color,0,h/2,0));
+  g.add(box(2.2,0.6,2.2,COL.fer,0,h,0,false)); return g;
+}
+function createLedgerSign(text){ return makeLabel(text); }
+function createRailSegment(len=6){
+  const g=new THREE.Group();
+  for(const off of[-0.6,0.6]) g.add(box(0.22,0.16,len,0x4a4236,off,0.2,0,false));
+  for(let k=0;k<=Math.floor(len/3);k++) g.add(box(2,0.16,0.4,0x5a4a36,0,0.18,-len/2+k*3,false));
+  return g;
+}
+function createPriceBoard(text='£'){
+  const c=document.createElement('canvas'); c.width=128; c.height=160; const x=c.getContext('2d');
+  x.fillStyle='#e9ddc6'; x.fillRect(0,0,128,160);
+  x.strokeStyle='#241f17'; x.lineWidth=6; x.strokeRect(5,5,118,150);
+  x.fillStyle='#8a2c1d'; x.font='700 60px "IBM Plex Mono",monospace';
+  x.textAlign='center'; x.textBaseline='middle'; x.fillText(text,64,86);
+  const tex=new THREE.CanvasTexture(c); const g=new THREE.Group();
+  g.add(box(0.25,3,0.25,COL.brun,0,1.5,0,false));
+  const b=new THREE.Mesh(new THREE.PlaneGeometry(2.2,2.7),
+    new THREE.MeshBasicMaterial({map:tex,transparent:true,side:THREE.DoubleSide}));
+  b.position.set(0,3.3,0); g.add(b); return g;
+}
+function createDebtThread(){
+  const a=zonePos('Banque'), b=zonePos('Usine');
+  const dx=b.x-a.x, dz=b.z-a.z, len=Math.hypot(dx,dz)||1;
+  const m=new THREE.Mesh(new THREE.CylinderGeometry(0.16,0.16,len,6),
+    new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:0,depthWrite:false}));
+  m.position.set((a.x+b.x)/2,7,(a.z+b.z)/2);
+  const dir=new THREE.Vector3(dx,0,dz).normalize();
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),dir);
+  m.visible=false; return m;
+}
+
+/* ===================================================================
+   DIORAMA DENSE — librairie de props + peuplement des zones.
+   Tout en primitives + CanvasTexture, regroupé dans un seul Group,
+   gated par gamePhase / niveauVille / DETAIL_LEVEL. Aucune collision
+   ajoutée : le décor n'entrave jamais la conduite (les objets légers
+   se laissent bousculer). « Avoir envie de rouler avant de comprendre. »
+   =================================================================== */
+let DETAIL_LEVEL='high';                 // 'low' | 'medium' | 'high'
+function dDen(){ return DETAIL_LEVEL==='high'?1:DETAIL_LEVEL==='medium'?0.65:0.35; }
+
+/* --- textures procédurales sobres (gravure / registre) --- */
+let _tx={};
+function texWood(){ if(_tx.wood)return _tx.wood; const c=document.createElement('canvas');c.width=c.height=128;const x=c.getContext('2d');
+  x.fillStyle='#7a5a39';x.fillRect(0,0,128,128);
+  x.strokeStyle='rgba(40,28,16,0.45)';x.lineWidth=2; for(let i=10;i<128;i+=20){x.beginPath();x.moveTo(0,i);x.lineTo(128,i);x.stroke();}
+  x.strokeStyle='rgba(40,28,16,0.18)';x.lineWidth=1; for(let i=0;i<50;i++){const y=Math.random()*128;x.beginPath();x.moveTo(0,y);x.lineTo(128,y+Math.random()*4-2);x.stroke();}
+  const t=new THREE.CanvasTexture(c);_tx.wood=t;return t; }
+function texMetal(){ if(_tx.metal)return _tx.metal; const c=document.createElement('canvas');c.width=c.height=128;const x=c.getContext('2d');
+  x.fillStyle='#4b4a45';x.fillRect(0,0,128,128);
+  x.strokeStyle='rgba(20,18,15,0.4)';x.lineWidth=1; for(let i=0;i<128;i+=6){x.beginPath();x.moveTo(i,0);x.lineTo(i,128);x.stroke();}
+  x.fillStyle='rgba(255,240,210,0.05)'; for(let i=0;i<30;i++)x.fillRect(Math.random()*128,Math.random()*128,2,8);
+  const t=new THREE.CanvasTexture(c);_tx.metal=t;return t; }
+function texBrick(){ if(_tx.brick)return _tx.brick; const c=document.createElement('canvas');c.width=c.height=128;const x=c.getContext('2d');
+  x.fillStyle='#6e5640';x.fillRect(0,0,128,128); x.strokeStyle='rgba(30,22,14,0.5)';x.lineWidth=2;
+  for(let r=0;r<128;r+=16){ x.beginPath();x.moveTo(0,r);x.lineTo(128,r);x.stroke();
+    const off=(r/16)%2?8:0; for(let cc=off;cc<128;cc+=24){x.beginPath();x.moveTo(cc,r);x.lineTo(cc,r+16);x.stroke();} }
+  const t=new THREE.CanvasTexture(c);_tx.brick=t;return t; }
+
+const cyl=(r1,r2,h,c,seg=12)=>new THREE.Mesh(new THREE.CylinderGeometry(r1,r2,h,seg),
+  new THREE.MeshStandardMaterial({color:c,flatShading:true,roughness:.85}));
+
+/* --- props (ceux non déjà définis ailleurs) --- */
+function createBarrel(c=0x6b4a2c){ const g=new THREE.Group();
+  const b=cyl(0.6,0.6,1.3,c); b.material.map=texWood(); b.position.y=0.65; g.add(b);
+  for(const y of[0.3,1.0]){ const band=cyl(0.63,0.63,0.14,0x2c2113); band.position.y=y; g.add(band); } return g; }
+function createSack(c=0xc9b78c){ const g=new THREE.Group();
+  const m=new THREE.Mesh(new THREE.SphereGeometry(0.55,8,6),new THREE.MeshStandardMaterial({color:c,flatShading:true}));
+  m.scale.set(1,1.25,1); m.position.y=0.6; g.add(m); g.add(box(0.42,0.18,0.42,0xb0a078,0,1.15,0,false)); return g; }
+function createCoalPile(){ const g=new THREE.Group();
+  const m=new THREE.Mesh(new THREE.ConeGeometry(1.6,1.3,7),new THREE.MeshStandardMaterial({color:THEME.darkBrown,flatShading:true,roughness:1}));
+  m.position.y=0.65; g.add(m);
+  for(let i=0;i<5;i++){ const r=new THREE.Mesh(new THREE.SphereGeometry(0.24,5,4),new THREE.MeshStandardMaterial({color:0x1d1610,flatShading:true}));
+    r.position.set(Math.random()*2.4-1.2,0.2,Math.random()*2.4-1.2); g.add(r); } return g; }
+function createCrateStack(){ const g=new THREE.Group();
+  [[0,0,0],[1.08,0,0],[0,0,1.08],[1.08,0,1.05],[0.54,1.05,0.5]].forEach((p,i)=>{
+    const m=box(1,1,1,i%2?0x8a6b49:0x77593b,p[0],0.5+p[1],p[2],false); m.material.map=texWood(); m.rotation.y=Math.random()*0.2-0.1; g.add(m); }); return g; }
+function createBrokenCrate(){ const g=new THREE.Group();
+  g.add(box(1,0.55,1,0x77593b,0,0.28,0,false));
+  const p=box(1,0.12,0.4,0x5a4530,0.2,0.66,0.1,false); p.rotation.z=0.5; g.add(p);
+  const q=box(0.4,0.12,1,0x5a4530,-0.2,0.6,-0.1,false); q.rotation.x=0.4; g.add(q); return g; }
+function createCrisisCrack(){ const g=new THREE.Group();
+  const seg=(x,z,a,l)=>{ const m=box(l,0.04,0.16,THEME.crisis,x,0.06,z,false); m.rotation.y=a; g.add(m); };
+  seg(0,0,0.3,3); seg(1.2,0.6,-0.6,2.2); seg(-1,0.5,0.9,2); seg(0.4,-1,1.5,1.6); return g; }
+/* v65 — le réverbère devient une LAMPE À GAZ complète : potence ouvragée,
+   verre, HALO de lumière (sprite) et FLAQUE de lumière chaude au sol —
+   les deux pilotés par la nuit. La ville nocturne se lit par ses lampes. */
+let _gasHaloTex=null,_gasPoolTex=null;
+function _gasTextures(){
+  if(_gasHaloTex) return;
+  const mk=(stops,h)=>{ const c=document.createElement('canvas'); c.width=c.height=128;
+    const x=c.getContext('2d'); const g=x.createRadialGradient(64,64,2,64,64,62);
+    stops.forEach(([k,col])=>g.addColorStop(k,col)); x.fillStyle=g; x.fillRect(0,0,128,128);
+    return new THREE.CanvasTexture(c); };
+  _gasHaloTex=mk([[0,'rgba(255,196,110,0.85)'],[0.35,'rgba(255,178,86,0.30)'],[1,'rgba(255,178,86,0)']]);
+  _gasPoolTex=mk([[0,'rgba(255,190,104,0.50)'],[1,'rgba(255,190,104,0)']]);
+}
+const gasLamps=[];
+/* v66 — six VRAIES lumières ponctuelles aux lieux clés, allumées la nuit
+   (distance bornée, decay 2 : coût contenu). Avec le bloom et les émissifs,
+   ce sont elles qui peignent les murs comme dans Stray. */
+const nightLights=[];
+function buildNightLights(){
+  const SPOTS=[[-72,6,-25],[55,6,-25],[-15,6,30],[0,5,62],[102,6,2],[-10,6,0]];
+  for(const [x,y,z] of SPOTS){
+    const L=new THREE.PointLight(0xffb45e,0,40,2);
+    L.position.set(x,y,z); scene.add(L); nightLights.push(L);
+  }
+}
+function createLampPost(){ const g=new THREE.Group(); _gasTextures();
+  g.add(box(0.22,4,0.22,COL.fer,0,2,0,false));
+  g.add(box(0.9,0.1,0.1,COL.fer,0.34,3.95,0,false));                       // potence
+  g.add(box(0.34,0.4,0.34,0x2a241c,0.68,3.7,0,false));                     // cage de la lanterne
+  const glass=new THREE.Mesh(new THREE.SphereGeometry(0.22,8,8),
+    new THREE.MeshStandardMaterial({color:0xffe6ad,emissive:0xffb347,emissiveIntensity:.6,flatShading:true}));
+  glass.position.set(0.68,3.7,0); g.add(glass); g.userData.lamp=glass;
+  const halo=new THREE.Sprite(new THREE.SpriteMaterial({map:_gasHaloTex,transparent:true,
+    opacity:0,depthWrite:false}));
+  halo.scale.set(3.6,3.6,1); halo.position.set(0.68,3.7,0); g.add(halo);
+  const pool=new THREE.Mesh(new THREE.PlaneGeometry(7,7),
+    new THREE.MeshBasicMaterial({map:_gasPoolTex,transparent:true,opacity:0,depthWrite:false}));
+  pool.rotation.x=-Math.PI/2; pool.position.set(0.68,0.035,0); g.add(pool);
+  gasLamps.push({halo,pool,ph:Math.random()*6.28});
+  return g; }
+function createFenceSegment(len=4){ const g=new THREE.Group();
+  g.add(box(0.15,1.1,0.15,COL.brun,-len/2,0.55,0,false)); g.add(box(0.15,1.1,0.15,COL.brun,len/2,0.55,0,false));
+  g.add(box(len,0.12,0.12,COL.brun,0,0.9,0,false)); g.add(box(len,0.12,0.12,COL.brun,0,0.45,0,false)); return g; }
+function createSmallCart(){ const g=new THREE.Group();
+  const plateau=box(1.4,0.5,2,0x6b513a,0,0.7,0,false); addOutline(plateau); g.add(plateau);
+  for(const x of[-0.82,0.82])for(const z of[-0.7,0.7]){
+    const w=cyl(0.44,0.44,0.3,0x2a241c,10); w.rotation.z=Math.PI/2; w.position.set(x,0.44,z); g.add(w);
+    const hub=cyl(0.14,0.14,0.34,0x8a8076,8); hub.rotation.z=Math.PI/2; hub.position.set(x,0.44,z); g.add(hub);
+  }
+  g.add(box(0.12,0.12,1.4,0x4a4236,0.6,0.95,1.3,false)); return g; }
+function createWagon(){ const g=new THREE.Group();
+  g.add(box(2.6,1.5,4.2,0x4a4236,0,1,0,false)); g.add(box(2.8,0.4,4.4,COL.fer,0,1.85,0,false));
+  for(const x of[-1.1,1.1])for(const z of[-1.4,1.4]){ const w=cyl(0.55,0.55,0.3,0x201c16,14); w.rotation.z=Math.PI/2; w.position.set(x,0.55,z); g.add(w); } return g; }
+function createFactoryPipe(len=5){ const g=new THREE.Group();
+  const m=cyl(0.4,0.4,len,COL.fer,10); m.material.map=texMetal(); m.rotation.z=Math.PI/2; m.position.y=2.4; g.add(m);
+  for(const s of[-1,1]) g.add(box(0.55,0.55,0.55,0x3a352c,s*len/2,2.4,0,false)); return g; }
+function createGear(r=1,c=COL.fer){ const g=new THREE.Group();
+  const disc=cyl(r,r,0.3,c,16); disc.material.map=texMetal(); disc.rotation.x=Math.PI/2; g.add(disc);
+  const T=10; for(let i=0;i<T;i++){ const a=i/T*6.283; g.add(box(0.26,0.3,0.26,c,Math.cos(a)*r,Math.sin(a)*r,0,false)); }
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(0.18,8,8),new THREE.MeshStandardMaterial({color:0x2c2620,flatShading:true})));
+  g.userData.gear=true; return g; }
+function createPulley(){ return createGear(0.8,0x3a352c); }
+function createWorkbench(){ const g=new THREE.Group();
+  g.add(box(2.2,0.25,1.1,0x6b513a,0,1,0,false));
+  for(const x of[-0.9,0.9])for(const z of[-0.4,0.4]) g.add(box(0.18,1,0.18,0x4a3a28,x,0.5,z,false));
+  g.add(box(0.3,0.3,0.3,COL.fer,0.6,1.25,0,false)); return g; }
+function createWorkerHouse(h=3.2,c=COL.froid){ const g=new THREE.Group();
+  // v64 : soubassement, débord de toit, vraie fenêtre éclairable, porte, mitron
+  g.add(box(3.5,0.4,3.5,0x7e7565,0,0.2,0,false));
+  const body=box(3.2,h,3.2,c,0,h/2+0.25,0); body.material.map=texBrick(); g.add(body); addOutline(body);
+  const roof=new THREE.Mesh(new THREE.ConeGeometry(2.95,1.7,4),new THREE.MeshStandardMaterial({color:0x46393b,flatShading:true}));
+  roof.position.y=h+1.05; roof.rotation.y=Math.PI/4; g.add(roof);
+  const chim=box(0.5,1.3,0.5,COL.charbon,1,h+0.7,1,false); g.add(chim);
+  g.add(box(0.7,0.16,0.7,0x6e6354,1,h+1.36,1,false));                     // chapeau
+  const w=createWindow(0.62,0.7); w.position.set(-0.78,h*0.58,1.66); g.add(w);   // s'allume la nuit
+  g.add(box(0.7,1.5,0.08,0x2a241d,0.78,1.0,1.64,false));                  // porte
+  g.add(box(0.9,0.18,0.7,0x9a9183,0.78,0.09,1.85,false));                 // seuil
+  return g; }
+function createChimney(h=8){ const g=new THREE.Group();
+  const m=box(1.6,h,1.6,COL.charbon,0,h/2,0); m.material.map=texBrick(); g.add(m);
+  g.add(box(2,0.5,2,0x2a241d,0,h,0,false)); return g; }
+function createMarketStall(c=COL.rouge){ const g=new THREE.Group();
+  for(const x of[-1.3,1.3])for(const z of[-0.9,0.9]) g.add(box(0.15,2,0.15,COL.brun,x,1,z,false));
+  const awn=box(3,0.2,2.2,c,0,2.1,0,false); awn.rotation.x=0.12; g.add(awn);
+  g.add(box(2.8,0.25,1.8,0x6b513a,0,1.3,0,false)); return g; }
+function createRopeLine(len=4){ const g=new THREE.Group();
+  g.add(box(0.06,0.06,len,0x2a241d,0,2.4,0,false)); const cols=[0x8a3b2a,0x4d5f70,0xcdbd9a,0x6b513a];
+  for(let i=0;i<4;i++) g.add(box(0.5,0.7,0.04,cols[i%4],0,2.0,-len/2+0.6+i*((len-1.2)/3),false)); return g; }
+function createPosterBoard(text){ const g=new THREE.Group();
+  g.add(box(0.18,2.6,0.18,COL.brun,0,1.3,0,false));
+  const lab=makeLabel(text); lab.scale.set(5,1.25,1); lab.position.set(0,3,0); g.add(lab); return g; }
+function createLedgerPlaque(text){ return makeLabel(text); }
+/* ===== v54 — habillage du monde, manière diorama-jouet (cf. bruno-simon.com)
+   sobre et papier : arbres en boules superposées, buissons, rochers à facettes,
+   meules de foin — et de grandes TYPOGRAPHIES À L'ENCRE posées au sol, comme
+   sur une carte ancienne. Tout reste dans la palette existante. ===== */
+function createTree(h=5,c=0x6f7a45){ const g=new THREE.Group();
+  const tr=cyl(0.32,0.4,h*0.42,0x6b513a,7); tr.position.y=h*0.21; g.add(tr);
+  for(let i=0;i<3;i++){ const r=h*(0.34-i*0.07);
+    const b=new THREE.Mesh(new THREE.SphereGeometry(r,7,6),
+      new THREE.MeshStandardMaterial({color:i%2?c:0x5a6a4a,roughness:1,flatShading:true}));
+    b.position.y=h*0.42+i*r*1.1; b.scale.y=0.82; g.add(b); }
+  return g; }
+function createBush(r=1.1){ const m=new THREE.Mesh(new THREE.SphereGeometry(r,7,6),
+    new THREE.MeshStandardMaterial({color:0x6f7a45,roughness:1,flatShading:true}));
+  m.position.y=r*0.7; m.scale.y=0.75; return m; }
+function createRock(r=1.0){ const m=new THREE.Mesh(new THREE.IcosahedronGeometry(r,0),
+    new THREE.MeshStandardMaterial({color:0x8a8275,roughness:1,flatShading:true}));
+  m.position.y=r*0.6; m.scale.y=0.7; m.rotation.y=Math.random()*3; return m; }
+function createHaystack(){ const m=new THREE.Mesh(new THREE.ConeGeometry(1.5,2.3,9),
+    new THREE.MeshStandardMaterial({color:0xb9a26b,roughness:1,flatShading:true}));
+  m.position.y=1.15; return m; }
+function createGroundText(text,w=30){
+  const c=document.createElement('canvas'); c.width=1024; c.height=192; const x=c.getContext('2d');
+  x.clearRect(0,0,1024,192); x.fillStyle='rgba(36,31,23,0.5)';
+  x.font='700 96px "IBM Plex Mono",monospace'; x.textAlign='center'; x.textBaseline='middle';
+  x.fillText(text.toUpperCase(),512,100);
+  const tex=new THREE.CanvasTexture(c); tex.anisotropy=4;
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(w,w*192/1024),
+    new THREE.MeshBasicMaterial({map:tex,transparent:true,depthWrite:false}));
+  m.rotation.x=-Math.PI/2; m.position.y=0.025; return m; }
+/* ===== v56 — éléments de cohérence et de beauté ===== */
+function createWindmill(h=9){ const g=new THREE.Group();
+  const tour=cyl(1.1,1.8,h,0x9c8f74,9); tour.position.y=h/2; g.add(tour); addOutline(tour);
+  const cap=new THREE.Mesh(new THREE.ConeGeometry(1.5,1.6,9),
+    new THREE.MeshStandardMaterial({color:0x46393b,flatShading:true,roughness:1}));
+  cap.position.y=h+0.7; g.add(cap);
+  const ailes=new THREE.Group();                       // userData.gear -> tournent via l'anim existante
+  for(let i=0;i<4;i++){ const a=box(0.5,h*0.62,0.1,0xcdbd9a,0,h*0.31,0,false);
+    const arm=new THREE.Group(); arm.add(a); arm.rotation.z=i*Math.PI/2; ailes.add(arm); }
+  ailes.position.set(0,h*0.86,1.7); ailes.userData.gear=true; g.add(ailes);
+  const porte=createDoor(); porte.position.set(0,0,1.7); g.add(porte);
+  return g; }
+function createScarecrow(){ const g=new THREE.Group();
+  g.add(box(0.16,2.2,0.16,0x6b513a,0,1.1,0,false)); g.add(box(1.6,0.14,0.14,0x6b513a,0,1.7,0,false));
+  g.add(box(0.7,0.8,0.3,0x8a3b2a,0,1.45,0,false));
+  const tete=new THREE.Mesh(new THREE.SphereGeometry(0.3,7,6),new THREE.MeshStandardMaterial({color:0xcdbd9a,flatShading:true}));
+  tete.position.y=2.15; g.add(tete);
+  const chap=new THREE.Mesh(new THREE.ConeGeometry(0.42,0.35,8),new THREE.MeshStandardMaterial({color:0x46393b,flatShading:true}));
+  chap.position.y=2.42; g.add(chap); return g; }
+function createWell(){ const g=new THREE.Group();
+  const mur=cyl(1.0,1.1,0.9,0x8a8275,10); mur.position.y=0.45; g.add(mur); addOutline(mur);
+  for(const x of[-0.9,0.9]) g.add(box(0.14,1.6,0.14,0x6b513a,x,1.2,0,false));
+  const toit=new THREE.Mesh(new THREE.ConeGeometry(1.4,0.8,4),new THREE.MeshStandardMaterial({color:0x46393b,flatShading:true}));
+  toit.position.y=2.2; toit.rotation.y=Math.PI/4; g.add(toit);
+  g.add(box(1.8,0.1,0.1,0x4a4236,0,1.85,0,false)); return g; }
+function createBoat(){ const g=new THREE.Group();
+  const coque=box(2.2,0.8,5.2,0x6b513a,0,0.5,0,false); g.add(coque); addOutline(coque);
+  g.add(box(1.8,0.3,4.4,0x8b7d63,0,0.95,0,false));
+  g.add(box(0.14,4.2,0.14,0x4a4236,0,3,0.4,false));
+  const voile=new THREE.Mesh(new THREE.PlaneGeometry(1.9,2.6),
+    new THREE.MeshStandardMaterial({color:0xe4d7ba,side:THREE.DoubleSide,flatShading:true}));
+  voile.position.set(0.05,3.4,0.4); voile.rotation.y=0.25; g.add(voile);
+  return g; }
+function createCloud(){ const g=new THREE.Group();
+  for(let i=0;i<3;i++){ const r=2.2+Math.random()*1.6;
+    const b=new THREE.Mesh(new THREE.SphereGeometry(r,7,6),
+      new THREE.MeshStandardMaterial({color:0xeae2d0,flatShading:true,roughness:1,transparent:true,opacity:.92}));
+    b.position.set(i*2.6-2.6,Math.random()*0.8,(Math.random()-0.5)*1.6); b.scale.y=0.55; g.add(b); }
+  return g; }
+function createBird(){ const g=new THREE.Group();
+  const w1=box(1.1,0.06,0.3,0x241f17,-0.55,0,0,false), w2=box(1.1,0.06,0.3,0x241f17,0.55,0,0,false);
+  g.add(w1); g.add(w2); g.userData.w1=w1; g.userData.w2=w2; return g; }
+function createGroundDecal(draw,w){            // décor de carte (rose des vents, cartouche)
+  const c=document.createElement('canvas'); c.width=1024; c.height=1024; const x=c.getContext('2d');
+  draw(x,1024); const tex=new THREE.CanvasTexture(c); tex.anisotropy=4;
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(w,w),
+    new THREE.MeshBasicMaterial({map:tex,transparent:true,depthWrite:false,opacity:.8}));
+  m.rotation.x=-Math.PI/2; m.position.y=0.022; return m; }
+function createCompassRose(w=22){ return createGroundDecal((x,S)=>{
+  const C=S/2; x.strokeStyle=x.fillStyle='rgba(36,31,23,0.75)'; x.lineWidth=6;
+  x.beginPath(); x.arc(C,C,S*0.30,0,6.3); x.stroke();
+  x.beginPath(); x.arc(C,C,S*0.36,0,6.3); x.stroke();
+  for(let i=0;i<8;i++){ const a=i*Math.PI/4, L=i%2?S*0.22:S*0.42;
+    x.save(); x.translate(C,C); x.rotate(a);
+    x.beginPath(); x.moveTo(0,-L); x.lineTo(S*0.035,0); x.lineTo(-S*0.035,0); x.closePath();
+    i%2?x.stroke():x.fill(); x.restore(); }
+  x.font='700 90px "IBM Plex Mono",monospace'; x.textAlign='center'; x.textBaseline='middle';
+  x.fillText('N',C,C-S*0.45); x.fillText('S',C,C+S*0.46); x.fillText('E',C+S*0.46,C); x.fillText('O',C-S*0.46,C);
+ },w); }
+function createMapCartouche(w=36){ return createGroundDecal((x,S)=>{
+  x.strokeStyle=x.fillStyle='rgba(36,31,23,0.8)';
+  x.lineWidth=10; x.strokeRect(S*0.06,S*0.30,S*0.88,S*0.40);
+  x.lineWidth=3;  x.strokeRect(S*0.085,S*0.325,S*0.83,S*0.35);
+  x.font='700 84px "IBM Plex Mono",monospace'; x.textAlign='center';
+  x.fillText('LE CIRCUIT DU CAPITAL',S/2,S*0.46);
+  x.font='400 46px "IBM Plex Mono",monospace';
+  x.fillText('Carte de la formation sociale',S/2,S*0.56);
+  x.fillText('· Anno MDCCCXLVIII ·',S/2,S*0.63);
+ },w); }
+function createConeMarker(){ const g=new THREE.Group();
+  g.add(new THREE.Mesh(new THREE.ConeGeometry(0.45,1.1,10),new THREE.MeshStandardMaterial({color:COL.rouge,flatShading:true})).translateY?
+    (()=>{const m=new THREE.Mesh(new THREE.ConeGeometry(0.45,1.1,10),new THREE.MeshStandardMaterial({color:COL.rouge,flatShading:true}));m.position.y=0.55;return m;})():null);
+  g.add(box(0.8,0.12,0.8,0x2a241d,0,0.06,0,false)); return g; }
+
+/* --- peuplement --- */
+let envGroup=null, envProps=[], kickProps=[], envLamps=[], envGears=[], envReady=false;
+let sunLight=null, hemiLight=null;   // v57 : poignées du cycle de lumière
+let composer=null, bloomPass=null;   // v66 : bloom (null si les scripts n'ont pas chargé)
+function envPut(obj,x,z,rot=0,stage=0,kick=false){
+  obj.position.set(x,0,z); if(rot) obj.rotation.y=rot; obj.userData.stage=stage;
+  envGroup.add(obj); envProps.push({obj,stage});
+  obj.traverse&&obj.traverse(o=>{ if(o.userData&&o.userData.lamp) envLamps.push(o.userData.lamp); if(o.userData&&o.userData.gear) envGears.push(o); });
+  if(kick) kickProps.push({obj,vx:0,vz:0,vr:0});
+  return obj;
+}
+function placeAround(zname,items){ const p=zonePos(zname); const n=Math.ceil(items.length*dDen());
+  items.slice(0,n).forEach(it=>{ const o=it[0](); envPut(o,p.x+it[1],p.z+it[2],it[3]||0,it[4]||0,it[5]||false); }); }
+
+function populateBankDistrict(){ placeAround('Banque',[
+  [()=>createLedgerPlaque('£'),0,9,0,0], [()=>createCrateStack(),-9,-3,0.3,0],
+  [()=>createLampPost(),9,7,0,0], [()=>createLampPost(),-9,7,0,0],
+  [()=>createFenceSegment(6),0,10,0,0], [()=>createBarrel(),8,-4,0,0,true],
+  [()=>createSack(),9,-6,0,1], [()=>createSack(0xbfa97e),9.8,-5,0,1],
+  [()=>createPosterBoard('REGISTRE'),-9,8,0.4,1], [()=>createConeMarker(),5,9,0,0,true],
+]); }
+function populateMeansMarket(){ placeAround('Marché des moyens',[
+  [()=>createCoalPile(),-9,4,0,1], [()=>createCrateStack(),8,3,0.2,0],
+  [()=>createSack(),9,-2,0,0], [()=>createSack(0xc4b184),9.7,-3,0,0], [()=>createSack(0xb7a072),8.6,-3.6,0,0],
+  [()=>createBarrel(),-8,-4,0,0,true], [()=>createBarrel(0x5e4326),-9,-5.4,0,0,true],
+  [()=>createPulley(),7,9,0,1], [()=>createSmallCart(),0,10,0.5,1,true],
+  [()=>createPosterBoard('M — MOYENS'),-2,11,0,0], [()=>createLampPost(),10,8,0,0],
+]); }
+function populateLaborSquare(){ placeAround('Marché du travail',[
+  [()=>createPosterBoard('Ft — FORCE DE TRAVAIL'),0,10,0,0],
+  [()=>createWorkerFigure(),-3,8,0,1], [()=>createWorkerFigure(),-1.5,8.6,0,1], [()=>createWorkerFigure(),0,9,0,1],
+  [()=>box(2.4,0.4,0.7,0x5a4530,0,0.4,0,false),5,8,0,0],   // banc
+  [()=>createWorkerHouse(2.8),11,6,0,2], [()=>createWorkerHouse(3.0),12,9,0,2],
+  [()=>createLampPost(),-8,7,0,0], [()=>createFenceSegment(6),-7,10,0,0],
+]); }
+function populateFactoryYard(){ placeAround('Usine',[
+  [()=>createChimney(11),10,-3,0,1], [()=>createFactoryPipe(6),-8,4,0,1],
+  [()=>createGear(1.2),9,5,0,2], [()=>createGear(0.9),9,7.4,0,2],
+  [()=>createWorkbench(),-7,7,0.3,1], [()=>createCrateStack(),7,8,0,0],
+  [()=>createCoalPile(),11,8,0,1], [()=>createPosterBoard('⚠ DANGER'),-9,9,0.2,1],
+  [()=>box(10,0.4,8,0x9a8a66,0,0.2,9,false),0,9,0,0],     // cour / plateforme basse
+  [()=>createLampPost(),-9,-2,0,0], [()=>createSmallCart(),-3,10,0.4,0,true],
+]); }
+function populateWarehouseDock(){ placeAround('Entrepôt',[
+  [()=>box(12,0.5,6,0x8d7c58,0,0.25,8,false),0,8,0,0],    // quai de chargement (relief)
+  [()=>createCrateStack(),-6,8,0,0], [()=>createCrateStack(),-3.5,8.2,0.2,0],
+  [()=>createCrateStack(),6,8,0,1], [()=>createWagon(),0,12,0,2],
+  [()=>createBrokenCrate(),9,5,0.6,2], [()=>createBarrel(),-9,4,0,0,true],
+  [()=>createSmallCart(),3,10,0.3,1,true], [()=>createLampPost(),9,9,0,0],
+  [()=>createPosterBoard('ENTREPÔT'),-9,9,0,0],
+]); }
+function populateSaleMarket(){ placeAround('Marché de vente',[
+  [()=>createMarketStall(),-7,7,0,0], [()=>createMarketStall(COL.bleu),0,8,0,0], [()=>createMarketStall(COL.vert),7,7,0,1],
+  [()=>createPriceBoard('£'),-4,10,0,0], [()=>createPriceBoard('£'),4,10,0.3,0],
+  [()=>createPosterBoard('PRIX BAS'),9,8,0.3,1], [()=>createCrateStack(),-9,4,0,0],
+  [()=>createBarrel(),9,4,0,0,true], [()=>createLampPost(),-9,9,0,0], [()=>createConeMarker(),2,11,0,0,true],
+]); }
+function populateWorkerDistrict(){ placeAround('Quartier ouvrier',[
+  [()=>createWorkerHouse(3.0),-7,8,0,0], [()=>createWorkerHouse(3.4),-3.5,8.4,0,0], [()=>createWorkerHouse(2.8),0,9,0,0],
+  [()=>createWorkerHouse(3.2),4,8.4,0,2], [()=>createWorkerHouse(3.0),7.5,8,0,2],
+  [()=>createRopeLine(5),-5,5,0.2,1], [()=>createRopeLine(4),1,5.4,0,1],
+  [()=>createLampPost(),-9,6,0,0], [()=>createLampPost(),9,6,0,0],
+  [()=>box(2.4,0.4,0.7,0x5a4530,-6,0.4,3.5,false),-6,3.5,0,0], [()=>createFenceSegment(6),3,10,0,0],
+]); }
+/* v54 — le monde se remplit par régions de caractère, à densité contrôlée.
+   La plupart des petits objets sont BOUSCULABLES (kick=true) : le chariot du
+   joueur peut les pousser — l'espace devient un terrain de jeu, sans rien
+   changer aux règles. */
+function populateWorldDressing(){
+  const J=(a,b)=>a+Math.random()*(b-a);
+  const free=(x,z)=>!zones.some(zz=>((zz.pos.x-x)**2+(zz.pos.z-z)**2)<14*14) && Math.abs(z)>9.5;
+  const sprinkle=(n,xa,xb,za,zb,mk,kick)=>{ n=Math.ceil(n*dDen());
+    for(let i=0;i<n;i++){ const x=J(xa,xb), z=J(za,zb);
+      if(!free(x,z)) continue; envPut(mk(),x,z,Math.random()*6.28,0,kick); } };
+  /* ---- v55 : éléments à GRANDE EMPREINTE — c'est eux qui mangent le vide ---- */
+  // tache d'herbe sombre (quasi gratuit, casse la monotonie du papier)
+  const grass=(x,z,r)=>{ if(!free(x,z)) return; const m=new THREE.Mesh(new THREE.CircleGeometry(r,14),
+      new THREE.MeshStandardMaterial({color:0xa3a06e,roughness:1,transparent:true,opacity:.5}));
+    m.rotation.x=-Math.PI/2; m.rotation.z=Math.random()*3; m.position.set(x,0.012,z); envGroup.add(m); };
+  // champ cultivé : parcelle + sillons
+  const field=(x,z,w,d,rot)=>{ if(!free(x,z)) return; const g=new THREE.Group();
+    const base=new THREE.Mesh(new THREE.PlaneGeometry(w,d),
+      new THREE.MeshStandardMaterial({color:0xb09a6a,roughness:1}));
+    base.rotation.x=-Math.PI/2; base.position.y=0.014; g.add(base);
+    for(let i=1;i<Math.floor(d/2.4);i++) g.add(box(w*0.92,0.1,0.35,0x8f7a4f,0,0.06,-d/2+i*2.4,false));
+    g.rotation.y=rot||0; envPut(g,x,z,0,0); };
+  // bosquet : un bois de n arbres dans un rayon r
+  const wood=(x,z,r,n)=>{ n=Math.ceil(n*dDen());
+    for(let i=0;i<n;i++){ const a=Math.random()*6.28, rr=Math.sqrt(Math.random())*r;
+      const px=x+Math.cos(a)*rr, pz=z+Math.sin(a)*rr;
+      if(!free(px,pz)) continue; envPut(createTree(J(3.5,6.5)),px,pz,Math.random()*6.28,0); } };
+  // hameau : ferme + meule + clôture + arbre
+  const hamlet=(x,z)=>{ if(!free(x,z)) return;
+    envPut(createWorkerHouse(3.2,0x8b7d63),x,z,J(0,6.28),0);
+    envPut(createHaystack(),x+4,z+2,0,0,true); envPut(createTree(4.5),x-4,z-3,0,0);
+    const f=createFenceSegment(5); envPut(f,x+2,z-4,J(0,3),0); };
+  // haie : rangée de clôtures entre deux points
+  const hedge=(x0,z0,x1,z1)=>{ const L=Math.hypot(x1-x0,z1-z0), n=Math.floor(L/4.2*dDen());
+    const rot=Math.atan2(x1-x0,z1-z0);
+    for(let i=0;i<n;i++){ const k=(i+0.5)/n, px=x0+(x1-x0)*k, pz=z0+(z1-z0)*k;
+      if(!free(px,pz)) continue; envPut(createFenceSegment(3.8),px,pz,rot,0); } };
+
+  // — LES COINS : la campagne entoure la ville (le monde déborde la rue)
+  wood(-100,-92,16,9); wood(-108,30,14,8); wood(-92,72,15,8);       // ouest & sud-ouest
+  wood(72,-82,17,9);   wood(96,-50,12,6);                            // nord-est
+  wood(62,78,16,8);    wood(96,58,12,6);                             // sud-est
+  wood(-48,86,13,6);   wood(30,-90,14,7);                            // sud & nord
+  // — champs autour de Mines·Champs et en bordure
+  field(-86,-78,18,12,0.3); field(-62,-86,16,10,-0.2); field(-112,-44,14,16,0);
+  field(44,-86,20,12,0.15); field(88,72,16,11,0.4);
+  // — hameaux dispersés : le monde est habité avant le capital
+  hamlet(-94,52); hamlet(-78,-52); hamlet(36,84); hamlet(80,-72);
+  // — haies de bocage à l'ouest
+  hedge(-116,-20,-86,-34); hedge(-110,46,-82,60);
+  // — taches d'herbe un peu partout (15, quasi gratuites)
+  for(let i=0;i<15;i++) grass(J(-110,110),(Math.random()<0.5?-1:1)*J(14,108),J(4,9));
+  // — v56 : moulins à vent (ailes animées par l'anim des engrenages), épouvantails, puits
+  envPut(createWindmill(10),-96,-44,0.4,0); envPut(createWindmill(8.5),-88,40,-0.3,0);
+  envPut(createScarecrow(),-84,-76,0.5,0,true); envPut(createScarecrow(),-60,-84,-0.4,0,true);
+  envPut(createScarecrow(),46,-84,0.2,0,true);
+  envPut(createWell(),-92,54,0,0); envPut(createWell(),34,82,0.6,0);
+  // — quartier ouvrier : cordes à linge entre les maisons, affiches
+  const QO=zonePos('Quartier ouvrier');
+  envPut(createRopeLine(5),QO.x-10,QO.z+10,0.4,0); envPut(createRopeLine(4),QO.x+11,QO.z+9,-0.6,0);
+  envPut(createRopeLine(5),QO.x-4,QO.z+13,1.1,0);
+  envPut(createPosterBoard('TRAVAIL · PAIN'),QO.x+12,QO.z-10,0.3,0); envPut(createPosterBoard('RÉUNION CE SOIR'),QO.x-13,QO.z-8,-0.4,0);
+  // — mines : tas de charbon + wagonnet sur un bout de rail
+  const MN=zonePos('Mines · Champs');
+  envPut(createCoalPile(),MN.x+9,MN.z+8,0,0); envPut(createCoalPile(),MN.x+12,MN.z+11,0.7,0);
+  envPut(createCoalPile(),MN.x+7,MN.z+12,1.4,0);
+  const rl=createRailSegment(9); rl.rotation.y=0.5; envPut(rl,MN.x+11,MN.z+16,0,0);
+  const wt=createSmallCart(); envPut(wt,MN.x+11,MN.z+16,0.5,0,true);
+  // v66 — rose des vents et cartouche RETIRÉS (décors de carte dessinée).
+
+  // — l'Ouest rural : sous-bois, meules, rochers
+  sprinkle(12,-116,-70,-95,-35,  ()=>createBush(J(0.8,1.5)), true);
+  sprinkle(6, -118,-86,-80,-40,  createHaystack, true);
+  sprinkle(9, -116,-70,-92,-25,  ()=>createRock(J(0.6,1.4)));
+  sprinkle(8, -116,-70, 14, 64,  ()=>createBush(J(0.8,1.3)), true);
+  // — bords de la grand-rue : poteaux, tonneaux, cônes, charrettes garées (à pousser !)
+  sprinkle(14,-100, 92, 9.5, 13.5, createBarrel, true);
+  sprinkle(10,-100, 92, -13.5, -9.5, createConeMarker, true);
+  sprinkle(6, -90, 84, 9.5, 13,  createSmallCart, true);
+  for(let x=-96;x<=88;x+=23) envPut(createLampPost(),x,(x/23)%2?11.5:-11.5,0,0);
+  // — ceinture industrielle sud : palettes, engrenages, tonneaux, sacs
+  sprinkle(12,-75, 95, 40, 54,   createCrateStack);
+  sprinkle(9, -70, 95, 38, 54,   createBarrel, true);
+  sprinkle(5, -50, 70, 40, 52,   ()=>createGear(J(0.8,1.3)));
+  sprinkle(7, -70, 95, 40, 52,   createSack, true);
+  // — l'Est portuaire : quais encombrés
+  sprinkle(9, 78, 114, -20, 24,  createCrateStack);
+  sprinkle(8, 76, 112, -18, 22,  createSack, true);
+  sprinkle(5, 80, 112, -16, 20,  createBarrel, true);
+  // — le Nord institutionnel : alignements sobres, buissons taillés
+  sprinkle(7, -85, 30, -48, -38, createLampPost);
+  sprinkle(8, -62, 32, -50, -38, ()=>createBush(1.0), true);
+  sprinkle(4, -88, 28, -50, -40, ()=>createPosterBoard(['AVIS','DÉCRET','ANNONCES','£'][Math.floor(Math.random()*4)]), false);
+  // v66 — typographies au sol RETIRÉES (élément « carte dessinée », contraire
+  // à la nouvelle identité). La géographie se lit par la lumière et les volumes.
+}
+function populateRoadsideDetails(){
+  // dispersion légère le long du parcours principal (objets bousculables + repères)
+  const path=['Banque','Marché des moyens','Marché du travail','Usine','Entrepôt','Marché de vente'];
+  for(let i=0;i<path.length;i++){ const a=zonePos(path[i]), b=zonePos(path[(i+1)%path.length]);
+    for(const f of[0.34,0.66]){ const x=a.x+(b.x-a.x)*f, z=a.z+(b.z-a.z)*f;
+      const nx=-(b.z-a.z), nz=(b.x-a.x), nl=Math.hypot(nx,nz)||1; const ox=nx/nl*10, oz=nz/nl*10;
+      envPut(createLampPost(), x+ox, z+oz, 0, 0);
+      if(dDen()>0.5) envPut(createBarrel(), x-ox*0.85, z-oz*0.85, 0, 0, true);
+      if(DETAIL_LEVEL==='high') envPut(createConeMarker(), x+ox*0.55, z+oz*0.55, 0, 0, true);
+    }
+  }
+}
+function populateIndustrialBackground(){
+  // silhouettes lointaines : cheminées + tour d'horloge, hors couloir de jeu
+  const far=[[ -30,-95,9],[ -42,-90,11],[ 95,40,10],[ 100,55,8],[ -95,-40,9]];
+  far.forEach(p=>envPut(createChimney(p[2]),p[0],p[1],0,0));
+  const tower=new THREE.Group();
+  tower.add(box(4,16,4,COL.pierre,0,8,0)); tower.add(box(5,1,5,COL.charbon,0,16.5,0,false));
+  const face=makeLabel('🕑'); face.scale.set(3,3,1); face.position.set(0,14,0); tower.add(face);
+  envPut(tower, 96, -30, 0, 0);
+}
+function populateEnvironment(){
+  if(envReady) return; envGroup=new THREE.Group(); scene.add(envGroup);
+  populateBankDistrict(); populateMeansMarket(); populateLaborSquare();
+  populateFactoryYard(); populateWarehouseDock(); populateSaleMarket();
+  populateWorkerDistrict(); populateRoadsideDetails(); populateIndustrialBackground();
+  populateWorldDressing();   // v54 : habillage diorama (suit la visibilité par phase via envGroup)
+  envReady=true; updateEnvironmentByStage();
+}
+function updateEnvironmentByStage(){
+  if(!envReady) return;
+  const live=(typeof gamePhase==='undefined')||gamePhase!=='precapital';
+  envGroup.visible=live; if(!live) return;
+  const nv=(typeof state!=='undefined'?state.niveauVille:0)||0;
+  for(const e of envProps) e.obj.visible = nv >= (e.stage||0);
+}
+function updateInteractiveProps(dt){
+  if(!envReady) return;
+  if(typeof IntroCinematic!=='undefined' && IntroCinematic.active) {
+    // l'intro peut animer les décors, mais le jeu vide de départ ne doit pas payer ce coût ensuite
+  } else if(typeof gamePhase!=='undefined' && gamePhase==='precapital') {
+    return;
+  }
+  for(const L of envLamps){ if(L&&L.material) L.material.emissiveIntensity=(0.35+0.35*(0.5+0.5*Math.sin(t*3+(L.position?L.position.x:0))))*((typeof DayCycle!=='undefined')?DayCycle.lampBoost:1); }
+  const spin=(typeof state!=='undefined'&&state.productionActive)?(0.5+(LivingWorld.ready?LivingWorld.activity:0.3)*3):0;
+  for(const g of envGears){ if(g) g.rotation.z+=dt*spin; }
+  if(typeof Vehicle==='undefined'||!Vehicle.group) return;
+  const vx=Vehicle.pos.x, vz=Vehicle.pos.z, sp=Math.abs(Vehicle.speed);
+  for(const p of kickProps){ const o=p.obj; const dx=o.position.x-vx, dz=o.position.z-vz; const d2=dx*dx+dz*dz;
+    if(d2<9 && sp>5){ const d=Math.sqrt(d2)||1, f=(sp/26)*0.6; p.vx+=(dx/d)*f; p.vz+=(dz/d)*f; p.vr+=(Math.random()-0.5)*0.5; }
+    if(p.vx||p.vz||p.vr){ p.vx*=Math.pow(0.015,dt); p.vz*=Math.pow(0.015,dt); p.vr*=Math.pow(0.04,dt);
+      o.position.x=Math.max(-HALF+2,Math.min(HALF-2,o.position.x+p.vx));
+      o.position.z=Math.max(-HALF+2,Math.min(HALF-2,o.position.z+p.vz));
+      o.rotation.z+=p.vr*dt;
+      if(Math.abs(p.vx)<0.0008&&Math.abs(p.vz)<0.0008&&Math.abs(p.vr)<0.0008){ p.vx=p.vz=p.vr=0; } }
+  }
+}
+
+/* --- petits tweens d'apparition (constructions) --- */
+let lwTweens=[];
+function animateConstruction(group){
+  if(!group) return;
+  lwTweens.push({obj:group,born:t,ttl:0.55});
+  const entry=Object.entries(zoneGroups).find(([n,g])=>g===group);
+  if(entry){ fxPuff(entry[0]); fxHalo(entry[0]); }
+}
+function updateLwTweens(){
+  for(let i=lwTweens.length-1;i>=0;i--){ const w=lwTweens[i]; const k=(t-w.born)/w.ttl;
+    if(k>=1){ w.obj.scale.set(1,1,1); lwTweens.splice(i,1); continue; }
+    const s=0.82+0.18*(1-Math.pow(1-k,2))+0.07*Math.sin(k*Math.PI);
+    w.obj.scale.set(s,s,s);
+  }
+}
+
+/* --- micro-textes flottants (overlay DOM projeté depuis la 3D) --- */
+let floaters=[]; let _floatLayer=null;
+const FLOAT_COL={ gain:'#7a6233', perte:'#8a2c1d', social:'#4d5f70', crise:'#8a2c1d', neutre:'#3a3225' };
+function floatLayer(){
+  if(_floatLayer) return _floatLayer;
+  const d=document.createElement('div'); d.id='floaters';
+  d.style.cssText='position:fixed;inset:0;pointer-events:none;z-index:25;overflow:hidden;';
+  (document.body||document.documentElement).appendChild(d); _floatLayer=d; return d;
+}
+function floatText(text, worldPos, type='neutre'){
+  try{
+    const lay=floatLayer(); const el=document.createElement('div'); el.textContent=text;
+    const c=FLOAT_COL[type]||FLOAT_COL.neutre;
+    el.style.cssText='position:absolute;transform:translate(-50%,-50%);white-space:nowrap;'
+      +'font:600 13px "IBM Plex Mono",monospace;color:#e9ddc6;background:'+c+';'
+      +'padding:2px 8px;border:1px solid #241f17;box-shadow:2px 2px 0 #241f17;opacity:0;';
+    lay.appendChild(el);
+    const wp=worldPos||{x:0,z:0};
+    const p=new THREE.Vector3(wp.x||0,(wp.y!=null?wp.y:7),wp.z||0);
+    floaters.push({el,pos:p,born:t,ttl:1.9});
+  }catch(e){}
+}
+function updateFloaters(){
+  if(!floaters.length||!camera) return; const W=innerWidth,H=innerHeight;
+  for(let i=floaters.length-1;i>=0;i--){ const f=floaters[i]; const k=(t-f.born)/f.ttl;
+    if(k>=1){ if(f.el.remove)f.el.remove(); floaters.splice(i,1); continue; }
+    const v=f.pos.clone(); v.y+=k*4; v.project(camera);
+    const op=k<0.15?k/0.15:(1-(k-0.15)/0.85);
+    f.el.style.left=((v.x*0.5+0.5)*W)+'px'; f.el.style.top=((-v.y*0.5+0.5)*H)+'px';
+    f.el.style.opacity=(v.z>1?0:Math.max(0,op)).toFixed(3);
+  }
+}
+
+const LivingWorld={
+  ready:false, grp:null,
+  workers:[], crates:[], smoke:[], customers:[], stands:[], lights:[], wagons:[], flows:[], wheel:null,
+  _lastDeclenche:false, _lastDette:0, _lastPrix:null, _krachT:-99,
+
+  get activity(){
+    if(gamePhase==='precapital') return 0;
+    let a=0.18+state.niveauVille*0.10+state.travailleurs*0.02
+         +state.niveauMachine*0.06+Math.min(state.stocks/300,0.25);
+    if(state.enGreve) a*=0.35;
+    if(state.d&&state.d.declenche) a*=0.5;
+    return Math.max(0.06,Math.min(1,a));
+  },
+
+  mkWorker(col){ const g=createWorkerFigure(col); g.visible=false; this.grp.add(g); return g; },
+  mkCrate(){ const m=createCrate(1.5,COL.brun); m.visible=false; this.grp.add(m); return m; },
+  /* v60 — la marchandise voyage en chariot : petit chariot + caisse colorée sur le plateau */
+  mkCargo(){ const cart=createSmallCart(); const load=createCrate(1.15,COL.brun);
+    load.position.set(0,1.55,0); cart.add(load); cart.visible=false; this.grp.add(cart);
+    return {cart,load}; },
+  mkPuff(){ const m=new THREE.Mesh(new THREE.SphereGeometry(1.3,7,7),
+      new THREE.MeshStandardMaterial({color:0x8a8275,transparent:true,opacity:0,flatShading:true}));
+    m.visible=false; this.grp.add(m); return m; },
+  mkLight(x,y,z){ const m=new THREE.Mesh(new THREE.PlaneGeometry(0.9,1.2),
+      new THREE.MeshBasicMaterial({color:0xffd9a0,transparent:true,opacity:0,depthWrite:false,side:THREE.DoubleSide}));
+    m.position.set(x,y,z); m.visible=false; this.grp.add(m); return m; },
+  mkWagon(){ const m=box(2.4,1.4,1.6,0x4a4236,0,0.7,0,false); m.visible=false; this.grp.add(m); return m; },
+
+  init(){
+    if(this.ready) return;
+    this.grp=new THREE.Group(); scene.add(this.grp);
+    for(let i=0;i<14;i++) this.workers.push({obj:this.mkWorker(i%3?COL.bleu:COL.froid),phase:Math.random()*6.28});
+    for(let i=0;i<14;i++){ const cg=this.mkCargo();
+      this.crates.push({obj:cg.cart, load:cg.load, p:Math.random(), leg:i%3}); }
+    for(let i=0;i<10;i++) this.smoke.push({obj:this.mkPuff(),p:Math.random(),chim:i%2});
+    for(let i=0;i<5;i++)  this.customers.push({obj:this.mkWorker(0x7a6f58),phase:Math.random()*6.28});
+    const mv=zonePos('Marché de vente'); const cols=[COL.rouge,COL.bleu,COL.vert];
+    for(let i=0;i<3;i++){ const g=new THREE.Group();
+      g.add(box(2.6,1.6,2,cols[i],0,0.8,0,false)); g.add(box(3,0.5,2.4,0x6b5f4b,0,1.7,0,false));
+      g.position.set(mv.x+(i-1)*5.5,0,mv.z-9); g.visible=false; this.grp.add(g); this.stands.push(g); }
+    const lspots=[]; const addL=(zn,arr)=>{ const p=zonePos(zn); arr.forEach(o=>lspots.push([p.x+o[0],o[1],p.z+o[2]])); };
+    addL('Banque',[[-3,7,5.6],[0,7,5.6],[3,7,5.6],[-3,10,5.6],[3,10,5.6]]);
+    addL('Quartier ouvrier',[[-3,3,3.7],[1,3,3.7],[-3,1.4,3.7],[2,3.5,3.7]]);
+    addL('Usine',[[-5,4,5.2],[0,4,5.2],[5,4,5.2]]);
+    lspots.forEach(s=>this.lights.push({obj:this.mkLight(s[0],s[1],s[2]),phase:Math.random()*6.28}));
+    const u=zonePos('Usine');
+    this.wheel=new THREE.Mesh(new THREE.TorusGeometry(2.0,0.35,8,16),
+      new THREE.MeshStandardMaterial({color:0x4b4438,metalness:.3,roughness:.6,flatShading:true}));
+    this.wheel.position.set(u.x+8.5,4.2,u.z+3); this.wheel.visible=false; this.grp.add(this.wheel);
+    for(let i=0;i<2;i++) this.wagons.push({obj:this.mkWagon(),p:i*0.5});
+    this.debt=createDebtThread(); this.grp.add(this.debt);
+    for(let i=0;i<16;i++){ const s=new THREE.Mesh(new THREE.SphereGeometry(0.45,6,6),
+        new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:0,depthWrite:false}));
+      s.visible=false; this.grp.add(s); this.flows.push({obj:s,active:false,p:0,speed:0.5,h:3,a:{x:0,z:0},b:{x:0,z:0}}); }
+    this._lastPrix=state.prixUnitaire;
+    this.ready=true;
+  },
+
+  update(dt){
+    if(!this.ready) return;
+    const live=(gamePhase!=='precapital');
+    this.grp.visible=live;
+    if(!live) return;
+    const A=this.activity;
+    this.updateWorkers(dt,A);
+    this.updateCommodities(dt,A);
+    this.updateFactoryActivity(dt,A);
+    this.updateSmoke(dt,A);
+    this.updateStockVisuals(dt,A);
+    this.updateMarketActivity(dt,A);
+    this.updateCityPulse(dt,A);
+    this.updateCrisisVisuals(dt,A);
+    this.updateDebt(dt);
+    this.updateFlows(dt);
+  },
+
+  updateWorkers(dt,A){
+    const Q=zonePos('Quartier ouvrier'),U=zonePos('Usine'),MT=zonePos('Marché du travail');
+    const employed=state.travailleurs|0, idle=Math.round(state.chomage*state.populationActive);
+    const cap=VISUAL_LIFE?Math.round(14*gQual()):3;
+    const nGreve=state.enGreve?Math.min(8,Math.max(2,employed)):0;
+    const nCommute=state.enGreve?0:Math.min(6,employed,cap);
+    const nIdle=Math.min(state.enGreve?0:Math.min(4,idle),cap);
+    let used=0;
+    for(let i=0;i<this.workers.length;i++){ const w=this.workers[i],o=w.obj;
+      if(used<nGreve){                        // grève : regroupés devant l'usine
+        const a=(used/Math.max(1,nGreve))*Math.PI-Math.PI/2;
+        o.visible=true; o.position.set(U.x+Math.cos(a)*7,0,U.z+9+Math.sin(a)*2.5); o.rotation.y=Math.PI;
+        animateWorker(o,dt,false); if(o.userData.armR) o.userData.armR.rotation.z=2.35; used++; continue; }
+      if(used<nGreve+nCommute){               // navette quartier <-> usine
+        const tri=Math.abs(((t*0.05*(0.5+A)+w.phase/6.28)%1)*2-1);
+        o.visible=true; o.position.x=Q.x+(U.x-Q.x)*tri+Math.sin(w.phase)*1.5;
+        o.position.z=Q.z+(U.z-Q.z)*tri+Math.cos(w.phase)*1.5; o.position.y=0;
+        o.rotation.y=Math.atan2(U.x-Q.x,U.z-Q.z);
+        animateWorker(o,dt,true); used++; continue; }
+      if(used<nGreve+nCommute+nIdle){         // chômage : immobiles près du marché du travail
+        const kk=used-nGreve-nCommute, base=(kk%2)?MT:Q;
+        o.visible=true; o.position.set(base.x+((kk*1.7)%6)-3,0,base.z+(Math.floor(kk/2)%3)*1.6+4);
+        o.rotation.y=w.phase; animateWorker(o,dt,false); used++; continue; }
+      o.visible=false;
+    }
+  },
+
+  updateCommodities(dt,A){
+    if(!state.productionActive){ this.crates.forEach(c=>c.obj.visible=false); return; }
+    const M=zonePos('Marché des moyens'),U=zonePos('Usine'),E=zonePos('Entrepôt'),V=zonePos('Marché de vente');
+    const hasEnt=state.buildings.entrepot>0;
+    const legs=hasEnt?[[M,U,COL.brun],[U,E,COL.rouge],[E,V,COL.or]]:[[M,U,COL.brun],[U,V,COL.rouge]];
+    const nVis=Math.min(this.crates.length,Math.max(2,Math.round(2+A*(VISUAL_LIFE?10*gQual():2))));
+    const speed=0.06+A*0.10, risk=(state.d&&state.d.risqueCrise)||0, krach=(t<this._krachT+1.3);
+    for(let i=0;i<this.crates.length;i++){ const c=this.crates[i],o=c.obj;
+      if(i>=nVis){ o.visible=false; continue; }
+      const leg=legs[c.leg%legs.length]; c.p+=speed*dt*(0.7+0.6*((i%3)/2));
+      if(c.p>=1){ c.p=0; c.leg=(c.leg+1)%legs.length; }
+      const a=leg[0],b=leg[1]; const x=a.x+(b.x-a.x)*c.p, z=a.z+(b.z-a.z)*c.p;
+      o.visible=true;
+      if(krach){ // v60 : en krach, les chariots versent et s'éparpillent — au sol, pas en l'air
+        const kk=(t-this._krachT)/1.3;
+        o.position.set(x+(c.sx||0)*kk*14, 0.04, z+(c.sz||0)*kk*14);
+        o.rotation.y+=dt*7; o.rotation.z=Math.min(0.9,kk*1.2);
+      } else {
+        o.position.set(x, 0.04+Math.abs(Math.sin(c.p*40))*0.05, z);   // roulage + cahot léger
+        o.rotation.y=Math.atan2(b.x-a.x,b.z-a.z); o.rotation.z=0;
+      }
+      const col=new THREE.Color(leg[2]);
+      if(risk>0.45) col.lerp(new THREE.Color(COL.rouge),Math.min(0.8,(risk-0.45)*1.5));
+      if(c.load&&c.load.material) c.load.material.color.copy(col);    // la couleur vit sur la CAISSE
+    }
+  },
+
+  updateFactoryActivity(dt,A){
+    if(!this.wheel) return;
+    this.wheel.visible=state.productionActive&&state.niveauMachine>0;
+    this.wheel.rotation.z+=dt*(state.enGreve?0:(0.4+A*3.2));
+  },
+
+  updateSmoke(dt,A){
+    const U=zonePos('Usine'), chim=[[-4,-2],[4,-2]];
+    const prod=state.productionActive;
+    const dens=state.enGreve?0.12:Math.min(1,0.25+A*0.9+state.niveauMachine*0.05);
+    const nP=(!prod)?0:(VISUAL_LIFE?Math.round(this.smoke.length*dens*gQual()):Math.min(3,this.smoke.length));
+    const risk=(state.d&&state.d.risqueCrise)||0, dark=risk>0.5||(state.d&&state.d.declenche);
+    for(let i=0;i<this.smoke.length;i++){ const s=this.smoke[i],o=s.obj;
+      if(i>=nP){ o.visible=false; continue; }
+      o.visible=true; s.p+=dt*(0.25+A*0.5); if(s.p>=1) s.p=0;
+      const c=chim[s.chim], jit=dark?(Math.sin(i*12.9+t)*0.5+0.5):1;
+      o.position.set(U.x+c[0]+Math.sin(t*0.8+i)*0.6,15.5+s.p*7,U.z+c[1]);
+      o.scale.setScalar(0.5+s.p*1.4);
+      o.material.opacity=Math.max(0,0.5*(1-s.p)*dens*jit);
+      o.material.color.setHex(dark?0x4a4438:0x8a8275);
+    }
+  },
+
+  updateStockVisuals(dt,A){
+    const ent=zoneGroups['Entrepôt']; if(!ent) return;
+    const sat=state.stocks>180; const red=new THREE.Color(COL.rouge);
+    ent.children.forEach(m=>{ if(m.userData&&m.userData.layer==='stock'&&m.material){
+      if(sat) m.material.color.lerp(red,0.03);
+      m.rotation.y=Math.sin(t*0.6+m.position.x)*0.05; }});
+  },
+
+  updateMarketActivity(dt,A){
+    const V=zonePos('Marché de vente');
+    const risk=(state.d&&state.d.risqueCrise)||0, decl=!!(state.d&&state.d.declenche);
+    const dem=Math.min(1,0.2+A*0.8+((state.niveauVille||0)>=4?0.2:0));
+    const nC=decl?0:Math.round(this.customers.length*dem*(risk>0.6?0.4:1));
+    for(let i=0;i<this.customers.length;i++){ const c=this.customers[i],o=c.obj;
+      if(i>=nC){ o.visible=false; continue; }
+      o.visible=true; const a=t*0.3+c.phase;
+      o.position.set(V.x+Math.cos(a+i)*6,0,V.z+6+Math.sin(a*1.3+i)*3); o.rotation.y=a;
+      animateWorker(o,dt,true);
+    }
+    const part=(state.d&&state.d.partJoueur!=null)?state.d.partJoueur:0.4;
+    const press=Math.max(0,Math.min(1,1-part*1.4));
+    this.stands.forEach((g,i)=>{ const on=press>0.15&&i<Math.ceil(press*3); g.visible=on;
+      if(on){ const s=0.6+press*0.6; g.scale.set(s,s,s); } });
+  },
+
+  updateCityPulse(dt,A){
+    const nLit=Math.round(Math.min(this.lights.length,state.niveauVille*2));
+    for(let i=0;i<this.lights.length;i++){ const L=this.lights[i],o=L.obj;
+      if(i>=nLit){ o.visible=false; continue; }
+      o.visible=true; o.material.opacity=0.22+0.32*(0.5+0.5*Math.sin(t*1.6+L.phase));
+    }
+    const onRails=state.buildings.rails>0;
+    const pts=[zonePos('Usine'),zonePos('Entrepôt'),zonePos('Marché de vente')];
+    this.wagons.forEach(w=>{ w.obj.visible=onRails; if(!onRails) return;
+      w.p+=dt*(0.05+A*0.06); if(w.p>=1) w.p=0;
+      const pp=w.p*2, seg=Math.min(1,Math.floor(pp)), f=pp-seg, a=pts[seg], b=pts[seg+1];
+      w.obj.position.set(a.x+(b.x-a.x)*f,0.7,a.z+(b.z-a.z)*f);
+      w.obj.rotation.y=Math.atan2(b.x-a.x,b.z-a.z);
+    });
+  },
+
+  updateDebt(dt){
+    if(!this.debt) return; const d=state.dette||0;
+    if(d<=0){ this.debt.visible=false; return; }
+    this.debt.visible=true; const k=Math.min(1,d/400);
+    const col=new THREE.Color(COL.or).lerp(new THREE.Color(COL.rouge),k);
+    this.debt.material.color.copy(col);
+    this.debt.material.opacity=0.30+0.40*k*(0.65+0.35*Math.sin(t*2));
+    const sc=1+k*1.3; this.debt.scale.set(sc,1,sc);
+  },
+  updateCrisisVisuals(dt,A){
+    const decl=!!(state.d&&state.d.declenche);
+    if(decl&&!this._lastDeclenche){
+      this._krachT=t;
+      this.crates.forEach(c=>{ const a=Math.random()*6.28; c.sx=Math.cos(a); c.sz=Math.sin(a); });
+      const B=zonePos('Banque'); floatText('krach',{x:B.x,y:16,z:B.z},'crise');
+      fxPing('Bourse'); fxPing('Marché de vente');
+    }
+    this._lastDeclenche=decl;
+  },
+
+  updateFlows(dt){
+    for(const fl of this.flows){ if(!fl.active) continue;
+      fl.p+=dt*fl.speed; if(fl.p>=1){ fl.active=false; fl.obj.visible=false; continue; }
+      const pp=Math.max(0,fl.p), x=fl.a.x+(fl.b.x-fl.a.x)*pp, z=fl.a.z+(fl.b.z-fl.a.z)*pp;
+      fl.obj.position.set(x,fl.h+Math.sin(pp*Math.PI)*2.5,z);
+      fl.obj.material.opacity=fl.p<0?0:0.85*(1-Math.abs(pp-0.5)*1.2);
+    }
+  },
+  spawnFlow(from,to,colorHex,count,hbase){ let n=0;
+    for(const fl of this.flows){ if(n>=count) break; if(fl.active) continue;
+      fl.active=true; fl.obj.visible=true; fl.a={x:from.x,z:from.z}; fl.b={x:to.x,z:to.z};
+      fl.p=-Math.random()*0.25; fl.speed=0.5+Math.random()*0.3; fl.h=hbase||3;
+      fl.obj.material.color.setHex(colorHex); n++; }
+  },
+
+  // appelé après chaque cycle du moteur : bursts d'argent / marchandises + bulles
+  onCycle(){
+    if(!this.ready||gamePhase!=='circuit') return;
+    const d=state.d||{};
+    const V=zonePos('Marché de vente'),B=zonePos('Banque'),U=zonePos('Usine'),Q=zonePos('Quartier ouvrier'),E=zonePos('Entrepôt');
+    if((d.unitesVendues||0)>0){ floatText('vente réalisée',{x:V.x,y:7,z:V.z},'gain');
+      this.spawnFlow(V,B,0xb8924a,4,3); fxCrate('Entrepôt','Marché de vente'); fxCrate('Usine','Entrepôt'); }
+    const dette=state.dette||0;
+    if(dette>this._lastDette+0.5){ floatText('dette +'+Math.round(dette-this._lastDette),{x:B.x,y:15,z:B.z},'perte');
+      this.spawnFlow(B,U,0xb8924a,3,3); }
+    this._lastDette=dette;
+    if(state.travailleurs>0) this.spawnFlow(U,Q,0xb8924a,3,3);          // salaires
+    if((d.plusValue||0)>0) this.spawnFlow(U,B,0x8a2c1d,3,4);            // plus-value (rouge)
+    if((d.invendus||0)>40||state.stocks>120) floatText('stocks saturés',{x:E.x,y:8,z:E.z},'perte');
+    if(state.enGreve) floatText('grève',{x:U.x,y:9,z:U.z},'social');
+    if(this._lastPrix!=null&&state.prixUnitaire<this._lastPrix-0.001) floatText('prix baisse',{x:V.x,y:9,z:V.z},'perte');
+    this._lastPrix=state.prixUnitaire;
+  },
+};
+function updateLivingWorld(dt){ if(LivingWorld.ready) LivingWorld.update(dt); }
+
+// réponse visible à un appui sur E (même sans modale)
+function LWmicro(name){
+  if(!LivingWorld.ready) return; const p=zonePos(name);
+  if(name==='Usine'){ fxPuff('Usine'); fxCrate('Usine',state.buildings.entrepot>0?'Entrepôt':'Marché de vente');
+    floatText('la machine tourne',{x:p.x,y:9,z:p.z},'neutre'); }
+  else if(name==='Entrepôt'){ fxHalo('Entrepôt'); floatText('stocks : '+Math.round(state.stocks)+' caisses',{x:p.x,y:8,z:p.z},'neutre'); }
+  else if(name==='Banque'){ if(state.dette>0){ LivingWorld.spawnFlow(zonePos('Banque'),zonePos('Usine'),0xb8924a,4,3);
+      floatText('crédit',{x:p.x,y:9,z:p.z},'perte'); } else floatText('argent avancé',{x:p.x,y:9,z:p.z},'gain'); }
+  else if(name==='Marché des moyens'){ fxCrate('Marché des moyens','Usine'); floatText('moyens achetés',{x:p.x,y:8,z:p.z},'neutre'); }
+  else if(name==='Marché du travail'){ floatText('embauche',{x:p.x,y:8,z:p.z},'social'); }
+}
+
+
+/* --- nettoyage des effets cinématiques pour éviter tout coût résiduel après l'intro --- */
+function clearTransientCinematicEffects(){
+  try{
+    if(Array.isArray(fxList)){
+      for(const f of fxList){ if(f && f.obj && f.obj.parent) f.obj.parent.remove(f.obj); }
+      fxList.length=0;
+    }
+  }catch(e){}
+  try{
+    if(Array.isArray(lwTweens)){
+      for(const w of lwTweens){ if(w && w.obj) w.obj.scale.set(1,1,1); }
+      lwTweens.length=0;
+    }
+  }catch(e){}
+  try{
+    if(Array.isArray(floaters)){
+      for(const f of floaters){ if(f && f.el && f.el.remove) f.el.remove(); }
+      floaters.length=0;
+    }
+  }catch(e){}
+  try{
+    if(_floatLayer && _floatLayer.remove){ _floatLayer.remove(); _floatLayer=null; }
+  }catch(e){}
+}
+function shouldRunHeavySceneEffects(){
+  if(typeof IntroCinematic!=='undefined' && IntroCinematic.active) return true;
+  if(typeof CycleCinematic!=='undefined' && CycleCinematic.active) return true;
+  if(typeof gamePhase!=='undefined' && gamePhase==='precapital') return false;
+  if(typeof state==='undefined' || !state) return false;
+  return !!(state.productionActive || state.enGreve || (state.d && state.d.risqueCrise>0.03) || (state.niveauVille||0)>0);
+}
+
+/* ===================================================================
+   FORMATION SOCIALE — le gameplay devient une simulation émergente.
+   Couche additive : après le 1er cycle guidé, le circuit cesse d'être
+   une route et devient un diagnostic ; les lieux deviennent des postes
+   d'intervention ; chaque période donne 3 actions ; le monde produit
+   des âges, un classement, un régime et sa propre histoire.
+   « Le joueur ne suit plus le circuit : il fait émerger le monde social. »
+   =================================================================== */
+let gameMode='guided';            // 'guided' (tutoriel) → 'socialFormation'
+let pendingEnterSF=false;
+
+// --- rythme : l'atelier jeune coûte cher et accumule lentement ; tout se tend
+//     puis se desserre à mesure que la formation mûrit (laisse le temps au joueur) ---
+function earlyFactor(){ if((state.age||0)>=2) return 0; return clamp((9-(state.cycle||0))/9); }
+function costMul(){ return 1 + 0.5*earlyFactor(); }   // ~1.5 au début → 1.0 ensuite
+function fraisPeriode(){ return Math.min(Math.round(22*earlyFactor()), Math.round((state.argent||0)*0.08)); }
+
+const AGES=['Argent dormant','Atelier','Manufacture','Grande industrie','Ville industrielle','Capital financier','Marché mondial'];
+const RANKS=['Argent inerte','Petit producteur marchand','Capitaliste d’atelier','Manufacturier','Industriel','Magnat industriel','Puissance financière','Capital monopoliste','Formation sociale avancée'];
+const AGE_UNLOCKS={2:['Division du travail','Ouvriers plus nombreux','Revendications collectives'],
+  3:['Machines lourdes · rails','Chômage structurel','Surproduction · crises plus violentes'],
+  4:['Rails et wagons en circulation','Quartier ouvrier dense','Marché élargi et plus actif'],
+  5:['Bourse active · émettre des actions','Dividendes à servir chaque période','Crises financières plus violentes'],
+  6:['Port · marché mondial','Exporter · importer bon marché','Crise à l’échelle globale']};
+const REGIME_LABEL={liberal:'Libéral instable',socialDemocrate:'Compromis social-démocrate',
+  autoritaire:'Autoritaire',revolutionnaire:'Poussée révolutionnaire',communisteFragile:'Commune fragile'};
+
+const historyLog=[];
+function addHistoricalEvent(type,text){
+  historyLog.unshift({an:state.annee||1,type:type||'neutre',text});
+  if(historyLog.length>40) historyLog.pop(); renderHistLog();
+}
+function renderHistLog(){
+  const el=document.getElementById('f-hist'); if(!el) return;
+  if(!historyLog.length){ el.innerHTML='<div class="he"><b>Journal</b> — Aucun événement historique stabilisé pour cette formation.</div>'; return; }
+  el.innerHTML=historyLog.slice(0,8).map(e=>{
+    const txt=String(e.text||'');
+    const prefix=/^(An |Cycle |La Commune)/.test(txt)?'':`<b>An ${e.an}</b> — `;
+    return `<div class="he">${prefix}${txt}</div>`;
+  }).join('');
+}
+
+function capitalProductif(s){ return Math.round(s.niveauMachine*150 + s.travailleurs*45
+  + (s.buildings.atelier||0)*120 + (s.buildings.usine||0)*220 + (s.buildings.entrepot||0)*90); }
+function marketStability(s){ const part=(s.d&&s.d.partJoueur!=null)?s.d.partJoueur:0.33, risk=(s.d&&s.d.risqueCrise)||0;
+  return clamp(0.35 + part*0.9 - risk*0.6 - Math.min(0.3,s.stocks/400)); }
+
+// v20 — les âges deviennent de vrais seuils historiques : on ne passe pas à la Manufacture
+// par simple clic ou par injection de capital ; il faut durée, stabilité et contradiction traversée.
+function ageRequirements(s){
+  const a=s.age||1, cap=capitalProductif(s), stab=marketStability(s);
+  const req=(label,done,value,score)=>({label,done:!!done,value:value==null?'':String(value),score:score==null?(done?1:0):clamp(score)});
+  if(a<=1) return [
+    req('10 périodes de développement', s.cycle>=10, `${s.cycle}/10`, Math.min(1,s.cycle/10)),
+    req('6 périodes profitables', s.cyclesProfitables>=6, `${s.cyclesProfitables}/6`, Math.min(1,s.cyclesProfitables/6)),
+    req('8 ouvriers employés', s.travailleurs>=8, `${s.travailleurs}/8`, Math.min(1,s.travailleurs/8)),
+    req('Capital productif ≥ 650 £', cap>=650, money(cap), Math.min(1,cap/650)),
+    req('Dette sous contrôle (< 300 £)', s.dette<300, money(s.dette), clamp(1-s.dette/300)),
+    req('Stocks non critiques (< 80)', s.stocks<80, Math.round(s.stocks), clamp(1-s.stocks/80)),
+    req('Débouchés stables', stab>0.55, Math.round(stab*100)+' %', clamp(stab/0.55)),
+    req('Pression traversée', !!s._pressureExperienced, s._pressureExperienced?'oui':'non', s._pressureExperienced?1:0)
+  ];
+  if(a===2) return [
+    req('Machine niveau 3', s.niveauMachine>=3, `${s.niveauMachine}/3`, Math.min(1,s.niveauMachine/3)),
+    req('10 ouvriers', s.travailleurs>=10, `${s.travailleurs}/10`, Math.min(1,s.travailleurs/10)),
+    req('Capital productif ≥ 1100 £', cap>=1100, money(cap), Math.min(1,cap/1100)),
+    req('10 périodes profitables', s.cyclesProfitables>=10, `${s.cyclesProfitables}/10`, Math.min(1,s.cyclesProfitables/10)),
+    req('Entrepôt niveau 2', (s.buildings.entrepot||0)>=2, `${s.buildings.entrepot||0}/2`, Math.min(1,(s.buildings.entrepot||0)/2)),
+    req('Débouchés tenables', stab>0.4, Math.round(stab*100)+' %', clamp(stab/0.4))
+  ];
+  if(a===3) return [
+    req('Rails construits', (s.buildings.rails||0)>=1, `${s.buildings.rails||0}/1`, Math.min(1,(s.buildings.rails||0)/1)),
+    req('14 ouvriers', s.travailleurs>=14, `${s.travailleurs}/14`, Math.min(1,s.travailleurs/14)),
+    req('Capital productif ≥ 1800 £', cap>=1800, money(cap), Math.min(1,cap/1800)),
+    req('Marché niveau 2', (s.buildings.marche||0)>=2, `${s.buildings.marche||0}/2`, Math.min(1,(s.buildings.marche||0)/2)),
+    req('Entrepôt niveau 2', (s.buildings.entrepot||0)>=2, `${s.buildings.entrepot||0}/2`, Math.min(1,(s.buildings.entrepot||0)/2)),
+    req('Débouchés tenables', stab>0.4, Math.round(stab*100)+' %', clamp(stab/0.4))
+  ];
+  if(a===4) return [
+    req('Bourse fondée', (s.buildings.bourse||0)>=1, `${s.buildings.bourse||0}/1`, Math.min(1,(s.buildings.bourse||0)/1)),
+    req('Capital productif ≥ 2600 £', cap>=2600, money(cap), Math.min(1,cap/2600)),
+    req('Débouchés élargis', (s.demandeBonus||0)>=2, `${s.demandeBonus||0}/2`, Math.min(1,(s.demandeBonus||0)/2)),
+    req('14 périodes profitables', s.cyclesProfitables>=14, `${s.cyclesProfitables}/14`, Math.min(1,s.cyclesProfitables/14)),
+    req('Débouchés tenables', stab>0.4, Math.round(stab*100)+' %', clamp(stab/0.4))
+  ];
+  if(a===5) return [
+    req('Port ouvert', (s.buildings.port||0)>=1, `${s.buildings.port||0}/1`, Math.min(1,(s.buildings.port||0)/1)),
+    req('Capital productif ≥ 3500 £', cap>=3500, money(cap), Math.min(1,cap/3500)),
+    req('Débouchés mondiaux', (s.demandeBonus||0)>=4, `${s.demandeBonus||0}/4`, Math.min(1,(s.demandeBonus||0)/4)),
+    req('Débouchés tenables', stab>0.4, Math.round(stab*100)+' %', clamp(stab/0.4))
+  ];
+  return [];
+}
+function ageRequirementProgress(s){ const r=ageRequirements(s); return r.length?clamp(r.reduce((a,b)=>a+(b.score||0),0)/r.length):1; }
+function ageRequirementReady(s){ const r=ageRequirements(s); return r.length && r.every(x=>x.done); }
+function canReachManufacture(s){ return (s.age||1)<=1 && ageRequirementReady(s); }
+function canReachGrandeIndustrie(s){ return s.age===2 && ageRequirementReady(s); }
+function canReachVilleIndustrielle(s){ return s.age===3 && ageRequirementReady(s); }
+function canReachCapitalFinancier(s){ return s.age===4 && ageRequirementReady(s); }
+function canReachMarcheMondial(s){ return s.age===5 && ageRequirementReady(s); }
+function ageProgress(s){
+  const pr=ageRequirementProgress(s);
+  if((s.age||1)<=5) return ageRequirementReady(s)?1:Math.min(pr,0.95);
+  return Math.min(1,s.niveauVille/7);
+}
+function nextAgeName(s){ return AGES[Math.min(AGES.length-1,(s.age||1)+1)]; }
+
+function computeRanking(s){
+  const productivePower=clamp(s.niveauMachine*0.12 + s.travailleurs*0.03 + capitalProductif(s)/2500);
+  const financialPower=clamp(0.5 + s.argent/1500 - s.dette/600);
+  const marketPower=clamp(((s.d&&s.d.partJoueur)||0.3)*1.6);
+  const socialControl=clamp(1 - s.colere*0.8 + (s.reproSocial||0)*0.05 - (s.conscience||0)*0.3);
+  const politicalStability=clamp((s.regime?s.regime.legitimacy:0.5) - ((s.d&&s.d.declenche)?0.3:0));
+  const crisisRisk=clamp((s.d&&s.d.risqueCrise)||0);
+  const revolutionaryPotential=clamp(s.colere*0.5 + s.conscience*0.6 + crisisRisk*0.4 - (s.regime?s.regime.repression:0)*0.3 - politicalStability*0.2);
+  const power=(productivePower+financialPower+marketPower)/3;
+  let lvl=0;
+  if((s.age||0)<1) lvl=s.cyclesProfitables>0?1:0;
+  if((s.age||0)>=1) lvl=2; if((s.age||0)>=2) lvl=3; if((s.age||0)>=3) lvl=4;
+  if((s.age||0)>=3 && power>0.6) lvl=5;
+  if((s.buildings.bourse||0)>0 && power>0.6) lvl=6;
+  if(marketPower>0.8 && financialPower>0.7) lvl=7;
+  if(s.regime && s.regime.communistPossibility>0.6) lvl=8;
+  s.ranking={rankName:RANKS[lvl],rankLevel:lvl,productivePower,financialPower,marketPower,socialControl,politicalStability,crisisRisk,revolutionaryPotential};
+  return s.ranking;
+}
+function initRegime(s){ s.regime={type:'liberal',legitimacy:0.5,repression:0.1,socialRights:0,welfare:0,
+  statePower:0.2,capitalPower:0.6,workerPower:0.1,revolutionaryPotential:0,authoritarianDrift:0,socialDemocraticDrift:0,communistPossibility:0}; }
+function updateRegime(s){ const r=s.regime; if(!r) return;
+  r.workerPower=clamp(s.conscience*0.7 + (s.organisation||0)*0.3 + s.colere*0.2);
+  r.capitalPower=clamp(0.5 + capitalProductif(s)/2500 - s.colere*0.2);
+  const crise=(s.d&&s.d.declenche)?1:0, risk=(s.d&&s.d.risqueCrise)||0;
+  if(r.socialRights>0.3 && r.legitimacy>0.5 && s.colere<0.4) r.socialDemocraticDrift=clamp(r.socialDemocraticDrift+0.06);
+  if(r.repression>0.4 && s.colere>0.45) r.authoritarianDrift=clamp(r.authoritarianDrift+0.07);
+  if((crise||risk>0.6) && r.workerPower>0.5 && r.legitimacy<0.4) r.revolutionaryPotential=clamp(r.revolutionaryPotential+0.08);
+  else r.revolutionaryPotential=clamp(r.revolutionaryPotential-0.02);
+  r.legitimacy=clamp(r.legitimacy - risk*0.05 - s.colere*0.03 + r.socialRights*0.02 + r.welfare*0.02 + 0.01);
+  r.communistPossibility=clamp((r.revolutionaryPotential>0.6 && r.workerPower>0.6 && r.legitimacy<0.35)? r.communistPossibility+0.05 : r.communistPossibility-0.03);
+  let type='liberal';
+  if(r.revolutionaryPotential>0.6) type='revolutionnaire';
+  else if(r.authoritarianDrift>0.45) type='autoritaire';
+  else if(r.socialDemocraticDrift>0.45) type='socialDemocrate';
+  if(r.communistPossibility>0.6) type='communisteFragile';
+  r.type=type;
+}
+
+/* ===================================================================
+   AGENTS SOCIAUX — des forces autonomes, pas de simples variables.
+   Chaque groupe a une force, une satisfaction, une organisation et une
+   mémoire ; il évolue selon les conditions et les choix, et rétroagit
+   sur le régime, le classement et les bifurcations.
+   =================================================================== */
+function initGroups(s){ s.groups={
+  capitalists:{force:0.6,satisfaction:0.6,organisation:0.5,memory:[]},
+  workers:{nombre:s.travailleurs,force:0.2,satisfaction:0.5,colere:s.colere,conscience:s.conscience,organisation:0.08,rancune:0,confiance:0,memory:[]},
+  unemployed:{nombre:0,force:0.05,satisfaction:0.35,memory:[]},
+  bankers:{force:0.3,satisfaction:0.6,pression:0.1,mefiance:0,memory:[]},
+  state:{force:0.2,legitimacy:0.5,repression:0.1,memory:[]},
+  merchants:{force:0.3,satisfaction:0.5,memory:[]},
+  unions:{force:0.04,organisation:0.04,reconnaissance:0,memory:[]},
+  revolutionaries:{force:0.0,potential:0.0,memory:[]},
+}; s._grpFlags={}; s._memFlags={}; }
+/* mémoire des agents : ils n'oublient pas les choix passés */
+function rememberEvent(s,groupKey,kind,label){
+  const g=s.groups&&s.groups[groupKey]; if(!g) return;
+  g.memory=g.memory||[]; g.memory.unshift({kind,label:label||kind,an:s.annee||1}); if(g.memory.length>6) g.memory.pop();
+  if(groupKey==='workers'){
+    if(kind==='repression'){ g.rancune=clamp((g.rancune||0)+0.22); g.confiance=clamp((g.confiance||0)-0.10); }
+    else if(kind==='concession'){ g.confiance=clamp((g.confiance||0)+0.16); g.rancune=clamp((g.rancune||0)-0.06); }
+    else if(kind==='trahison'){ g.rancune=clamp((g.rancune||0)+0.20); g.confiance=clamp((g.confiance||0)-0.18); }
+  } else if(groupKey==='bankers'){
+    if(kind==='defaut') g.mefiance=clamp((g.mefiance||0)+0.20);
+    else if(kind==='remboursement') g.mefiance=clamp((g.mefiance||0)-0.10);
+  }
+}
+/* apaiser les ouvriers — l'effet dépend de la mémoire (rancune émousse, confiance amplifie) */
+function apaiserOuvriers(amount,label){
+  const w=state.groups&&state.groups.workers; const ranc=w?(w.rancune||0):0, conf=w?(w.confiance||0):0;
+  const eff=amount*(1 - ranc*0.55 + conf*0.25);
+  state.colere=clamp(state.colere - Math.max(0.015,eff));
+  rememberEvent(state,'workers','concession',label||'concession');
+}
+function updateSocialGroups(s){
+  if(!s.groups) initGroups(s);
+  const g=s.groups, r=s.regime||{}, d=s.d||{};
+  const risk=d.risqueCrise||0, crise=d.declenche?1:0;
+  const unemployedN=Math.max(0,Math.round((s.populationActive||0)-s.travailleurs));
+  // patrons
+  g.capitalists.force=clamp(0.4 + capitalProductif(s)/2500 + s.argent/2500);
+  g.capitalists.satisfaction=clamp(0.5 + ((d.resultatNet||0)>0?0.2:-0.2) - s.dette/900);
+  // ouvriers — l'organisation s'accumule (conscience, grève, colère) et se tasse lentement
+  g.workers.nombre=s.travailleurs; g.workers.colere=s.colere; g.workers.conscience=s.conscience;
+  const ranc=g.workers.rancune||0, conf=g.workers.confiance||0;
+  g.workers.organisation=clamp(g.workers.organisation*(0.9+ranc*0.06) + s.conscience*0.12 + (s.enGreve?0.08:0) + (s.colere>0.5?0.05:0) + (r.repression>0.5?0.04:0));
+  g.workers.force=clamp(s.travailleurs/22 + g.workers.organisation*0.6 + s.colere*0.2 + ranc*0.1);
+  g.workers.satisfaction=clamp(0.7 - s.colere*0.8 + (s.salaire-5)*0.04 + (s.reproSocial||0)*0.04 - ranc*0.2 + conf*0.15 - (s.niveauMachine||0)*0.012);
+  // armée industrielle de réserve — grossit avec la mécanisation et la grande industrie
+  g.unemployed.nombre=unemployedN;
+  g.unemployed.force=clamp(s.chomage*0.6 + (s.niveauMachine>=3?0.12:0) + ((s.age||0)>=3?0.1:0));
+  g.unemployed.satisfaction=clamp(0.45 - s.chomage*0.5);
+  // banquiers — pression selon dette / faible légitimité
+  g.bankers.pression=clamp(s.dette/600 + (1-(r.legitimacy||0.5))*0.3);
+  g.bankers.force=clamp(0.3 + s.dette/700);
+  g.bankers.satisfaction=clamp(0.5 + s.tauxInteret*2 - (d.faillite?0.4:0));
+  // État
+  g.state.force=clamp((r.statePower||0.2) + (r.repression||0)*0.5 + ((s.age||0)>=3?0.1:0));
+  g.state.legitimacy=r.legitimacy||0.5; g.state.repression=r.repression||0;
+  // marchands / concurrence
+  const part=(d.partJoueur!=null)?d.partJoueur:0.33;
+  g.merchants.force=clamp(1-part); g.merchants.satisfaction=clamp(part*1.2);
+  // syndicats — émergent de l'organisation ouvrière + reconnaissance institutionnelle
+  g.unions.organisation=clamp(g.workers.organisation*0.85 + (r.socialRights||0)*0.3);
+  g.unions.reconnaissance=clamp((r.socialRights||0) + (r.socialDemocraticDrift||0)*0.5);
+  g.unions.force=clamp(g.unions.organisation*0.8 + g.unions.reconnaissance*0.3 + ((s.age||0)>=2?0.08:0) + ((s.age||0)>=3?0.07:0));
+  // révolutionnaires — crise + conscience + faible légitimité, brisés par la répression
+  g.revolutionaries.potential=clamp(g.revolutionaries.potential*0.85 + s.conscience*0.14 + risk*0.14 + crise*0.2
+    + (g.unions.force>0.5?0.06:0) - (r.repression||0)*0.10 - (r.legitimacy||0.5)*0.08);
+  g.revolutionaries.force=clamp(g.revolutionaries.potential * (g.workers.organisation>0.4?1:0.5));
+  // --- rétroactions douces vers le reste du modèle ---
+  s.organisation=g.unions.organisation;                              // ferme la boucle vers updateRegime
+  if(g.bankers.pression>0.7) s.tauxInteret=Math.min(0.20,s.tauxInteret+0.01);   // pression bancaire
+  if(g.unemployed.force>0.5) s.peurChomage=clamp(s.peurChomage+0.03);           // l'armée de réserve discipline
+  if(g.revolutionaries.force>0.5 && r.revolutionaryPotential!=null) r.revolutionaryPotential=clamp(r.revolutionaryPotential+0.04);
+  // --- mémoire : décroissance lente + effets durables ---
+  g.workers.rancune=clamp((g.workers.rancune||0)*0.96);
+  g.workers.confiance=clamp((g.workers.confiance||0)*0.95);
+  g.bankers.mefiance=clamp((g.bankers.mefiance||0)*0.97);
+  if((g.workers.rancune||0)>0.4) s.colere=clamp(s.colere + 0.02*g.workers.rancune);   // la rancune fait remonter la colère
+  if((g.workers.confiance||0)>0.4) s.colere=clamp(s.colere - 0.01*g.workers.confiance); // la confiance l'apaise un peu
+  if(s.dette>(s.plafondCredit||500)*0.9 || s.argent<0) g.bankers.mefiance=clamp((g.bankers.mefiance||0)+0.05);
+  if((g.bankers.mefiance||0)>0.4) s.tauxInteret=Math.min(0.22, s.tauxInteret + 0.01*g.bankers.mefiance); // la méfiance durcit le crédit
+  // --- événements ponctuels (apparition d'une force sociale) ---
+  const F=s._grpFlags||(s._grpFlags={}), M=s._memFlags||(s._memFlags={});
+  if(!F.unions && g.unions.force>0.4){ F.unions=1; addHistoricalEvent('social','Un syndicat se constitue : les ouvriers ne négocient plus un par un.'); }
+  if(!F.reserve && g.unemployed.force>0.45){ F.reserve=1; addHistoricalEvent('social','Une armée industrielle de réserve se forme : le chômage pèse sur les salaires.'); }
+  if(!F.revo && g.revolutionaries.force>0.45){ F.revo=1; addHistoricalEvent('crise','Des noyaux révolutionnaires apparaissent dans les quartiers ouvriers.'); }
+  if(!F.bankpow && g.bankers.pression>0.75){ F.bankpow=1; addHistoricalEvent('crise','La banque impose ses conditions : le capital financier prend le dessus.'); }
+  // --- mémoire : seuils franchis ---
+  if(!M.rancune && g.workers.rancune>0.5){ M.rancune=1; addHistoricalEvent('social','Les ouvriers n’ont pas oublié la répression : la rancune s’installe et durcit les rapports.'); }
+  if(M.rancune && g.workers.rancune<0.25) M.rancune=0;
+  if(!M.confiance && g.workers.confiance>0.5){ M.confiance=1; addHistoricalEvent('social','Un climat de confiance s’installe : les concessions passées portent leurs fruits.'); }
+  if(M.confiance && g.workers.confiance<0.25) M.confiance=0;
+  if(!M.mefiance && g.bankers.mefiance>0.5){ M.mefiance=1; addHistoricalEvent('crise','La banque se méfie : après les défauts, le crédit se fait rare et cher.'); }
+  if(M.mefiance && g.bankers.mefiance<0.25) M.mefiance=0;
+}
+const GROUP_VIEW=[
+  ['Patrons','capitalists','force',0x5a4530],
+  ['Ouvriers','workers','force',0x4d5f70],
+  ['Chômeurs','unemployed','force',0x6c665c],
+  ['Banquiers','bankers','force',0xa8812c],
+  ['État','state','force',0x4f5a3e],
+  ['Syndicats','unions','force',0x3a5a6a],
+  ['Révolution','revolutionaries','force',0x8a2c1d],
+];
+function diagnoseCircuit(s){ const d=s.d||{}; const o={};
+  o['A']= s.dette>250 || s.argent<60;
+  o['M']= s.niveauMachine<1 || (s.cyclesSansInvestir||0)>=3;
+  o['Ft']= s.travailleurs<3 || s.chomage>0.4 || s.colere>0.45 || s.enGreve;
+  o['P']= !s.productionActive || s.fatigue>0.6 || d.accident;
+  o['M\u2032']= s.stocks>((s.stockCapaciteBonus?120:90) - ((s.age||0)>=3?25:0)) || (d.invendus||0)>((s.age||0)>=3?30:40);
+  o['A\u2032']= (d.partJoueur!=null && d.partJoueur<0.22) || (d.demande!=null && d.demande<30) || s.prixUnitaire<1.1;
+  return o;
+}
+function dominantContradiction(s){ const g=diagnoseCircuit(s);
+  if(g['Ft'] && (s.colere>0.45||s.enGreve)) return 'Travail · conflit social';
+  if(g['M\u2032']) return 'Surproduction · stocks';
+  if(g['A']) return 'Dette · capital financier';
+  if(g['A\u2032']) return 'Débouchés · concurrence';
+  if(g['P']) return 'Production · usure';
+  if(g['M']) return 'Capital constant insuffisant';
+  return 'Aucune tension dominante';
+}
+
+const CIRCUIT_LETTERS={
+  'A':{title:'A — Argent avancé', meaning:'Le cycle commence par une somme d’argent qui n’est pas encore du capital. Elle devient capital si elle est avancée pour acheter moyens, travail et revenir augmentée.'},
+  'M':{title:'M — Moyens de production', meaning:'M désigne ici les moyens achetés : matières, outils, machines, capital constant. Sans eux, la production reste trop faible.'},
+  'Ft':{title:'Ft — Force de travail', meaning:'Ft est la force de travail achetée sur le marché du travail. C’est une marchandise particulière : elle peut produire plus de valeur qu’elle ne coûte en salaire.'},
+  'P':{title:'P — Production', meaning:'P est le procès de production : ouvriers, machines et matières y transforment les moyens achetés en marchandises porteuses de valeur.'},
+  'M′':{title:'M′ — Marchandises produites', meaning:'M′ désigne les marchandises sorties de la production. Elles contiennent une valeur accrue, mais cette valeur reste virtuelle tant qu’elles ne sont pas vendues.'},
+  'A′':{title:'A′ — Argent revenu augmenté', meaning:'A′ est l’argent revenu après la vente. Le cycle a réussi seulement si A′ dépasse A : la plus-value est alors réalisée.'}
+};
+function circuitDiagnostic(sym,s){
+  const d=s.d||{}, reasons=[], actions=[];
+  const pc=v=>Math.round(clamp(v)*100)+' %';
+  const m=v=>money(Math.round(v));
+  if(sym==='A'){
+    if(s.argent<60) reasons.push(`liquidité basse : ${m(s.argent)} disponibles`);
+    if(s.dette>250) reasons.push(`dette lourde : ${m(s.dette)} à porter`);
+    actions.push('Va à la Banque : emprunte si la trésorerie bloque, rembourse ou renégocie si les intérêts mangent le profit.');
+    actions.push('Évite les investissements lourds avant d’avoir stabilisé un cycle profitable.');
+  } else if(sym==='M'){
+    if(s.niveauMachine<1) reasons.push('capital constant insuffisant : machines/outils trop faibles');
+    if((s.cyclesSansInvestir||0)>=3) reasons.push('pas assez de réinvestissement récent dans les moyens de production');
+    actions.push('Va au Marché des moyens pour acheter une machine comptant, ou à l’Usine pour installer une machine à crédit.');
+    actions.push('Réinvestis une partie du profit si la productivité plafonne.');
+  } else if(sym==='Ft'){
+    if(s.travailleurs<3) reasons.push(`main-d’œuvre insuffisante : ${s.travailleurs} ouvrier(s)`);
+    if(s.chomage>0.4) reasons.push(`chômage élevé : ${pc(s.chomage)} de réserve ouvrière`);
+    if(s.colere>0.45) reasons.push(`colère ouvrière élevée : ${pc(s.colere)}`);
+    if(s.enGreve) reasons.push('grève en cours : la production peut se bloquer');
+    actions.push('Va au Marché du travail : embauche si la production manque de bras, augmente les salaires si la colère bloque le cycle.');
+    actions.push('Va au Quartier ouvrier ou à l’État si le conflit devient politique.');
+  } else if(sym==='P'){
+    if(!s.productionActive) reasons.push('production inactive ou trop faible');
+    if(s.fatigue>0.6) reasons.push(`fatigue élevée : ${pc(s.fatigue)}`);
+    if(d.accident) reasons.push('accident de production signalé ce cycle');
+    actions.push('Va à l’Usine : règle journée, salaire, sécurité et machines.');
+    actions.push('Réduis la journée ou améliore la sécurité si la fatigue ou les accidents dominent.');
+  } else if(sym==='M′'){
+    const cap=(s.stockCapaciteBonus?120:90) - ((s.age||0)>=3?25:0);
+    if(s.stocks>cap) reasons.push(`stocks totaux trop hauts : ${Math.round(s.stocks)} / seuil ${cap}`);
+    if((d.invendus||0)>((s.age||0)>=3?30:40)) reasons.push(`invendus du cycle : ${Math.round(d.invendus||0)}`);
+    actions.push('Va à l’Entrepôt : liquide les stocks ou agrandis la capacité de stockage.');
+    actions.push('Réduis la production ou améliore les débouchés si les invendus reviennent souvent.');
+  } else if(sym==='A′'){
+    if(d.partJoueur!=null && d.partJoueur<0.22) reasons.push(`part de marché faible : ${pc(d.partJoueur)}`);
+    if(d.demande!=null && d.demande<30) reasons.push(`demande solvable basse : ${Math.round(d.demande)}`);
+    if(s.prixUnitaire<1.1) reasons.push(`prix très bas : ${money2(s.prixUnitaire)} par unité`);
+    actions.push('Va au Marché de vente : baisse le prix pour vendre plus, ou élargis les débouchés si la demande manque.');
+    actions.push('Surveille la concurrence : produire ne suffit pas, il faut réaliser la valeur par la vente.');
+  }
+  if(!reasons.length){
+    reasons.push('pas de tension majeure détectée sur ce point du circuit');
+  }
+  return {alert:!!diagnoseCircuit(s)[sym], reasons, actions, meta:CIRCUIT_LETTERS[sym]||{title:sym,meaning:'—'}};
+}
+function openCircuitInfo(sym){
+  const info=circuitDiagnostic(sym,state), meta=info.meta;
+  const box=document.getElementById('circuit-info'); if(!box) return;
+  set('ci-title',meta.title);
+  const st=document.getElementById('ci-status');
+  if(st){ st.className='distatus '+(info.alert?'alert':'ok'); st.textContent=info.alert?'⚠ Point du circuit en tension':'✓ Aucun blocage majeur ici'; }
+  const meaning=document.getElementById('ci-meaning'); if(meaning) meaning.innerHTML=meta.meaning;
+  const reasons=document.getElementById('ci-reasons'); if(reasons) reasons.innerHTML=info.reasons.map(r=>`<li>${r}</li>`).join('');
+  const actions=document.getElementById('ci-actions'); if(actions) actions.innerHTML=info.actions.map(a=>`<li>${a}</li>`).join('');
+  box.classList.add('on'); refreshModalMode();
+}
+function closeCircuitInfo(){ const box=document.getElementById('circuit-info'); if(box) box.classList.remove('on'); refreshModalMode(); }
+
+/* --- lieux = postes d'intervention --- */
+function deckPlay(id){ const it=DECK.find(x=>x.id===id)||BANK_DECK.find(x=>x.id===id);
+  if(it && (!it.can||it.can())){ it.play(); return true; } return false; }
+const ZONE_ACTIONS={
+ 'Banque':[
+   {label:'Emprunter 100 £', sub:'+ trésorerie · + dette + intérêts', can:s=>s.plafondCredit-s.dette>=100, run:()=>emprunter(100)},
+   {label:'Rembourser 50 £', sub:'− dette · − intérêts futurs', can:s=>s.dette>0&&s.argent>=50, run:()=>rembourser(50)},
+   {label:'Renégocier la dette', sub:'taux d’intérêt abaissé', can:s=>s.dette>100, run:()=>{ state.tauxInteret=Math.max(0.04,state.tauxInteret-0.02); pushLog('Banque','Dette renégociée : le taux baisse — la pression bancaire se desserre.'); }},
+ ],
+ 'Usine':[
+   {label:'Installer une machine (crédit)', sub:'+ productivité · + dette 200 £', can:s=>true, run:()=>{ if(!deckPlay('mach')){ state.niveauMachine++; state.dette+=200; state._investedThisCycle=true; pushLog('Usine','Machine installée à crédit.'); } }},
+   {label:'Intensifier (journée +1 h)', sub:'+ plus-value · + fatigue/colère', can:s=>s.heures<s.limiteJournee, run:()=>deckPlay('jour')},
+   {label:'Réduire la journée', sub:'− fatigue/colère · − production', can:s=>s.heures>8, run:()=>deckPlay('jour_down')},
+   {label:'Améliorer la sécurité', sub:'− accidents · − colère · −50 £', can:s=>s.argent>=50, run:()=>{ state.argent-=50; state.securiteNiveau=(state.securiteNiveau||0)+1; state.sante=clamp(state.sante+0.1); apaiserOuvriers(0.08,'sécurité'); if(state.revendication==='securite')state.revendication=null; pushLog(productionPlaceLabel(),'Sécurité améliorée (−50 £).'); }},
+   {label:'Construire des rails', sub:'infrastructure · wagons · ~350 £ (grande industrie)', can:s=>(s.age||0)>=3 && s.argent>=350, run:()=>{ state.argent-=350; state.buildings.rails=(state.buildings.rails||0)+1; state.railsBonus=Math.min(0.5,(state.railsBonus||0)+0.16); state._investedThisCycle=true; if(typeof updateBuildings==='function') updateBuildings(); pushLog('Usine','Rails construits : wagons et circulation accélérée des marchandises.'); }},
+   {label:'Automatiser une ligne', sub:'machines remplacent des ouvriers · + productivité · + chômage/colère', can:s=>(s.niveauMachine||0)>=4 && s.travailleurs>1 && s.argent>=250, run:()=>{ state.argent-=250; state.niveauMachine++; const lic=Math.min(2,state.travailleurs-1); state.travailleurs-=lic; state.populationActive=Math.max(state.populationActive,state.travailleurs+lic); state.colere=clamp(state.colere+0.06); if(typeof recomputeProduction==='function') recomputeProduction(); pushLog('Usine',`Ligne automatisée : ${lic} ouvrier(s) remplacé(s) par des machines. La productivité monte, l’armée de réserve grossit.`,'warn'); }},
+ ],
+ 'Marché du travail':[
+   {label:'Embaucher', sub:'+ travail vivant · + masse salariale', can:s=>true, run:()=>{ state.populationActive=Math.max(state.populationActive,state.travailleurs+1); if(!deckPlay('hire')){ state.travailleurs++; recomputeProduction(); } }},
+   {label:'Licencier', sub:'+ chômage · + colère', can:s=>s.travailleurs>1, run:()=>deckPlay('fire')},
+   {label:'Augmenter les salaires', sub:'− colère · − profit', can:s=>true, run:()=>deckPlay('sal')},
+   {label:'Baisser les salaires', sub:'+ exploitation · + colère', can:s=>s.salaire>3, run:()=>deckPlay('sal_down')},
+ ],
+ 'Entrepôt':[
+   {label:'Liquider les stocks', sub:'vendre à perte · trésorerie ↑', can:s=>s.stocks>5, run:()=>{ const v=Math.round(state.stocks*state.prixUnitaire*0.6); state.argent+=v; pushLog('Entrepôt',`Stocks liquidés à perte : +${money(v)}.`,'warn'); state.stocks=0; }},
+   {label:'Agrandir l’entrepôt', sub:'+ capacité de stock · ~180 £ (majoré au début)', can:s=>s.argent>=Math.round(180*costMul()), run:()=>{ const c=Math.round(180*costMul()); state.argent-=c; state.buildings.entrepot=(state.buildings.entrepot||0)+1; state.stockCapaciteBonus=(state.stockCapaciteBonus||0)+1; state._investedThisCycle=true; pushLog('Entrepôt',`Entrepôt agrandi (−${c} £).`); }},
+ ],
+ 'Marché de vente':[
+   {label:'Baisser les prix', sub:'+ ventes · − marge', can:s=>s.prixUnitaire>0.9, run:()=>{ state.prixUnitaire=Math.max(0.9,+(state.prixUnitaire-0.1).toFixed(2)); pushLog('Marché de vente',`Prix abaissé à ${state.prixUnitaire} £ : on prend le marché aux concurrents.`); }},
+   {label:'Augmenter les prix', sub:'+ marge · − ventes', can:s=>true, run:()=>{ state.prixUnitaire=+(state.prixUnitaire+0.1).toFixed(2); pushLog('Marché de vente',`Prix relevé à ${state.prixUnitaire} £.`); }},
+   {label:'Élargir le marché', sub:'+ demande solvable · ~220 £ (majoré au début)', can:s=>s.argent>=Math.round(220*costMul()), run:()=>{ const c=Math.round(220*costMul()); state.argent-=c; state.demandeBonus=(state.demandeBonus||0)+1; state.buildings.marche=(state.buildings.marche||0)+1; state._investedThisCycle=true; pushLog('Marché de vente',`Débouchés élargis (−${c} £).`); }},
+ ],
+ 'Quartier ouvrier':[
+   {label:'Construire des logements', sub:'− colère durable · ~150 £ (majoré au début)', can:s=>s.argent>=Math.round(150*costMul()), run:()=>{ const c=Math.round(150*costMul()); state.argent-=c; state.buildings.quartier=(state.buildings.quartier||0)+1; state.reproSocial=(state.reproSocial||0)+1; apaiserOuvriers(0.1,'logements'); state._investedThisCycle=true; pushLog('Quartier ouvrier',`Logements ouvriers (−${c} £) : la reproduction sociale s’organise.`); }},
+   {label:'Négocier', sub:'concession payante · − colère · droits ↑', can:s=>s.argent>=Math.round(40+s.travailleurs*6), run:()=>{ const c=Math.round(40+state.travailleurs*6); state.argent-=c; apaiserOuvriers(0.12,'négociation'); if(state.regime){ state.regime.socialRights=clamp(state.regime.socialRights+0.08); state.regime.legitimacy=clamp(state.regime.legitimacy+0.04);} pushLog('Quartier ouvrier',`Négociation (−${c} £) : des concessions ont un prix — salaires et conditions concédés.`,'social'); }},
+ ],
+ 'État · Tribunal':[
+   {label:'Voter une loi sociale', sub:'droits ↑ · légitimité ↑ · profit ↓', can:s=>true, run:()=>{ state.limiteJournee=Math.max(8,state.limiteJournee-2); if(state.regime){ state.regime.socialRights=clamp(state.regime.socialRights+0.12); state.regime.welfare=clamp(state.regime.welfare+0.08); state.regime.legitimacy=clamp(state.regime.legitimacy+0.05);} state.modeEtat='réforme'; apaiserOuvriers(0.08,'loi sociale'); pushLog('État','Loi sociale : journée plafonnée, droits étendus.','social'); }},
+   {label:'Réprimer', sub:'colère ↓ court terme · conscience ↑', can:s=>true, run:()=>{ state.colere=clamp(state.colere-0.12); state.conscience=clamp(state.conscience+0.1); state.modeEtat='répression'; if(state.regime){ state.regime.repression=clamp(state.regime.repression+0.12); state.regime.legitimacy=clamp(state.regime.legitimacy-0.04);} rememberEvent(state,'workers','repression','répression d’État'); pushLog('État','Répression : l’ordre règne — la conscience de classe aussi, et la rancune.','social'); }},
+ ],
+ 'Marché des moyens':[
+   {label:'Acheter une machine (comptant)', sub:'+ productivité · ~300 £ (majoré au début)', can:s=>s.argent>=Math.round(300*costMul()), run:()=>{ const c=Math.round(300*costMul()); state.argent-=c; state.niveauMachine++; state._investedThisCycle=true; if(typeof updateCapitalStage==='function') updateCapitalStage(); pushLog('Marché des moyens',`Machine achetée comptant (−${c} £).`); }},
+ ],
+ 'Bourse':[
+   {label:'Fonder la Bourse', sub:'capital financier · ~600 £ (dès la Ville industrielle)', can:s=>(s.age||0)>=4 && (s.buildings.bourse||0)<1 && s.argent>=600, run:()=>{ state.argent-=600; state.buildings.bourse=1; state.bourseActive=true; state.creditBonus=(state.creditBonus||0)+150; state.plafondCredit=(state.plafondCredit||500)+400; state._investedThisCycle=true; if(typeof updateZoneVisibility==='function') updateZoneVisibility(); if(typeof updateBuildings==='function') updateBuildings(); pushLog('Bourse','La Bourse est fondée : le capital devient financier — on peut lever du capital en émettant des actions, et le crédit s’élargit.'); }},
+   {label:'Émettre des actions', sub:'+ capital immédiat · + dividendes à servir', can:s=>(s.buildings.bourse||0)>=1, run:()=>{ const lev=Math.round(350+(state.niveau||1)*40); state.argent+=lev; state.dividende=(state.dividende||0)+Math.round(lev*0.06); pushLog('Bourse',`Actions émises : +${money(lev)} de capital levé, mais ${money(Math.round(lev*0.06))} de dividendes à servir chaque période.`,'warn'); }},
+   {label:'Spéculer', sub:'pari financier · gain ou perte · capital fictif', can:s=>(s.buildings.bourse||0)>=1 && s.argent>=120, run:()=>{ const stab=marketStability(state); const win=Math.random()<(0.40+stab*0.30); const stake=Math.round(120+state.argent*0.05); if(win){ state.argent+=stake; pushLog('Bourse',`Spéculation gagnante : +${money(stake)}. Le capital fictif enfle.`,'good'); } else { state.argent-=stake; pushLog('Bourse',`Spéculation perdante : −${money(stake)}. La bulle se dégonfle.`,'warn'); } }},
+ ],
+ 'Port · Marché mondial':[
+   {label:'Ouvrir le port', sub:'marché mondial · ~700 £ (dès le Capital financier)', can:s=>(s.age||0)>=5 && (s.buildings.port||0)<1 && s.argent>=700, run:()=>{ state.argent-=700; state.buildings.port=1; state.portOuvert=true; state.demandeBonus=(state.demandeBonus||0)+4; state._investedThisCycle=true; if(typeof updateZoneVisibility==='function') updateZoneVisibility(); if(typeof updateBuildings==='function') updateBuildings(); pushLog('Port · Marché mondial','Le port s’ouvre : le capital conquiert le marché mondial — des débouchés massifs, mais la crise pourra se propager à l’échelle globale.'); }},
+   {label:'Exporter les stocks', sub:'écouler la production sur le marché mondial · + trésorerie', can:s=>(s.buildings.port||0)>=1 && s.stocks>3, run:()=>{ const v=Math.round(state.stocks*state.prixUnitaire*0.85); state.argent+=v; state.stocks=Math.max(0,Math.round(state.stocks*0.2)); pushLog('Port · Marché mondial',`Exportation : stocks écoulés sur le marché mondial (+${money(v)}).`,'good'); }},
+   {label:'Importer des matières bon marché', sub:'− coût de production quelques périodes · ~150 £', can:s=>(s.buildings.port||0)>=1 && s.argent>=150, run:()=>{ state.argent-=150; state.importCheap=(state.importCheap||0)+3; pushLog('Port · Marché mondial','Matières premières importées à bas coût : la production coûte moins cher pour quelques périodes.'); }},
+ ],
+};
+// (B) lecture de l'état courant des catégories concernées, à l'ouverture d'un bâtiment
+function zoneReadout(name,s){
+  const pc=v=>Math.round(v*100)+' %', m=v=>money(Math.round(v));
+  switch(name){
+    case 'Banque': { const cw=(typeof CompetitorWorld!=='undefined'&&CompetitorWorld.revealed)?CompetitorWorld.firms().filter(c=>c.vivant):[];
+      const cred=cw.reduce((a,c)=>a+c.debt,0);
+      return `Trésorerie <b>${m(s.argent)}</b> · Dette <b>${m(s.dette)}</b> · Taux <b>${pc(s.tauxInteret)}</b> · Plafond crédit <b>${m(s.plafondCredit||0)}</b>`+
+        (cw.length?`<br><i>Mêmes guichets pour tous — crédits ouverts aux concurrents : <b>${m(cred)}</b>${cw.some(c=>c.debt>260)?' (dont un débiteur fragile)':''}</i>`:''); }
+    case 'Usine': { const w=s.groups&&s.groups.workers; const rel=w?(w.satisfaction>0.55?'bon':w.satisfaction<0.35?'aliéné':'tendu'):'—'; return `Journée <b>${s.heures} h</b> / max <b>${s.limiteJournee} h</b> · Machines <b>niv. ${s.niveauMachine}</b> · Sécurité <b>niv. ${s.securiteNiveau||0}</b> · Ouvriers <b>${s.travailleurs}</b> · Rapport ouvrier <b>${rel}</b>`; }
+    case 'Marché du travail': { const cw=(typeof CompetitorWorld!=='undefined'&&CompetitorWorld.revealed)?CompetitorWorld.firms().filter(c=>c.vivant):[];
+      const emp=cw.reduce((a,c)=>a+c.workers,0); const wmin=cw.length?Math.min(...cw.map(c=>c.wage)):0, wmax=cw.length?Math.max(...cw.map(c=>c.wage)):0;
+      return `Ouvriers <b>${s.travailleurs}</b> · Salaire <b>${m(s.salaire)}</b> · Chômage <b>${pc(s.chomage)}</b> · Colère <b>${pc(s.colere)}</b>`+
+        (cw.length?`<br><i>Le même marché embauche pour tous — concurrents : <b>${emp}</b> ouvriers, salaires <b>${wmin}–${wmax} £</b>${wmax>s.salaire?' (on paie mieux ailleurs)':''}</i>`:''); }
+    case 'Entrepôt': return `Stocks <b>${Math.round(s.stocks)}</b> · Capacité <b>${(s.stockCapaciteBonus?'étendue':'standard')}</b> · Prix unitaire <b>${m(s.prixUnitaire)}</b>`;
+    case 'Marché de vente': { const part=(s.d&&s.d.partJoueur!=null)?s.d.partJoueur:null;
+      const cw=(typeof CompetitorWorld!=='undefined'&&CompetitorWorld.revealed)?CompetitorWorld.firms().filter(c=>c.vivant):[];
+      const px=cw.map(c=>`${c.nom.split(' ').pop()} <b>${money2(c.prix)}</b>`).join(' · ');
+      return `Prix <b>${m(s.prixUnitaire)}</b> · Part de marché <b>${part!=null?pc(part):'—'}</b> · Débouchés <b>+${s.demandeBonus||0}</b>`+
+        (cw.length?`<br><i>Prix affichés sur le même marché — ${px}</i>`:''); }
+    case 'Quartier ouvrier': { const w=s.groups&&s.groups.workers; const mem=w?(w.rancune>0.45?'rancune':w.confiance>0.45?'confiance':'neutre'):'—'; return `Colère <b>${pc(s.colere)}</b> · Logements <b>${s.buildings.quartier||0}</b> · Reproduction <b>${s.reproSocial||0}</b> · Mémoire <b>${mem}</b>`; }
+    case 'État · Tribunal': { const r=s.regime||{}; return `Journée max <b>${s.limiteJournee} h</b> · Droits <b>${pc(r.socialRights||0)}</b> · Répression <b>${pc(r.repression||0)}</b> · Légitimité <b>${pc(r.legitimacy||0.5)}</b>`; }
+    case 'Marché des moyens': return `Machines <b>niv. ${s.niveauMachine}</b> · Trésorerie <b>${m(s.argent)}</b> · Coût machine <b>${m(Math.round(300*costMul()))}</b>`;
+    case 'Bourse': return `Bourse <b>${(s.buildings.bourse||0)>0?'active':'à fonder'}</b> · Dividendes <b>${m(s.dividende||0)}/période</b> · Crédit bonus <b>+${m(s.creditBonus||0)}</b> · Trésorerie <b>${m(s.argent)}</b>`;
+    case 'Port · Marché mondial': return `Port <b>${(s.buildings.port||0)>0?'ouvert':'à ouvrir'}</b> · Débouchés <b>+${s.demandeBonus||0}</b> · Stocks <b>${Math.round(s.stocks)}</b> · Import bon marché <b>${(s.importCheap||0)>0?(s.importCheap+' pér.'):'—'}</b>`;
+    default: return '';
+  }
+}
+// (A) objectifs : leur accomplissement injecte du capital (≥500, croissant) et fait monter de niveau
+const OBJECTIVES_SF=[
+  {id:'profit', label:'Dégager un profit sur une période', check:s=>(s.d&&(s.d.resultatNet||0)>0), r:120},
+  {id:'emb5',   label:'Employer 5 ouvriers', check:s=>s.travailleurs>=5, r:160},
+  {id:'mach2',  label:'Mécaniser : machine niveau 2', check:s=>s.niveauMachine>=2, r:220},
+  {id:'stock',  label:'Agrandir la capacité de stockage', check:s=>(s.stockCapaciteBonus||0)>=1, r:260},
+  {id:'part',   label:'Conquérir le marché (≥ 45 % de part)', check:s=>(s.d&&s.d.partJoueur!=null&&s.d.partJoueur>=0.45), r:320},
+  {id:'manu',   label:'Atteindre la Manufacture', check:s=>(s.age||1)>=2, r:420},
+  {id:'emb10',  label:'Employer 10 ouvriers', check:s=>s.travailleurs>=10, r:500},
+  {id:'mach3',  label:'Machine niveau 3', check:s=>s.niveauMachine>=3, r:600},
+  {id:'gi',     label:'Atteindre la Grande industrie', check:s=>(s.age||1)>=3, r:760},
+  {id:'rails',  label:'Construire des rails', check:s=>(s.buildings.rails||0)>=1, r:850},
+  {id:'ville',  label:'Atteindre la Ville industrielle', check:s=>(s.age||1)>=4, r:1000},
+  {id:'bourse', label:'Fonder la Bourse (capital financier)', check:s=>(s.buildings.bourse||0)>=1, r:1200},
+  {id:'cf',     label:'Atteindre le Capital financier', check:s=>(s.age||1)>=5, r:1400},
+  {id:'port',   label:'Ouvrir le port (marché mondial)', check:s=>(s.buildings.port||0)>=1, r:1650},
+  {id:'mm',     label:'Atteindre le Marché mondial', check:s=>(s.age||1)>=6, r:1900},
+];
+function currentObjective(s){ return OBJECTIVES_SF[s.objIndex||0]||null; }
+// (issue 2) chaque action a une conséquence visuelle sur la carte : impact immédiat au lieu cliqué
+// + flux causaux vers les zones réellement affectées (argent, ouvriers, colère qui se propagent)
+function actionVisual(zoneName,label){
+  if(typeof scene==='undefined'||!scene) return;
+  const L=(label||'').toLowerCase(), Z=zoneName;
+  const GOLD=COL.or, RED=COL.rouge, BLUE=COL.bleu, GREEN=COL.vert;
+  const ft=(txt,where,type)=>{ try{ floatText(txt, zonePos(where||Z), type||'neutre'); }catch(e){} };
+  const halo=(n,c)=>{ try{ fxHalo(n,c); }catch(e){} };
+  const ping=(n,c)=>{ try{ fxPing(n,c); }catch(e){} };
+  const puff=(n)=>{ try{ fxPuff(n); }catch(e){} };
+  const crate=(a,b,c)=>{ try{ fxCrate(a,b,c); }catch(e){} };
+  try{ flashTimer=Math.max(flashTimer||0,0.25); }catch(e){}
+  // Bourse / capital financier
+  if(L.includes('bourse')||L.includes('émettre')||L.includes('spéculer')){ halo('Bourse',GOLD); crate('Bourse','Banque',GOLD); ft(L.includes('spéculer')?'spéculation':'+ capital','Bourse',L.includes('spéculer')?'crise':'gain'); return; }
+  // Port / marché mondial
+  if(L.includes('port')||L.includes('exporter')||L.includes('importer')){ halo('Port · Marché mondial',BLUE); crate('Port · Marché mondial','Marché de vente',BLUE); ft('marché mondial','Port · Marché mondial','gain'); return; }
+  // Banque
+  if(L.includes('emprunter')){ halo('Banque',GOLD); crate('Banque','Usine',GOLD); ft('+ crédit','Banque','gain'); return; }
+  if(L.includes('rembourser')){ halo('Banque',BLUE); crate('Usine','Banque',GOLD); ft('− dette','Banque','social'); return; }
+  if(L.includes('renégocier')){ halo('Banque',BLUE); ft('taux ↓','Banque','social'); return; }
+  // Machines
+  if(L.includes('machine')){ crate('Marché des moyens','Usine',GOLD); halo('Usine',GOLD); puff('Usine'); ft('+ machine','Usine','gain'); return; }
+  // Journée de travail
+  if(L.includes('journée +')||L.includes('intensifier')){ puff('Usine'); halo('Usine',RED); ping('Quartier ouvrier',RED); ft('+ plus-value','Usine','gain'); ft('+ fatigue','Quartier ouvrier','crise'); return; }
+  if(L.includes('réduire la journée')){ halo('Usine',BLUE); ft('− fatigue','Usine','social'); return; }
+  if(L.includes('sécurité')){ halo('Usine',BLUE); ft('− accidents','Usine','social'); return; }
+  if(L.includes('rails')){ halo('Usine',GOLD); crate('Usine','Entrepôt',GOLD); crate('Entrepôt','Marché de vente',GOLD); ft('rails','Usine','gain'); return; }
+  // Marché du travail
+  if(L.includes('embaucher')){ crate('Marché du travail','Usine',BLUE); halo('Usine',GOLD); ft('+1 ouvrier','Usine','gain'); return; }
+  if(L.includes('licencier')){ ping('Marché du travail',RED); crate('Usine','Quartier ouvrier',RED); ping('Quartier ouvrier',RED); ft('+ chômage','Quartier ouvrier','crise'); return; }
+  if(L.includes('augmenter les salaires')){ crate('Banque','Quartier ouvrier',GOLD); halo('Quartier ouvrier',GREEN); ft('+ salaire','Quartier ouvrier','social'); return; }
+  if(L.includes('baisser les salaires')){ ping('Quartier ouvrier',RED); ft('+ colère','Quartier ouvrier','crise'); return; }
+  // Entrepôt
+  if(L.includes('liquider')){ crate('Entrepôt','Banque',GOLD); puff('Entrepôt'); ft('+ trésorerie','Entrepôt','gain'); return; }
+  if(L.includes('agrandir')){ halo('Entrepôt',GOLD); ft('+ capacité','Entrepôt','gain'); return; }
+  // Marché de vente
+  if(L.includes('baisser les prix')){ halo('Marché de vente',GREEN); crate('Quartier ouvrier','Marché de vente',BLUE); ft('+ ventes','Marché de vente','social'); return; }
+  if(L.includes('augmenter les prix')){ ping('Marché de vente',RED); ft('+ marge · − ventes','Marché de vente','crise'); return; }
+  if(L.includes('élargir')){ halo('Marché de vente',GOLD); ft('+ débouchés','Marché de vente','gain'); return; }
+  // Quartier ouvrier
+  if(L.includes('logements')){ crate('Banque','Quartier ouvrier',GOLD); halo('Quartier ouvrier',GREEN); ft('+ logements','Quartier ouvrier','social'); return; }
+  if(L.includes('négocier')){ halo('Quartier ouvrier',BLUE); ft('− colère','Quartier ouvrier','social'); return; }
+  // État
+  if(L.includes('loi sociale')){ halo('État · Tribunal',BLUE); crate('État · Tribunal','Quartier ouvrier',BLUE); ft('droits ↑','Quartier ouvrier','social'); return; }
+  if(L.includes('réprimer')){ ping('État · Tribunal',RED); ping('Quartier ouvrier',RED); ft('répression','Quartier ouvrier','crise'); return; }
+  // défaut : impact doré au lieu cliqué
+  halo(Z,GOLD);
+}
+function checkObjectives(){
+  const s=state; if(s.objIndex==null) s.objIndex=0;
+  let safety=0;
+  while(s.objIndex<OBJECTIVES_SF.length && safety++<12){
+    const o=OBJECTIVES_SF[s.objIndex];
+    if(!o.check(s)) break;
+    const reward=Math.round(Math.max(o.r, capitalProductif(s)*0.22));  // v20 : récompenses utiles mais non explosives
+    s.argent+=reward; s.objIndex++; s.niveau=(s.niveau||1)+1;
+    flashTimer=Math.max(flashTimer,0.8);
+    pushLog('Objectif',`« ${o.label} » accompli — capital injecté : +${money(reward)}. Niveau ${s.niveau}.`,'good');
+    addHistoricalEvent('objectif',`Objectif atteint : ${o.label} (+${money(reward)}, niveau ${s.niveau}).`);
+    if(typeof showLevelUp==='function') showLevelUp(s.niveau, o.label, reward);
+    if(typeof floatText==='function'){ try{ floatText(`+${money(reward)} · Niveau ${s.niveau}`, (typeof vehicle!=='undefined'&&vehicle)?vehicle.position:null, 'good'); }catch(e){} }
+  }
+}
+let _levelupEl=null;
+function showLevelUp(level,label,reward){
+  try{
+    if(!_levelupEl){ _levelupEl=document.createElement('div'); _levelupEl.id='levelup';
+      (document.body||document.documentElement).appendChild(_levelupEl); }
+    _levelupEl.innerHTML='<div class="lu-k">Niveau supérieur</div><div class="lu-n">Niveau '+level+'</div>'
+      +'<div class="lu-o">'+label+'</div>'
+      +'<div class="lu-g">Gain : +'+money(reward)+'  ·  Capital : '+money(state.argent)+'</div>';
+    _levelupEl.classList.add('show');
+    if(_levelupEl._t) clearTimeout(_levelupEl._t);
+    _levelupEl._t=setTimeout(()=>{ if(_levelupEl) _levelupEl.classList.remove('show'); }, 3800);
+  }catch(e){}
+}
+function openZoneActions(zone){
+  const list=ZONE_ACTIONS[zone.name];
+  document.getElementById('za-title').textContent=displayZoneName(zone.name);
+  const left=state.actionsRestantes;
+  document.getElementById('za-actions').textContent=left+' action'+(left>1?'s':'')+' restante'+(left>1?'s':'');
+  const stEl=document.getElementById('za-state'); if(stEl) stEl.innerHTML=zoneReadout(zone.name,state);
+  const box=document.getElementById('za-list'); box.innerHTML='';
+  if(!list||!list.length){ box.innerHTML='<p style="opacity:.7;font-size:13px">Pas d’intervention directe ici : observe, ou agis ailleurs.</p>'; }
+  else list.forEach(a=>{ const b=document.createElement('button'); b.className='za';
+    const ok=(left>0)&&(!a.can||a.can(state)); b.disabled=!ok;
+    b.innerHTML=`<b>${a.label}</b><span class="s">${a.sub}</span>`;
+    b.onclick=()=>doZoneAction(zone,a); box.appendChild(b); });
+  document.getElementById('zoneact').classList.add('on'); refreshModalMode();
+}
+function doZoneAction(zone,a){
+  if(state.actionsRestantes<=0 || (a.can&&!a.can(state))) return;
+  a.run(); state.actionsRestantes--;
+  if(typeof actionVisual==='function') actionVisual(zone.name, a.label);
+  if(typeof LWmicro!=='undefined') LWmicro(zone.name);
+  if(typeof updateBuildings==='function') updateBuildings();   // toute amélioration change le monde visuellement
+  if(typeof updateZoneVisibility==='function') updateZoneVisibility();
+  updateHUD(); updateConsequences(); renderFormationPanel();
+  if(state.actionsRestantes<=0){ document.getElementById('zoneact').classList.remove('on'); refreshModalMode();
+    pushLog('Période','Plus d’actions disponibles. Lance le cycle productif depuis le panneau Formation sociale.','warn'); tutorialCoachRefresh(true); }
+  else openZoneActions(zone);
+}
+
+const AGE_RULES_DESC={
+  0:'Argent dormant',
+  1:'Survie · faible concurrence · petit atelier',
+  2:'Division du travail · concurrence intense · revendications collectives',
+  3:'Chômage structurel · surproduction · crises violentes · État présent',
+  4:'Ville industrielle · rails · organisation ouvrière puissante',
+  5:'Capital financier · Bourse · dividendes · crises plus violentes',
+  6:'Marché mondial · Port · débouchés massifs · crise globalisée',
+};
+const AGE_RULE_BODY={
+  2:'La <b>division du travail</b> augmente la productivité, mais elle rassemble les ouvriers : les revendications deviennent collectives et la concurrence se durcit.',
+  3:'La <b>grande industrie</b> impose ses lois : la machine crée un <b>chômage structurel</b> (une armée de réserve permanente), la <b>surproduction</b> menace, les crises frappent plus fort, et l’<b>État</b> doit intervenir davantage.',
+  4:'La <b>ville industrielle</b> : rails et wagons font circuler les marchandises, le marché s’élargit, le quartier ouvrier se densifie. L’<b>organisation ouvrière</b> devient une puissance avec laquelle il faut compter.',
+  5:'Le <b>capital financier</b> domine : la Bourse permet de lever du capital en <b>émettant des actions</b>, mais impose des <b>dividendes</b> à servir chaque période, et la spéculation rend les <b>crises plus violentes</b>.',
+  6:'Le <b>marché mondial</b> s’ouvre : le port donne des <b>débouchés massifs</b> et des matières premières bon marché — mais expose toute la formation sociale à une <b>crise globalisée</b>, plus profonde.',
+};
+// chaque âge remanie les règles — effets structurels appliqués après le cycle
+function applyAgeRules(s){
+  const age=s.age||1, r=s.regime||{};
+  s.ageRules=AGE_RULES_DESC[age]||AGE_RULES_DESC[1];
+  if(age>=2 && s.competitors){            // concurrence plus intense
+    s.competitors.forEach(c=>{ if(c.vivant) c.prix=Math.max(1.05,c.prix-0.01); });
+  }
+  if(age>=3){                             // grande industrie : règles plus dures
+    const reserve=Math.round(s.travailleurs*0.3 + s.niveauMachine*1.5);
+    s.populationActive=Math.max(s.populationActive, s.travailleurs+reserve);   // armée de réserve permanente
+    if(r.statePower!=null) r.statePower=Math.max(r.statePower,0.4);             // État plus présent
+    if(s.d && s.d.declenche){                                                   // crise plus violente
+      const hit=Math.round(s.argent*0.06); s.argent-=hit; s.colere=clamp(s.colere+0.05);
+      addHistoricalEvent('crise',`Crise industrielle : la surproduction frappe fort (−${hit} £, colère ↑).`);
+    }
+  }
+  if(age>=4){                             // ville industrielle : rails actifs, marché élargi
+    s.demandeBonus=Math.max(s.demandeBonus||0,2);
+    if((s.buildings.rails||0)<1){ s.buildings.rails=1; if(typeof updateBuildings==='function') updateBuildings(); }
+    s.railsBonus=Math.max(s.railsBonus||0,0.3);
+  }
+  if(age>=5){                             // capital financier : dividendes + crises plus violentes
+    s.plafondCredit=Math.max(s.plafondCredit||500,1400);
+    if((s.dividende||0)>0) s.argent-=Math.round(s.dividende);                          // dividendes servis chaque période
+    if(s.d && s.d.declenche){ const hit=Math.round(Math.max(0,s.argent)*0.05); if(hit>0){ s.argent-=hit; addHistoricalEvent('crise',`Panique financière : la Bourse amplifie la crise (−${money(hit)}).`); } }
+  }
+  if(age>=6){                             // marché mondial : débouchés massifs, crise globalisée
+    s.demandeBonus=Math.max(s.demandeBonus||0,6);
+    if((s.buildings.port||0)<1){ s.buildings.port=1; if(typeof updateBuildings==='function') updateBuildings(); }
+    if(s.d && s.d.declenche){ s.colere=clamp(s.colere+0.04); addHistoricalEvent('crise','La crise se propage par le marché mondial : aucune économie n’y échappe.'); }
+  }
+  if((s.importCheap||0)>0){ s.argent+=Math.round(8+s.travailleurs*1.5); s.importCheap--; } // matières importées bon marché
+}
+function checkAgeTransition(){ const s=state; let to=null;
+  if((s.age||1)<=1 && canReachManufacture(s)) to=2;
+  else if(s.age===2 && canReachGrandeIndustrie(s)) to=3;
+  else if(s.age===3 && canReachVilleIndustrielle(s)) to=4;
+  else if(s.age===4 && canReachCapitalFinancier(s)) to=5;
+  else if(s.age===5 && canReachMarcheMondial(s)) to=6;
+  if(to && to>(s.age||1)){ s.age=to; s.niveauVille=Math.max(s.niveauVille,to);
+    if(typeof refreshNiveauVille==='function') refreshNiveauVille();
+    if(typeof updateBuildings==='function') updateBuildings();
+    if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
+    if(typeof updateVilleBadge==='function') updateVilleBadge();
+    if(typeof buildSocialTableau==='function') buildSocialTableau();   // la carte se restructure (la ville naît)
+    flashTimer=1.6; const name=AGES[to];
+    // déflagration visuelle qui balaie toute la carte
+    ['Usine','Quartier ouvrier','Marché de vente','Banque','Entrepôt','Marché du travail','État · Tribunal','Bourse','Port · Marché mondial'].forEach((n,i)=>{
+      if(typeof fxPing==='function') fxPing(n); if(typeof fxHalo==='function') fxHalo(n,COL.or); });
+    addHistoricalEvent('age',`La formation sociale bascule dans l’âge : ${name}. La carte se restructure.`);
+    const ruleLine=AGE_RULE_BODY[to]?`<p>${AGE_RULE_BODY[to]}</p>`:'';
+    const villeLine=(to===3)?'<p>La grande industrie <b>suppose la ville</b> : autour de l’usine, des rues, des immeubles et une place s’étendent — la carte devient une véritable ville.</p>':'';
+    showConcept({stamp:'Âge historique', title:name,
+      body:`<p>Le développement du capital fait passer la formation sociale dans un nouvel âge : <b>${name}</b>.</p>${villeLine}${ruleLine}`,
+      unlock:AGE_UNLOCKS[to]||[]});
+    return true; }
+  return false;
+}
+function evaluateHistoricalBifurcations(s){ const r=s.regime; if(!r) return;
+  if(s._bifCooldown>0){ s._bifCooldown--; return; }
+  const g=s.groups||{}; const rev=(g.revolutionaries?g.revolutionaries.force:0), org=(g.workers?g.workers.organisation:0),
+        unions=(g.unions?g.unions.reconnaissance:0), workerForce=(g.workers?g.workers.force:0);
+  // poussée révolutionnaire — portée par les forces organisées, non par la seule colère
+  if((rev>0.55 || (r.revolutionaryPotential>0.65 && org>0.5)) && r.legitimacy<0.4){
+    addHistoricalEvent('crise','Poussée révolutionnaire : la classe ouvrière organisée conteste l’ordre du capital.');
+    s.colere=clamp(s.colere-0.1); s._bifCooldown=3; flashTimer=0.7; return; }
+  // durcissement autoritaire — l'État réprime une force ouvrière montante
+  if(r.repression>0.5 && (workerForce>0.5 || s.colere>0.5) && r.authoritarianDrift>0.4){
+    addHistoricalEvent('crise','Durcissement autoritaire : l’État réprime ; la paix sociale est imposée par la force.');
+    s.colere=clamp(s.colere-0.12); s.conscience=clamp(s.conscience+0.06); s._bifCooldown=3; return; }
+  // compromis social — des syndicats reconnus canalisent le conflit
+  if((unions>0.4 || (r.socialRights>0.4 && r.legitimacy>0.55)) && s.colere<0.42){
+    addHistoricalEvent('social','Compromis social : syndicats reconnus, conflits canalisés dans des institutions.');
+    r.socialDemocraticDrift=clamp(r.socialDemocraticDrift+0.1); s._bifCooldown=4; return; }
+}
+function generativeChronicle(){
+  const s=state, d=s.d||{}, bits=[];
+  const net=(d.resultatNet!=null?d.resultatNet:(d.profitRealise||0));
+  if(d.declenche) bits.push('crise de réalisation');
+  else if(net>5) bits.push('profit réalisé : '+money(net));
+  else if(net<-5) bits.push('perte nette : '+money(Math.abs(net)));
+  else bits.push('cycle presque à l’équilibre');
+  if(s.dette>250) bits.push('dette élevée : '+money(s.dette));
+  if(s.stocks>100) bits.push('stocks critiques : '+Math.round(s.stocks));
+  if(s.colere>0.5) bits.push('colère ouvrière : '+pct(s.colere));
+  if(s.chomage>0.4) bits.push('chômage : '+pct(s.chomage));
+  addHistoricalEvent('chronique',`Cycle ${s.cycle} — ${bits.join(' · ')}.`);
+}
+
+
+/* =====================================================================
+   v48 — COMPETITOR WORLD
+   « Le capital n'est jamais seul : il existe toujours comme concurrence
+   entre capitaux. »
+   Ce module incarne les concurrents de CompetitionSystem :
+   - un district visible par firme (atelier, dépôt, ouvriers, fumée, prix) ;
+   - un comportement autonome par stratégie, joué à chaque période ;
+   - une lecture du monde sans menu (prospérité, crise, grève, faillite) ;
+   - l'observation sur place (gratuite, approximative) et le rapport
+     détaillé (1 action) ; le rachat des faillites (concentration) ;
+   - un classement industriel et des événements autonomes au journal.
+   Division du travail avec le moteur : CompetitionSystem reste maître des
+   prix, parts de marché et faillites ; CompetitorWorld anime ouvriers,
+   machines, stocks, colère, âges, espace — et raconte ce qui se passe.
+   ===================================================================== */
+const CompetitorWorld={
+  revealed:false,
+  _events:[],          // événements de la période en cours (max 2 émis, faillites/âges prioritaires)
+
+  firms(){ return state.competitors||[]; },
+  byZone(name){ return this.firms().find(c=>c.zoneName===name); },
+
+  /* ---------- construction des districts (appelé par init, cachés au départ) ---------- */
+  build(){
+    for(const c of this.firms()){
+      c.zoneName='⚒ '+c.nom;
+      const g=new THREE.Group(); g.position.set(c.district.x,0,c.district.z); g.visible=false;
+      // socle permanent : dalle de quartier, enseigne, halo — même emprise au sol que les zones du joueur.
+      const dalle=new THREE.Mesh(new THREE.CircleGeometry(8.5,28),
+        new THREE.MeshStandardMaterial({color:0xb9a884,roughness:1,transparent:true,opacity:.55}));
+      dalle.rotation.x=-Math.PI/2; dalle.position.y=0.03; g.add(dalle);
+      const lab=makeLabel(c.nom); lab.position.set(0,10,0); g.add(lab);
+      const halo=new THREE.Mesh(new THREE.RingGeometry(8.4,9.2,40),
+        new THREE.MeshBasicMaterial({color:c.couleur,transparent:true,opacity:.32,side:THREE.DoubleSide}));
+      halo.rotation.x=-Math.PI/2; halo.position.y=0.04; g.add(halo);
+      scene.add(g);
+      zoneGroups[c.zoneName]=g; c._group=g;
+      zones.push({name:c.zoneName,pos:new THREE.Vector3(c.district.x,0,c.district.z),radius:9,key:'',group:g,halo,
+        action:()=>[c.nom, this.promptInfo(c)]});
+      obstacles.push({pos:new THREE.Vector2(c.district.x,c.district.z),radius:5.5});
+    }
+    this.refreshVisuals();
+  },
+
+  /* révélation à l'entrée en formation sociale : le monde dépasse le joueur */
+  reveal(){
+    if(this.revealed) return;
+    this.revealed=true;
+    for(const c of this.firms()){ if(c._group) c._group.visible=true; }
+    PlayerDistrict.mark(); PlayerDistrict.refreshHousing(); CityGrowth.update();
+    this.refreshVisuals(); this.renderRanking();
+    addHistoricalEvent('age','D’autres capitaux étaient déjà là : Brandt, Verrié et Halage empruntent à la même banque, embauchent sur le même marché du travail et vendent sur la même place que toi. Ensemble, vous ferez la ville.');
+    pushLog('Concurrence','Trois quartiers d’entreprise apparaissent autour des mêmes marchés que toi. Va les observer : le capital n’est jamais seul.','warn');
+  },
+
+  /* ---------- état lisible sans menu ---------- */
+  etat(c){
+    if(!c.vivant) return c.rachete?'racheté':'en faillite';
+    if(c.enGreve) return 'en grève';
+    if(c.debt>260||c.capital<120) return 'endetté · fragile';
+    if(c.capital>520) return 'en expansion';
+    return 'stable';
+  },
+  /* observation gratuite : approximations — l'exactitude se paie (rapport détaillé) */
+  fuzzyPrice(c){ const r=state.prixUnitaire||1.4; return c.prix<r*0.93?'prix bas':c.prix>r*1.07?'prix élevés':'prix proches des tiens'; },
+  fuzzy(c){
+    return [
+      this.fuzzyPrice(c),
+      c.debt>260?'fortement endettée':c.debt>120?'endettée':'dette faible',
+      c.workers>=9?'ouvriers nombreux':'effectif réduit',
+      c.machineLevel>=3?'production intense (machines)':'production artisanale',
+      c.anger>0.55?'tension sociale visible':null,
+      c.stocks>40?'caisses qui s’entassent':null
+    ].filter(Boolean).join(' · ');
+  },
+  promptInfo(c){
+    if(!c.vivant && !c.rachete) return 'FAILLITE — actifs abandonnés. Appuie sur E : rachat possible.';
+    return STAGE_NAME[c.stage]+' · '+this.etat(c)+' · '+this.fuzzy(c);
+  },
+
+  /* ---------- panneau d'observation (réutilise la fenêtre de lieu) ---------- */
+  openPanel(c){
+    document.getElementById('za-title').textContent=c.nom;
+    const left=state.actionsRestantes;
+    document.getElementById('za-actions').textContent=left+' action'+(left>1?'s':'')+' restante'+(left>1?'s':'');
+    const stEl=document.getElementById('za-state');
+    if(c.spied){
+      stEl.innerHTML=`<b>${STAGE_NAME[c.stage]}</b> — stratégie : <b>${c.devise}</b><br>`+
+        `Prix <b>${money2(c.prix)}</b> · Part de marché <b>${pct(c.part||0)}</b> · Capital <b>${money(c.capital)}</b> · Dette <b>${money(c.debt)}</b><br>`+
+        `Ouvriers <b>${c.workers}</b> · Machines <b>niv. ${c.machineLevel}</b> · Salaire <b>${money(c.wage)}</b> · Stocks <b>${Math.round(c.stocks)}</b><br>`+
+        `Colère locale <b>${pct(c.anger)}</b> · État : <b>${this.etat(c)}</b>`+
+        (c.vivant?'':'<br><b style="color:var(--rouge)">EN FAILLITE — actifs rachetables</b>');
+    } else {
+      stEl.innerHTML=`<b>${STAGE_NAME[c.stage]}</b> · ${this.etat(c)}<br>${this.fuzzy(c)}<br><i style="opacity:.7">Observation à l’œil nu : approximative. Un rapport détaillé coûte 1 action.</i>`;
+    }
+    const box=document.getElementById('za-list'); box.innerHTML='';
+    const mk=(label,sub,ok,fn)=>{ const b=document.createElement('button'); b.className='za'; b.disabled=!ok;
+      b.innerHTML=`<b>${label}</b><span class="s">${sub}</span>`; b.onclick=fn; box.appendChild(b); };
+    if(c.vivant && !c.spied)
+      mk('Commander un rapport détaillé','espionnage économique · révèle prix, dette, stocks, stratégie · 1 action',
+        left>0, ()=>{ c.spied=true; state.actionsRestantes--; renderFormationPanel();
+          pushLog('Observation',`Rapport sur ${c.nom} : stratégie « ${c.devise} ».`,'plain'); this.openPanel(c); });
+    if(!c.vivant && !c.rachete){
+      const cost=this.buyoutCost(c);
+      mk('Racheter les actifs ('+money(cost)+')',
+        'machines + ouvriers absorbés + stocks bradés · concentration du capital · 1 action',
+        left>0 && state.argent>=cost, ()=>{ this.buyout(c); });
+    }
+    document.getElementById('zoneact').classList.add('on'); refreshModalMode(); tutorialCoachRefresh(true);
+  },
+
+  buyoutCost(c){ return Math.round(160 + c.machineLevel*90 + c.stocks*0.4); },
+  buyout(c){
+    const cost=this.buyoutCost(c);
+    if(state.argent<cost || state.actionsRestantes<=0) return;
+    state.argent-=cost; state.actionsRestantes--;
+    state.niveauMachine+=1;                                  // ses machines partent pour une bouchée de pain
+    const absorbes=Math.min(3,c.workers);
+    state.travailleurs+=absorbes; state.populationActive=Math.max(state.populationActive,state.travailleurs);
+    state.stocks+=Math.round(c.stocks*0.5);
+    state._investedThisCycle=true;
+    c.rachete=true; c.workers=0; c.stocks=0;
+    if(typeof recomputeProduction==='function') recomputeProduction();
+    addHistoricalEvent('crise',`${c.nom} est absorbée : machines récupérées, ${absorbes} ouvriers repris, le capital se concentre.`);
+    pushLog('Concentration',`Rachat de ${c.nom} (−${money(cost)}) : +1 niveau de machine, +${absorbes} ouvriers, stocks récupérés.`,'warn');
+    this.updateConcentration(); this.refreshVisuals(); this.renderRanking();
+    updateHUD(); updateConsequences(); renderFormationPanel();
+    document.getElementById('zoneact').classList.remove('on'); refreshModalMode();
+  },
+
+  /* ---------- comportement autonome : une décision par firme et par période ---------- */
+  onPeriod(){
+    if(!this.revealed) return;
+    this._events=[];
+    const demande=(state.d&&state.d.demande)||450;
+    for(const c of this.firms()){
+      if(!c.vivant){ this.markDeath(c); continue; }
+      const prevCap=c._lastCap!=null?c._lastCap:c.capital;
+      // production/vente approchées (l'argent exact est tenu par CompetitionSystem ; ici : matérialité)
+      // échelle ~ joueur : ouvriers × 9 h × productivité ; la grève réduit à 15 %
+      const prod=(c.enGreve?0.15:1) * c.workers*9*c.productivite*(1+0.3*(c.machineLevel-1));
+      // friction de réalisation : on ne capte jamais toute sa demande -> les stocks deviennent visibles
+      const ventes=Math.min(prod+c.stocks, 0.92*(c.part||0.2)*demande/Math.max(0.4,c.prix));
+      c.stocks=Math.max(0,Math.min(300,c.stocks+prod-ventes));
+      c.enGreve=false;
+      this['strat_'+(c.strat==='bas-salaires'?'bas':c.strat)](c,prevCap);
+      // pertes -> licenciements (l'armée de réserve grossit pour tout le monde)
+      if(!c._justInvested && c.capital<prevCap-30 && c.workers>3 && Math.random()<0.5){
+        const lic=1+Math.round(Math.random());
+        c.workers-=lic; c.anger=clamp(c.anger+0.05);
+        state.populationActive+=lic;                       // chômage global ↑ -> demande ↓, pression salariale
+        this.queue(`${c.nom} licencie ${lic} ouvrier${lic>1?'s':''} : l’armée de réserve grossit.`,'social');
+      }
+      // passage d'âge autonome : un concurrent peut atteindre la Manufacture avant le joueur
+      if(c.stage===1 && c.machineLevel>=3){
+        c.stage=2; c.productivite*=1.12;
+        const avant=(state.age||1)<2;
+        this.queue(`${c.nom} atteint la Manufacture${avant?' — avant toi':''} : sa productivité bondit, ses prix baisseront plus vite.`, 'crise', true);
+        if(avant) pushLog('⚠ Pression historique',`${c.nom} a changé d’échelle avant toi. Suis le rythme de l’accumulation — ou perds tes débouchés.`,'warn');
+      }
+      if(c.stage===2 && c.machineLevel>=6){
+        c.stage=3; c.productivite*=1.10; state.populationActive+=2;
+        this.queue(`${c.nom} passe à la grande industrie : machines massives, chômage accru, marché saturé.`, 'crise', true);
+      }
+      c._lastCap=c.capital; c._justInvested=false;
+      c.debt=Math.max(0,c.debt);
+    }
+    // un seul marché du travail : si on paie mieux ailleurs, tes ouvriers le savent
+    const alive2=this.firms().filter(c=>c.vivant);
+    if(alive2.length){
+      const wmax=Math.max(...alive2.map(c=>c.wage));
+      state._wageEnvyCd=Math.max(0,(state._wageEnvyCd||0)-1);
+      if(wmax>state.salaire && state._wageEnvyCd===0 && Math.random()<0.45){
+        state.colere=clamp(state.colere+0.025); state._wageEnvyCd=3;
+        const qui=alive2.find(c=>c.wage===wmax);
+        this.queue(`On paie ${wmax} £ chez ${qui.nom} : tes ouvriers comparent, la pression salariale monte.`,'social');
+      }
+    }
+    this.priceWar();
+    this.updateConcentration();
+    this.emitEvents();
+    refreshPlayerPlant();              // v53 : ton bâtiment suit ton âge — même grammaire que les leurs
+    PlayerDistrict.refreshHousing();   // v50 : tes logements suivent ton effectif, comme chez eux
+    CityGrowth.update();               // v50 : la ville avance au rythme du développement collectif
+    this.refreshVisuals();
+    this.renderRanking();
+  },
+
+  /* stratégies — comportements reconnaissables, résultats visibles */
+  strat_mecanise(c){
+    // la mécanisation se finance à crédit : c'est précisément sa stratégie (et sa fragilité)
+    if(c.capital>280 && Math.random()<0.65){
+      c.machineLevel++; c.capital-=100; c.debt+=120; c.prix=Math.max(0.7,c.prix*0.97); c._justInvested=true; c._justInvestedVisible=true;
+      if(c.workers>4 && Math.random()<0.6){ c.workers--; c.anger=clamp(c.anger+0.07); state.populationActive+=1; }
+      this.queue(`${c.nom} installe une machine et baisse ses prix.`,'plain');
+    }
+    c.anger=clamp(c.anger+0.02-0.01*Math.random());
+  },
+  strat_bas(c){
+    c.wage=4; c.anger=clamp(c.anger+0.06-0.02*Math.random());
+    if(c.anger>0.62 && Math.random()<0.5){
+      c.enGreve=true; c.capital-=45; c.anger=clamp(c.anger-0.18);
+      this.queue(`Grève chez ${c.nom} : la production s’arrête, la colère déborde l’atelier.`,'social', true);
+      // contagion : les ouvriers du joueur regardent ailleurs
+      state.conscience=clamp(state.conscience+0.04);
+      if(state.salaire<=4){ state.colere=clamp(state.colere+0.04);
+        this.queue('La grève voisine fait école : tes ouvriers comparent leurs salaires.','social'); }
+    } else if(c.capital>380 && Math.random()<0.4){ c.workers++; }
+  },
+  strat_compromis(c){
+    c.debt=Math.max(0,c.debt-15);
+    if(Math.random()<0.22 && c.capital>300) c.workers++;
+    if(Math.random()<0.16 && c.capital>520){ c.machineLevel++; c.capital-=180; c._justInvested=true; this.queue(`${c.nom} mécanise prudemment.`,'plain'); }
+    c.anger=clamp(c.anger-0.02);
+  },
+
+  /* guerre des prix : vendre nettement sous le marché force des réponses */
+  priceWar(){
+    if(state._priceWarCd>0){ state._priceWarCd--; return; }
+    const alive=this.firms().filter(c=>c.vivant);
+    if(!alive.length) return;
+    const minConc=Math.min(...alive.map(c=>c.prix));
+    if(state.prixUnitaire < minConc*0.90){
+      alive.forEach(c=>{ c.prix=Math.max(0.6,c.prix*0.94); c.capital-=35; });
+      state._priceWarCd=3;
+      this.queue('GUERRE DES PRIX : les concurrents s’alignent, les marges chutent, les plus endettés vacillent.','crise', true);
+      if(typeof fxHalo==='function') alive.forEach(c=>fxHalo(c.zoneName,COL.rouge));
+    }
+  },
+
+  /* concentration : faillites -> oligopole -> quasi-monopole (état rare et problématique) */
+  updateConcentration(){
+    const parts=[(state.d&&state.d.partJoueur)||0.25,...this.firms().filter(c=>c.vivant).map(c=>c.part||0)];
+    const hhi=parts.reduce((a,b)=>a+b*b,0);             // 0.25 = 4 acteurs égaux · 1 = monopole
+    state.marketConcentration=clamp((hhi-0.25)/0.75);
+    if(state.marketConcentration>0.45 && !state._oligopoleVu){
+      state._oligopoleVu=true;
+      this.firms().filter(c=>c.vivant).forEach(c=>c.prix=Math.min(2.1,c.prix*1.04));
+      state.colere=clamp(state.colere+0.03);
+      this.queue('Le marché se concentre : les survivants relèvent les prix. L’État et la rue observent.','crise', true);
+    }
+  },
+
+  markDeath(c){
+    if(c._deadSeen) return;
+    c._deadSeen=true;
+    state.populationActive+=Math.min(3,c.workers);   // le quartier tombe au chômage
+    this.queue(`Faillite de ${c.nom}. Bâtiments fermés, ouvriers à la rue — ses actifs sont rachetables sur place.`,'crise', true);
+  },
+
+  /* journal : 2 événements ordinaires max par période ; faillites/âges toujours émis */
+  queue(text,type,prioritaire){ this._events.push({text,type:type||'plain',prioritaire:!!prioritaire}); },
+  emitEvents(){
+    const prio=this._events.filter(e=>e.prioritaire);
+    const norm=this._events.filter(e=>!e.prioritaire).slice(0,2);
+    [...prio,...norm].forEach(e=>{ addHistoricalEvent(e.type==='plain'?'chronique':e.type, e.text); pushLog('Concurrence',e.text,e.type==='plain'?'plain':e.type==='crise'?'crisis':'social'); });
+    this._events=[];
+  },
+
+  /* ---------- le district raconte l'état de la firme, sans menu ---------- */
+  refreshVisuals(){
+    // Les prix sont PUBLICS sur la place du marché : chaque firme y affiche son panneau.
+    // (l'espionnage, lui, révèle ce que le marché ne montre pas : dette, stocks, stratégie)
+    const mv=zoneGroups['Marché de vente'];
+    if(mv){ clearLayer(mv,'concprices');
+      if(this.revealed){
+        const alive=this.firms().filter(c=>c.vivant);
+        alive.forEach((c,i)=>{
+          const pb=createPriceBoard(String(Math.round(c.prix*100)/100));
+          pb.position.set(-5.5+i*5.5,0,10.5); tagLayer(pb,'concprices'); mv.add(pb);
+          const ring=new THREE.Mesh(new THREE.RingGeometry(0.7,1.0,20),
+            new THREE.MeshBasicMaterial({color:c.couleur,transparent:true,opacity:.6,side:THREE.DoubleSide}));
+          ring.rotation.x=-Math.PI/2; ring.position.set(-5.5+i*5.5,0.05,10.5); tagLayer(ring,'concprices'); mv.add(ring);
+        });
+      }
+    }
+    for(const c of this.firms()){
+      const g=c._group; if(!g) continue;
+      clearLayer(g,'cw');
+      const add=m=>{ tagLayer(m,'cw'); g.add(m); return m; };
+      // --- v53 : MÊMES bâtisseurs que le joueur — un atelier est un atelier, chez tous ---
+      PLANT_BUILDERS[Math.min(3,Math.max(1,c.stage||1))](g,add);
+      // logements ouvriers : 1 maison pour 4 ouvriers — le quartier se peuple comme celui du joueur
+      const houses=Math.min(3,Math.floor(c.workers/4));
+      for(let i=0;i<houses;i++){ const h=createWorkerHouse(3.0,COL.froid);
+        h.position.set(-8.5+i*3.4,0,-6.5); h.rotation.y=0.18*(i-1); add(h); }
+      // caisses du dépôt ∝ stocks (invendus visibles)
+      const n=Math.min(8,Math.floor(c.stocks/12));
+      for(let i=0;i<n;i++) add(createCrate(1.3,0x8a6b49)).position.set(-9.5+(i%4)*1.8,0.65,2.8+Math.floor(i/4)*1.8);
+      // ouvriers ∝ effectif, dans la cour (mêmes proportions que le tableau du joueur)
+      const w=Math.min(5,Math.ceil(c.workers/2.5));
+      for(let i=0;i<w;i++){ const f=createWorkerFigure({color:c.couleur,scale:0.85});
+        f.position.set(-4+i*2.1,0,6.6); f.rotation.y=Math.PI; add(f); }
+      // machines visibles ∝ mécanisation
+      for(let i=0;i<Math.min(4,c.machineLevel-1);i++){
+        const m=new THREE.Mesh(new THREE.CylinderGeometry(0.8,0.8,1.2,10),
+          new THREE.MeshStandardMaterial({color:0x4b4438,metalness:.3,roughness:.6,flatShading:true}));
+        m.rotation.z=Math.PI/2; m.position.set(4.5,0.9,1.5+i*1.6); add(m);
+      }
+      // fumée = activité ; pas de fumée = arrêt
+      const active=c.vivant&&!c.enGreve;
+      if(active && c.stage<3){ const sm=new THREE.Mesh(new THREE.SphereGeometry(0.6,8,8),
+          new THREE.MeshStandardMaterial({color:COL.fumee,transparent:true,opacity:0.3,flatShading:true}));
+        sm.position.set(c.stage===2?-3.6:2.8, c.stage===2?10.4:8.4, c.stage===2?-3:-1.8);
+        sm.userData.chimney=true; add(sm); }   // v63 : émetteur — les bouffées montent et se dissipent
+      // grève : piquet devant la porte
+      if(c.enGreve){ const bar=box(8,0.45,0.45,COL.rouge,0,2,5.4,false); add(bar);
+        const sg=makeLabel('GRÈVE'); sg.scale.set(5,1.3,1); sg.position.set(0,6.5,5.4); add(sg); }
+      // état terminal : faillite / rachat
+      if(!c.vivant){
+        const veil=new THREE.Mesh(new THREE.CircleGeometry(9,28),
+          new THREE.MeshBasicMaterial({color:0x1a1712,transparent:true,opacity:c.rachete?0.18:0.42,depthWrite:false}));
+        veil.rotation.x=-Math.PI/2; veil.position.y=0.05; add(veil);
+        const sg=makeLabel(c.rachete?'RACHETÉ':'FAILLITE — FERMÉ'); sg.scale.set(8,1.5,1); sg.position.set(0,7.5,3); add(sg);
+        if(!c.rachete) for(let i=0;i<3;i++){ const f=createWorkerFigure({color:0x46535e,scale:0.85});
+          f.position.set(-4+i*3,0,8.5); add(f); }   // ouvriers dehors
+      }
+      // au district : pas de prix (il s'affiche sur le marché COMMUN) — juste l'enseigne d'activité
+      const pb=createPriceBoard(c.vivant?'⚒':'✕');
+      pb.position.set(6.8,0,4.5); add(pb);
+    }
+  },
+
+  /* ---------- classement industriel ---------- */
+  ranking(){
+    const rows=[{me:true,nom:'Toi',stage:STAGE_NAME[Math.min(3,state.age||1)]||'Atelier',part:(state.d&&state.d.partJoueur)||0,etat:'—',couleur:0xa8812c,vivant:true}];
+    for(const c of this.firms()) rows.push({me:false,nom:c.nom,stage:STAGE_NAME[c.stage],part:c.vivant?(c.part||0):0,etat:this.etat(c),couleur:c.couleur,vivant:c.vivant});
+    rows.sort((a,b)=>b.part-a.part);
+    return rows;
+  },
+  renderRanking(){
+    const el=document.getElementById('f-ranking'); if(!el) return;
+    if(!this.revealed){ el.innerHTML=''; return; }
+    const hx=cc=>'#'+((cc>>>0)&0xffffff).toString(16).padStart(6,'0');
+    const conc=state.marketConcentration||0;
+    const concTxt=conc>0.45?'quasi-monopole — profits forts, État et ouvriers réagissent':conc>0.2?'oligopole — le marché se referme':'concurrence vive — pression permanente sur les prix';
+    el.innerHTML='<div class="fkh">Classement industriel</div>'+this.ranking().map((r,i)=>
+      `<div class="row${r.me?' me':''}"><span class="dot" style="background:${hx(r.couleur)};${r.vivant?'':'opacity:.25'}"></span>`+
+      `<span class="nm">${i+1}. ${r.nom}${r.vivant?'':' †'}</span><span class="st">${r.stage}</span><span class="pt">${pct(r.part)}</span></div>`).join('')+
+      `<div class="conc">Concentration : ${pct(conc)} — ${concTxt}</div>`;
+  }
+};
+const STAGE_NAME={1:'Atelier',2:'Manufacture',3:'Grande industrie'};
+/* v50 — Le quartier du joueur. Jusqu'ici, Brandt, Verrié et Halage avaient
+   halo de couleur et enseigne — pas toi. Or « le tien » existe : l'Usine et
+   l'Entrepôt sont TON capital fixe (la banque, les marchés et l'État sont à
+   tous). On le marque donc dans le même langage visuel : halo or, enseigne,
+   et tes logements ouvriers près de l'usine quand l'effectif grandit. */
+const PlayerDistrict={
+  marked:false,
+  mark(){
+    if(this.marked) return; this.marked=true;
+    for(const zn of ['Usine','Entrepôt']){
+      const g=zoneGroups[zn]; if(!g) continue;
+      const ring=new THREE.Mesh(new THREE.RingGeometry(9.6,10.4,44),
+        new THREE.MeshBasicMaterial({color:COL.or,transparent:true,opacity:.45,side:THREE.DoubleSide}));
+      ring.rotation.x=-Math.PI/2; ring.position.y=0.045; g.add(ring);
+    }
+    const us=zoneGroups['Usine'];
+    if(us){ const lab=makeLabel('⚒ Ton entreprise'); lab.scale.set(8,1.6,1); lab.position.set(0,11.5,0); us.add(lab); }
+  },
+  /* logements ouvriers du joueur : même règle que les firmes (1 maison / 4 ouvriers) */
+  refreshHousing(){
+    const us=zoneGroups['Usine']; if(!us||!this.marked) return;
+    clearLayer(us,'phouses');
+    const n=Math.min(3,Math.floor((state.travailleurs||0)/4));
+    for(let i=0;i<n;i++){ const h=createWorkerHouse(3.0,COL.froid);
+      h.position.set(-10+i*3.4,0,-7.5); h.rotation.y=0.15*(i-1); tagLayer(h,'phouses'); us.add(h); }
+  }
+};
+
+/* v50 — LA VILLE SE REJOINT.
+   Le niveau de ville n'est plus indexé sur le seul joueur : il dérive du
+   développement COLLECTIF (ton âge + les âges des firmes vivantes). À mesure
+   qu'il monte, rues, réverbères, habitations et clôtures comblent l'espace
+   entre les quartiers — les secteurs se rejoignent, la ville se fait.
+     niveau 1 : réverbères le long des axes entre quartiers ;
+     niveau 2 : + maisons ouvrières dans les interstices ;
+     niveau 3 : + îlots denses et cheminées : les secteurs fusionnent. */
+const CityGrowth={
+  level:0, group:null,
+  collective(){
+    const firms=(state.competitors||[]).filter(c=>c.vivant);
+    return (state.age||1) + firms.reduce((a,c)=>a+(c.stage||1),0);   // 4 au départ (1+1+1+1)
+  },
+  targetLevel(){ const c=this.collective(); return c>=9?3:c>=7?2:c>=5?1:0; },
+  /* v52 — la ville-rue se densifie comme une vraie ville linéaire :
+       niv. 1 : réverbères le long de la GRAND-RUE ;
+       niv. 2 : + ruelle vers le quartier ouvrier et CONTRE-ALLÉE SUD (entre les
+                parcelles industrielles et les logements) qui se peuplent de maisons ;
+       niv. 3 : + contre-allée nord (derrière les institutions) — le tissu se ferme. */
+  segments(){
+    return [
+      {a:{x:-108,z:0},  b:{x:96,z:0},   min:1},   // grand-rue
+      {a:{x:0,z:14},    b:{x:0,z:50},   min:2},   // ruelle vers le quartier ouvrier
+      {a:{x:-72,z:46},  b:{x:96,z:46},  min:2},   // contre-allée sud (entre usines et logements)
+      {a:{x:-90,z:-42}, b:{x:30,z:-42}, min:3},   // contre-allée nord (derrière banque/marchés)
+    ];
+  },
+  nearZone(x,z){ return zones.some(zz=>((zz.pos.x-x)**2+(zz.pos.z-z)**2) < 13*13); },
+  /* distance point->segment, pour épargner la ligne dorée du circuit */
+  _segDist(px,pz,a,b){
+    const dx=b.x-a.x, dz=b.z-a.z, L2=dx*dx+dz*dz||1;
+    const k=Math.max(0,Math.min(1,((px-a.x)*dx+(pz-a.z)*dz)/L2));
+    return Math.hypot(px-(a.x+dx*k), pz-(a.z+dz*k));
+  },
+  nearCircuitLine(x,z){
+    if(typeof CIRCUIT==='undefined') return false;
+    const pts=CIRCUIT.map(c=>{const zz=zones.find(q=>q.name===c.zone); return zz?{x:zz.pos.x,z:zz.pos.z}:null;}).filter(Boolean);
+    for(let i=0;i<pts.length;i++){ if(this._segDist(x,z,pts[i],pts[(i+1)%pts.length])<11) return true; }
+    return false;
+  },
+  rebuild(){
+    if(this.group&&scene) scene.remove(this.group);
+    this.group=new THREE.Group(); this.group.name='CityGrowth'; scene.add(this.group);
+    if(this.level<=0) return;
+    let total=0; const TOTAL_MAX=120;          // plafond global de performance
+    const den=(typeof dDen==='function'?dDen():0.65);
+    let seed=7;
+    const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };  // déterministe : la ville ne « saute » pas
+    for(const seg of this.segments()){
+      if(this.level<seg.min) continue;
+      const a=seg.a, b=seg.b;
+      // densité croissante : niveau 1 -> rues éclairées, niveau 3 -> tissu urbain serré
+      const L=Math.hypot(b.x-a.x,b.z-a.z), n=Math.min(22,Math.max(4,Math.round(L/(12-2*this.level)*den)));  // plafonné : la densité reste sobre
+      const ux=(b.x-a.x)/L, uz=(b.z-a.z)/L, nx=-uz, nz=ux;          // direction + normale : la rue a deux côtés
+      for(let i=1;i<n;i++){
+        const k=i/n;
+        // une rue a deux côtés : on pose de part et d'autre de l'axe (le centre reste roulable)
+        const sides=this.level>=2?[-1,1]:[(i%2)?1:-1];
+        for(const sgn of sides){
+          const off=4.5+rnd()*3.5;
+          const x=a.x+(b.x-a.x)*k+nx*off*sgn+(rnd()-0.5)*3;
+          const z=a.z+(b.z-a.z)*k+nz*off*sgn+(rnd()-0.5)*3;
+          if(Math.abs(x)>HALF-6||Math.abs(z)>HALF-6||this.nearZone(x,z)||this.nearCircuitLine(x,z)) continue;
+          const r=rnd();
+          let obj=null;
+          if(this.level>=3 && r<0.25){ obj=createWorkerHouse(3.4,0x8b7d63); const ch=createChimney(5); ch.position.set(1.2,0,0); obj.add(ch); }
+          else if(this.level>=2 && r<0.5){ obj=createWorkerHouse(2.9,COL.froid); }
+          else if(r<0.78){ obj=createLampPost(); }
+          else { obj=createFenceSegment(3.5); }
+          obj.position.set(x,0,z);
+          obj.rotation.y=Math.atan2(ux,uz)+ (r<0.78?0:(rnd()-0.5)*0.6);   // aligné sur la rue
+          this.group.add(obj);
+          if(++total>=TOTAL_MAX) return;
+        }
+      }
+    }
+  },
+  /* v54 — à l'ère de la grande industrie, une voie ferrée longe la rue,
+     de la ceinture des usines jusqu'au port : les marchandises prennent le rail. */
+  buildRails(){
+    if(this._rails) return; this._rails=true;
+    const rg=new THREE.Group(); rg.name='CityRails'; scene.add(rg);
+    for(let x=-62;x<=92;x+=12){ const r=createRailSegment(12); r.rotation.y=Math.PI/2; r.position.set(x+6,0,15.5); rg.add(r); }
+    this._wagon=createWagon();
+    for(let i=0;i<2;i++){ const c=createCrate(1.1,i?0x8a6b49:COL.or); c.position.set(0,2.2,-1+i*2); this._wagon.add(c); }
+    this._wagon.rotation.y=Math.PI/2; this._wagon.position.set(-58,0.1,15.5); rg.add(this._wagon);
+    this._wagonDir=1;
+    addHistoricalEvent('age','Une voie ferrée relie les usines au port : les marchandises prennent le rail.');
+    pushLog('Ville','Le rail est posé le long de la grand-rue — du quartier des usines jusqu’au port.','plain');
+  },
+  updateRails(dt){
+    if(!this._rails||!this._wagon) return;
+    const w=this._wagon; w.position.x+=this._wagonDir*dt*7;
+    if(w.position.x>90){ this._wagonDir=-1; } if(w.position.x<-58){ this._wagonDir=1; }
+  },
+  update(){
+    const t=this.targetLevel();
+    if(t>=3) this.buildRails();
+    if(t===this.level) return;
+    this.level=t; this.rebuild();
+    const msg=[null,
+      'La ville se rejoint : des rues éclairées relient vos quartiers.',
+      'Entre les ateliers, des maisons ouvrières comblent les vides : la ville absorbe les campagnes.',
+      'Les secteurs fusionnent en tissu urbain continu : la ville industrielle est l’œuvre de tous les capitaux.'][t];
+    if(msg){ addHistoricalEvent('age',msg); pushLog('Ville',msg,'plain'); if(typeof flashTimer!=='undefined') flashTimer=0.5; }
+  }
+};
+/* =====================================================================
+   v65 — L'HORIZON (direction artistique « Charbon et lumière »).
+   Le monde ne s'arrête plus au cadre : trois couronnes de silhouettes
+   l'entourent et fondent dans la brume (bandes de profondeur, façon
+   Jusant). Et ces silhouettes RACONTENT : collines et moulins à l'ouest
+   et au sud (la campagne continue), skylines industrielles hérissées de
+   cheminées au nord et à l'est (D'AUTRES VILLES, d'autres capitaux —
+   le monde du jeu n'est qu'une formation sociale parmi d'autres).
+   Matériaux soumis au brouillard : la profondeur se peint toute seule.
+   ===================================================================== */
+/* v66 — L'HORIZON EN VOLUMES. Les plans-silhouettes de la v65 lisaient comme
+   des découpages superposés (critique juste). Remplacés par de VRAIS volumes
+   bas-poly que le brouillard et la lumière modèlent : collines écrasées,
+   montagnes à facettes, et au nord-est des BLOCS DE VILLES lointaines hérissés
+   de cheminées, piqués de minuscules fenêtres émissives qui bloomeront la nuit
+   (d'autres capitaux veillent). */
+const distantGlows=[];
+function buildHorizon(){
+  let seed=99; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
+  const hillMat =new THREE.MeshStandardMaterial({color:0x55604c,roughness:1,flatShading:true});
+  const mtnMat  =new THREE.MeshStandardMaterial({color:0x5c626e,roughness:1,flatShading:true});
+  const cityMat =new THREE.MeshStandardMaterial({color:0x3c4250,roughness:1,flatShading:true});
+  const hill=(x,z,r,h)=>{ const m=new THREE.Mesh(new THREE.IcosahedronGeometry(r,1),hillMat);
+    m.scale.set(1,h/r,1); m.position.set(x,0,z); m.rotation.y=rnd()*6.28; scene.add(m); };
+  const mtn=(x,z,r,h)=>{ const m=new THREE.Mesh(new THREE.ConeGeometry(r,h,5),mtnMat);
+    m.position.set(x,h/2-2,z); m.rotation.y=rnd()*6.28; scene.add(m); };
+  const cityBlock=(x,z,ang)=>{
+    const g=new THREE.Group();
+    const n=3+Math.floor(rnd()*3);
+    for(let i=0;i<n;i++){
+      const w=8+rnd()*10, h=10+rnd()*18, d=8+rnd()*8;
+      const b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),cityMat);
+      b.position.set((i-(n-1)/2)*11+(rnd()-0.5)*4, h/2, (rnd()-0.5)*8); g.add(b);
+      for(let k=0;k<3;k++){                       // fenêtres lointaines : graines de bloom
+        const fw=new THREE.Mesh(new THREE.PlaneGeometry(0.9,1.2),
+          new THREE.MeshStandardMaterial({color:0x1c2026,emissive:0xffb45e,emissiveIntensity:0}));
+        fw.position.set(b.position.x+(rnd()-0.5)*w*0.7, 3+rnd()*(h-5), b.position.z+d/2+0.06);
+        g.add(fw); distantGlows.push(fw.material);
+      }
+    }
+    for(let c=0;c<2;c++){
+      const ch=new THREE.Mesh(new THREE.CylinderGeometry(1.2,1.7,26+rnd()*16,7),cityMat);
+      ch.position.set((rnd()-0.5)*n*10, 16, (rnd()-0.5)*6); g.add(ch);
+      ch.userData.chimney=true; ch.userData.glowless=true;     // elles fument aussi, au loin
+    }
+    g.position.set(x,0,z); g.rotation.y=ang; scene.add(g);
+  };
+  // couronne 1 (~170) : collines au sud/ouest, villes au nord/est
+  for(let i=0;i<14;i++){ const a=(i/14)*6.28, dx=Math.sin(a), dz=Math.cos(a);
+    const x=dx*172+(rnd()-0.5)*18, z=dz*172+(rnd()-0.5)*18;
+    if(dx>0.45||dz<-0.45) cityBlock(x,z,a+Math.PI); else hill(x,z,26+rnd()*16,10+rnd()*8); }
+  // couronne 2 (~225) : grandes collines + villes plus rares
+  for(let i=0;i<10;i++){ const a=(i/10)*6.28+0.3, dx=Math.sin(a), dz=Math.cos(a);
+    const x=dx*226+(rnd()-0.5)*22, z=dz*226+(rnd()-0.5)*22;
+    if((dx>0.5||dz<-0.5)&&rnd()<0.6) cityBlock(x,z,a+Math.PI); else hill(x,z,38+rnd()*20,16+rnd()*10); }
+  // couronne 3 (~280) : montagnes à facettes
+  for(let i=0;i<9;i++){ const a=(i/9)*6.28+0.15;
+    mtn(Math.sin(a)*282+(rnd()-0.5)*26, Math.cos(a)*282+(rnd()-0.5)*26, 46+rnd()*26, 34+rnd()*22); }
+}
+
+/* v59 — LE CIEL. Un dôme en dégradé (shader minimal) : zénith bleu-gris
+   désaturé, horizon qui se fond EXACTEMENT dans la couleur du brouillard —
+   pas de couture entre le sol et le ciel. DayCycle pilote les deux teintes :
+   midi clair et bleuté, heure dorée chaude et basse. Les nuages, le soleil
+   et les oiseaux vivent à l'intérieur du dôme. */
+let skyDome=null, skyStars=null;
+function buildSky(){
+  const uniforms={
+    topColor:   {value:new THREE.Color(0x9eb6bd)},
+    bottomColor:{value:new THREE.Color(0xcbbd9a)},
+    offset:     {value:2},       // v59b : horizon bas — le ciel commence tout de suite
+    exponent:   {value:0.45}     // v59c : avec la compression hh, monte vite et plafonne
+  };
+  const mat=new THREE.ShaderMaterial({
+    uniforms, side:THREE.BackSide, depthWrite:false, fog:false,
+    vertexShader:`varying vec3 vPos; void main(){ vPos=position;
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+    fragmentShader:`uniform vec3 topColor; uniform vec3 bottomColor;
+      uniform float offset; uniform float exponent; varying vec3 vPos;
+      void main(){ float h=normalize(vPos+vec3(0.0,offset,0.0)).y;
+        float hh=clamp(h*2.3,0.0,1.0);                 // v59c : compression — le bleu n'attend pas le zénith
+        gl_FragColor=vec4(mix(bottomColor,topColor,pow(hh,exponent)),1.0); }`
+  });
+  skyDome=new THREE.Mesh(new THREE.SphereGeometry(345,20,12),mat);
+  skyDome.renderOrder=-2;
+  scene.add(skyDome);
+  // v60 — étoiles (enfants du dôme : elles suivent la caméra avec lui)
+  const N=260, pos=new Float32Array(N*3);
+  for(let i=0;i<N;i++){ const a=Math.random()*6.28, e=0.18+Math.random()*1.3, r=330;
+    pos[i*3]=Math.cos(e)*Math.sin(a)*r; pos[i*3+1]=Math.sin(e)*r; pos[i*3+2]=Math.cos(e)*Math.cos(a)*r; }
+  const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  skyStars=new THREE.Points(sg,new THREE.PointsMaterial({color:0xfff2d8,size:2.0,sizeAttenuation:false,
+    transparent:true,opacity:0,depthWrite:false,fog:false}));
+  skyStars.renderOrder=-1; skyDome.add(skyStars);
+}
+
+/* v58 — L'ATMOSPHÈRE : nappes de brume au ras du sol (fortes à l'heure dorée,
+   presque dissipées à midi — asservies à DayCycle) et un SOLEIL visible dans le
+   ciel (sprite à halo, insensible à la brume de profondeur), qui suit sa course. */
+const Atmosphere={
+  mists:[], sun:null, moon:null, ready:false,
+  _mistTexture(){
+    const c=document.createElement('canvas'); c.width=256; c.height=64; const x=c.getContext('2d');
+    const g=x.createRadialGradient(128,32,4,128,32,120);
+    g.addColorStop(0,'rgba(238,230,212,0.85)'); g.addColorStop(1,'rgba(238,230,212,0)');
+    x.fillStyle=g; x.save(); x.scale(1,0.5); x.fillRect(0,0,256,128); x.restore();
+    return new THREE.CanvasTexture(c);
+  },
+  _sunSprite(){
+    const c=document.createElement('canvas'); c.width=c.height=256; const x=c.getContext('2d');
+    let g=x.createRadialGradient(128,128,2,128,128,128);
+    g.addColorStop(0,'rgba(255,244,214,0.95)'); g.addColorStop(0.18,'rgba(255,238,196,0.85)');
+    g.addColorStop(0.32,'rgba(255,228,170,0.28)'); g.addColorStop(1,'rgba(255,228,170,0)');
+    x.fillStyle=g; x.fillRect(0,0,256,256);
+    const m=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),
+      transparent:true,depthWrite:false,fog:false}));
+    m.scale.set(64,64,1); m.renderOrder=-1; return m;
+  },
+  init(){
+    if(this.ready) return; this.ready=true;
+    const tex=this._mistTexture();
+    const spots=[[-92,-66],[-100,-34],[-94,46],[-78,68],[108,-46],[108,30],[64,84]]; // champs de l'ouest + littoral
+    for(const [x,z] of spots){
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(30,9),
+        new THREE.MeshBasicMaterial({map:tex,transparent:true,opacity:0.14,depthWrite:false}));
+      m.rotation.x=-Math.PI/2; m.rotation.z=Math.random()*3;
+      m.position.set(x,0.9+Math.random()*0.5,z);
+      m.userData.home=x; m.userData.v=0.25+Math.random()*0.3;
+      scene.add(m); this.mists.push(m);
+    }
+    this.sun=this._sunSprite(); scene.add(this.sun);
+    // v60 — la lune : disque pâle et net, halo discret
+    const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
+    let g=x.createRadialGradient(64,64,2,64,64,64);
+    g.addColorStop(0,'rgba(228,234,240,0.95)'); g.addColorStop(0.30,'rgba(218,226,236,0.85)');
+    g.addColorStop(0.42,'rgba(210,220,232,0.18)'); g.addColorStop(1,'rgba(210,220,232,0)');
+    x.fillStyle=g; x.fillRect(0,0,128,128);
+    this.moon=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),
+      transparent:true,depthWrite:false,fog:false}));
+    this.moon.scale.set(34,34,1); this.moon.renderOrder=-1; scene.add(this.moon);
+  },
+  update(dt){
+    if(!this.ready) return;
+    const k=DayCycle.kDay;                                   // v60 : 0 = nuit, 1 = midi
+    const mistK=0.05+0.17*(1-k);                             // brume forte à l'aube et au crépuscule
+    for(const m of this.mists){
+      m.position.x+=m.userData.v*dt;
+      if(m.position.x>m.userData.home+12) m.position.x=m.userData.home-12;
+      m.material.opacity=mistK*(0.7+0.3*Math.sin(t*0.4+m.userData.home));
+    }
+    if(sunLight){
+      const dir=sunLight.position.clone().normalize().multiplyScalar(235);
+      if(this.sun){ this.sun.position.copy(dir); this.sun.material.opacity=Math.max(0,k*1.1-0.08); }
+      // la lune occupe la direction de la lumière la NUIT (le directionnel joue alors la lune)
+      if(this.moon){ this.moon.position.copy(dir);
+        const elOK=Math.min(1,Math.max(0,((DayCycle._el||0)-0.25)*5));   // pas de lune collée à l'horizon
+        this.moon.material.opacity=Math.max(0,(1-k*1.8))*elOK; }
+    }
+  }
+};
+
+/* v57 — LA NATURE PRÉCÈDE LE CAPITAL.
+   Forêts denses et herbe par InstancedMesh : ~150 arbres et ~220 touffes pour
+   5 draw calls. Toujours visibles (c'est de la géographie, pas du décor
+   d'époque) : la carte n'est jamais nue, même en phase 0. Génération
+   déterministe, hors zones / rue / eau / décors de carte. */
+const Nature={
+  built:false,
+  build(){
+    if(this.built) return; this.built=true;
+    let seed=42; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
+    const KEEP_OUT=[[-98,92,16],[58,-100,22],[-86,-78,13],[-62,-86,12],[-112,-44,12],[44,-86,13],[88,72,12]]; // rose, cartouche, champs
+    const ok=(x,z)=>{
+      if(Math.abs(x)>116||Math.abs(z)>116) return false;
+      if(x>106) return false;                                   // l'eau
+      if(Math.abs(z)<12 && x>-112 && x<106) return false;       // la rue
+      if(zones.some(zz=>((zz.pos.x-x)**2+(zz.pos.z-z)**2)<15*15)) return false;
+      if(KEEP_OUT.some(([kx,kz,kr])=>((kx-x)**2+(kz-z)**2)<kr*kr)) return false;
+      return true; };
+    // — positions d'arbres : couronne extérieure dense + clairsemé à l'intérieur
+    const trees=[];
+    let guard=0;
+    while(trees.length<150 && guard++<3000){
+      const edge=rnd()<0.74;
+      const x=(rnd()*2-1)*116, z=(rnd()*2-1)*116;
+      const d=Math.max(Math.abs(x),Math.abs(z));
+      if(edge ? d<72 : d>=72) continue;
+      if(!ok(x,z)) continue;
+      trees.push({x,z,s:0.75+rnd()*0.8,r:rnd()*6.28,alt:rnd()<0.5});
+    }
+    const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3();
+    const inst=(geo,color,n)=>{ const m=new THREE.InstancedMesh(geo,
+        new THREE.MeshStandardMaterial({color,roughness:1,flatShading:true}), n);
+      m.castShadow=true; scene.add(m); return m; };
+    const trunks=inst(new THREE.CylinderGeometry(0.30,0.42,2.6,7), 0x6b513a, trees.length);
+    const nA=trees.filter(tr=>!tr.alt).length, nB=trees.length-nA;
+    const canA=inst(new THREE.SphereGeometry(1,7,6), 0x6f7a45, nA*2);
+    const canB=inst(new THREE.SphereGeometry(1,7,6), 0x5a6a4a, nB*2);
+    trunks.castShadow=false;
+    let iA=0,iB=0;
+    trees.forEach((tr,i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0),tr.r);
+      P.set(tr.x,1.3*tr.s,tr.z); S.set(tr.s,tr.s,tr.s); M.compose(P,Q,S); trunks.setMatrixAt(i,M);
+      const can=tr.alt?canB:canA; let idx=tr.alt?iB:iA;
+      P.set(tr.x,(2.6+1.0)*tr.s,tr.z); S.set(1.65*tr.s,1.30*tr.s,1.65*tr.s); M.compose(P,Q,S); can.setMatrixAt(idx*2,M);
+      P.set(tr.x+0.3*tr.s,(2.6+2.2)*tr.s,tr.z-0.2*tr.s); S.set(1.15*tr.s,0.95*tr.s,1.15*tr.s); M.compose(P,Q,S); can.setMatrixAt(idx*2+1,M);
+      tr.alt?iB++:iA++;
+    });
+    [trunks,canA,canB].forEach(m=>m.instanceMatrix.needsUpdate=true);
+    // — herbe : 220 touffes coniques
+    const tufts=[]; guard=0;
+    while(tufts.length<220 && guard++<3000){
+      const x=(rnd()*2-1)*114, z=(rnd()*2-1)*114;
+      if(!ok(x,z)) continue; tufts.push({x,z,s:0.7+rnd()*0.9,r:rnd()*6.28});
+    }
+    const grass=new THREE.InstancedMesh(new THREE.ConeGeometry(0.30,0.7,5),
+      new THREE.MeshStandardMaterial({color:0xa3a06e,roughness:1,flatShading:true}), tufts.length);
+    tufts.forEach((tf,i)=>{ Q.setFromAxisAngle(new THREE.Vector3(0,1,0),tf.r);
+      P.set(tf.x,0.35*tf.s,tf.z); S.set(tf.s,tf.s,tf.s); M.compose(P,Q,S); grass.setMatrixAt(i,M); });
+    grass.instanceMatrix.needsUpdate=true; scene.add(grass);
+    // — teintes régionales très douces : la carte gagne de la profondeur
+    const tint=(x,z,w,d,color,op)=>{ const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),
+        new THREE.MeshBasicMaterial({color,transparent:true,opacity:op,depthWrite:false}));
+      m.rotation.x=-Math.PI/2; m.position.set(x,0.008,z); scene.add(m); };
+    tint(-96,0,52,232,0x7a8a55,0.08);    // l'ouest rural, verdâtre
+    tint(14,47,176,38,0x8a7a5f,0.05);    // la ceinture industrielle, chaude
+    tint(96,0,22,232,0xc2a877,0.07);     // la frange portuaire, sable
+  }
+};
+
+/* v63 — TRAINS DE BOUFFÉES. Les cheminées (userData.chimney) émettent de
+   vraies bouffées qui montent, grossissent, dérivent au vent d'ouest et se
+   dissipent. Pool fixe de 22 bouffées, recensement des émetteurs toutes les
+   2,5 s (les usines naissent, brûlent et meurent), position monde recalculée
+   au lâcher. Le vieux y=15.5 forcé ne s'applique plus (bug v53 corrigé). */
+const PuffTrains={
+  puffs:[], emitters:[], _scanT:0, _spawnT:0, ready:false,
+  init(){
+    if(this.ready) return; this.ready=true;
+    for(let i=0;i<30;i++){   // v66 : pool élargi (les villes lointaines fument aussi)
+      const m=new THREE.Mesh(new THREE.SphereGeometry(0.8,7,6),
+        new THREE.MeshStandardMaterial({color:0x9a9285,transparent:true,opacity:0,flatShading:true,depthWrite:false}));
+      m.visible=false; scene.add(m);
+      this.puffs.push({obj:m, t0:-99, life:3.4});
+    }
+  },
+  scan(){
+    this.emitters.length=0;
+    scene.traverse(o=>{ if(o.userData&&o.userData.chimney&&o.visible){
+      let p=o.parent, ok=true; while(p){ if(p.visible===false){ok=false;break;} p=p.parent; }
+      if(ok) this.emitters.push(o); } });
+  },
+  update(dt){
+    if(!this.ready) return;
+    this._scanT-=dt; if(this._scanT<=0){ this._scanT=2.5; this.scan(); }
+    this._spawnT-=dt;
+    if(this._spawnT<=0 && this.emitters.length){
+      this._spawnT=0.34;
+      const free=this.puffs.find(pf=>t-pf.t0>pf.life);
+      if(free){
+        const e=this.emitters[Math.floor(Math.random()*this.emitters.length)];
+        e.getWorldPosition(free.obj.position);
+        free.t0=t; free.life=3.0+Math.random()*1.4; free.obj.visible=true;
+      }
+    }
+    for(const pf of this.puffs){
+      const a=(t-pf.t0)/pf.life;
+      if(a>=1){ pf.obj.visible=false; continue; }
+      pf.obj.position.y+=dt*(1.5+a*1.2);
+      pf.obj.position.x+=dt*0.7;                              // le vent d'ouest (même sens que les nuages)
+      pf.obj.scale.setScalar(0.5+a*1.7);
+      pf.obj.material.opacity=0.42*(1-a)*(1-a*0.3);
+    }
+  }
+};
+
+/* v58 — LE PAYSAGE SONORE. Tout est synthétisé (aucun fichier) et mixé par
+   PROXIMITÉ : un vent doux partout (souffle filtré, lentement modulé), des
+   mouettes près de l'eau, le ronron grave des machines près des usines en
+   activité. Démarre au premier geste (politique d'autoplay), touche B pour
+   couper. Volumes volontairement discrets : une ambiance, pas une bande-son. */
+const AmbientSound={
+  ctx:null, master:null, started:false, muted:false,
+  wind:null, windLfo:null, hum:null, humGain:null, _gullT:0,
+  start(){
+    if(this.started) return; this.started=true;
+    try{
+      const C=this.ctx=new (window.AudioContext||window.webkitAudioContext)();
+      this.master=C.createGain(); this.master.gain.value=0.15; this.master.connect(C.destination);
+      // — vent : bruit blanc bouclé -> passe-bas dont la fréquence respire
+      const len=C.sampleRate*2, buf=C.createBuffer(1,len,C.sampleRate), d=buf.getChannelData(0);
+      for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+      const src=C.createBufferSource(); src.buffer=buf; src.loop=true;
+      const lp=C.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=380; lp.Q.value=0.6;
+      const wg=C.createGain(); wg.gain.value=0.5;
+      const lfo=C.createOscillator(); lfo.frequency.value=0.06;
+      const lfoG=C.createGain(); lfoG.gain.value=140;
+      lfo.connect(lfoG); lfoG.connect(lp.frequency);
+      src.connect(lp); lp.connect(wg); wg.connect(this.master);
+      src.start(); lfo.start(); this.wind=wg;
+      // — machines : deux oscillateurs graves légèrement désaccordés -> passe-bas
+      const o1=C.createOscillator(), o2=C.createOscillator();
+      o1.type='sawtooth'; o2.type='sawtooth'; o1.frequency.value=54; o2.frequency.value=55.4;
+      const hf=C.createBiquadFilter(); hf.type='lowpass'; hf.frequency.value=160;
+      this.humGain=C.createGain(); this.humGain.gain.value=0;
+      o1.connect(hf); o2.connect(hf); hf.connect(this.humGain); this.humGain.connect(this.master);
+      o1.start(); o2.start();
+    }catch(e){ this.ctx=null; }
+  },
+  gull(){
+    const C=this.ctx; if(!C) return;
+    const n=1+Math.floor(Math.random()*2);
+    for(let i=0;i<n;i++){
+      const t0=C.currentTime+i*(0.28+Math.random()*0.2);
+      const o=C.createOscillator(); o.type='triangle';
+      o.frequency.setValueAtTime(1250,t0);
+      o.frequency.exponentialRampToValueAtTime(760,t0+0.16);
+      o.frequency.exponentialRampToValueAtTime(1050,t0+0.30);
+      const g=C.createGain(); g.gain.setValueAtTime(0.0001,t0);
+      g.gain.exponentialRampToValueAtTime(0.09,t0+0.05);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+0.34);
+      o.connect(g); g.connect(this.master); o.start(t0); o.stop(t0+0.4);
+    }
+  },
+  cricket(){
+    const C=this.ctx; if(!C) return;
+    for(let i=0;i<3;i++){ const t0=C.currentTime+i*0.085;
+      const o=C.createOscillator(); o.type='triangle'; o.frequency.value=4300+Math.random()*250;
+      const g=C.createGain(); g.gain.setValueAtTime(0.0001,t0);
+      g.gain.exponentialRampToValueAtTime(0.016,t0+0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001,t0+0.07);
+      o.connect(g); g.connect(this.master); o.start(t0); o.stop(t0+0.09); }
+  },
+  toggle(){ this.muted=!this.muted;
+    if(this.master) this.master.gain.value=this.muted?0:0.15;
+    if(typeof pushLog==='function') pushLog('Son', this.muted?'Ambiance coupée (B pour réactiver).':'Ambiance sonore active.','plain'); },
+  update(dt){
+    if(!this.ctx||this.muted||typeof Vehicle==='undefined') return;
+    const vx=Vehicle.pos.x, vz=Vehicle.pos.z;
+    const kd=(typeof DayCycle!=='undefined')?DayCycle.kDay:1;
+    // mouettes (le jour) : probabilité croissante près de l'eau
+    this._gullT-=dt;
+    if(this._gullT<=0){ this._gullT=5+Math.random()*8;
+      const dEau=Math.max(0,106-vx);
+      if(kd>0.3 && dEau<60 && Math.random()< (1-dEau/60)*0.9) this.gull(); }
+    // grillons (la nuit) — v60
+    this._criT=(this._criT||0)-dt;
+    if(this._criT<=0){ this._criT=0.9+Math.random()*1.6;
+      if(kd<0.3 && Math.random()<0.8) this.cricket(); }
+    // ronron : distance à l'usine active la plus proche (joueur + firmes vivantes)
+    let best=1e9;
+    if(typeof zonePos==='function' && typeof state!=='undefined' && state.travailleurs>0 && !state.enGreve){
+      const u=zonePos('Usine'); best=Math.min(best,Math.hypot(vx-u.x,vz-u.z)); }
+    if(typeof CompetitorWorld!=='undefined' && CompetitorWorld.revealed)
+      for(const c of CompetitorWorld.firms()) if(c.vivant&&!c.enGreve)
+        best=Math.min(best,Math.hypot(vx-c.district.x,vz-c.district.z));
+    const target=best<46 ? 0.10*(1-best/46) : 0;
+    const g=this.humGain.gain; g.value=g.value+(target-g.value)*Math.min(1,dt*2.5);
+  }
+};
+
+/* v57 — LE JOUR RESPIRE. Jamais de nuit (la lisibilité d'abord) : la lumière
+   oscille lentement (~4 min) entre un matin doré, un midi clair et une fin
+   d'après-midi ambrée aux ombres longues. Les réverbères se rallument quand
+   le soleil baisse. Trois interpolations par frame : coût nul. */
+const DayCycle={
+  /* v60 — LE CYCLE COMPLET : aurore -> matin -> midi -> heure dorée -> crépuscule -> NUIT.
+     Tout est défini par une table d'étapes (phase 0..1) interpolées : course et couleur
+     de la lumière (le directionnel joue le soleil le jour, la LUNE la nuit), brouillard,
+     teinte du ciel, éclat des lampes, et kDay (0 = nuit, 1 = midi) que toute l'atmosphère
+     consomme : brume, étoiles, lune, nuages, oiseaux, grillons. La nuit est une nuit
+     d'encre lavée, jouable : la lumière lunaire garde des ombres lisibles. */
+  PERIOD:420, lampBoost:0.6, kDay:1,
+  STOPS:[
+    {p:0.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit d'encre bleue (lune)
+    {p:0.07, el:0.12, az: 1.15, sunC:0xffb27a, sunI:0.50, hemC:0xb9a48c, hemI:0.46, fog:0xc9a98c, top:0x7d8fb0, lamp:1.2, k:0.30}, // aurore
+    {p:0.14, el:0.45, az: 0.95, sunC:0xffd9a4, sunI:0.95, hemC:0xe8d8b8, hemI:0.68, fog:0xd2bd92, top:0x9bb0c8, lamp:0.6, k:0.80}, // matin
+    {p:0.40, el:0.95, az: 0.35, sunC:0xfff1d4, sunI:1.12, hemC:0xefe2c6, hemI:0.78, fog:0xcbbd9a, top:0x7fb0d4, lamp:0.35,k:1.00}, // midi
+    {p:0.62, el:0.60, az:-0.55, sunC:0xffe2b0, sunI:1.00, hemC:0xead9b4, hemI:0.70, fog:0xcfbd96, top:0x8fb0c8, lamp:0.5, k:0.90}, // après-midi
+    {p:0.72, el:0.30, az:-0.95, sunC:0xffc98e, sunI:0.85, hemC:0xe2c9a2, hemI:0.62, fog:0xd2b88c, top:0x9bb0c8, lamp:0.9, k:0.60}, // heure dorée
+    {p:0.80, el:0.08, az:-1.15, sunC:0xff7d4a, sunI:0.50, hemC:0xb08a78, hemI:0.42, fog:0xc07a52, top:0x4c5a86, lamp:1.3, k:0.25}, // crépuscule embrasé
+    {p:0.88, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit tombée
+    {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // boucle
+  ],
+  _cA:null,_cB:null,
+  phase(){ return ((t/this.PERIOD)+0.22)%1; },          // la partie commence en fin de matinée
+  _mixColor(target,h1,h2,u){
+    if(!this._cA){ this._cA=new THREE.Color(); this._cB=new THREE.Color(); }
+    this._cA.setHex(h1); this._cB.setHex(h2); target.copy(this._cA).lerp(this._cB,u); },
+  update(){
+    if(!sunLight) return;
+    const ph=this.phase(), S=this.STOPS;
+    let a=S[0],b=S[1];
+    for(let i=0;i<S.length-1;i++){ if(ph>=S[i].p&&ph<=S[i+1].p){ a=S[i]; b=S[i+1]; break; } }
+    const u0=(ph-a.p)/Math.max(1e-6,b.p-a.p), u=u0*u0*(3-2*u0);     // smoothstep
+    const el=a.el+(b.el-a.el)*u, az=a.az+(b.az-a.az)*u, R=110;
+    sunLight.position.set(Math.cos(el)*Math.sin(az)*R, Math.max(8,Math.sin(el)*R), Math.cos(el)*Math.cos(az)*R);
+    sunLight.intensity=physI(a.sunI+(b.sunI-a.sunI)*u);
+    this._mixColor(sunLight.color, a.sunC, b.sunC, u);
+    if(hemiLight){ hemiLight.intensity=physI(a.hemI+(b.hemI-a.hemI)*u);
+      this._mixColor(hemiLight.color, a.hemC, b.hemC, u); }
+    if(scene.fog) this._mixColor(scene.fog.color, a.fog, b.fog, u);
+    this.kDay=a.k+(b.k-a.k)*u;            // calculé AVANT le ciel : les étoiles lisent la bonne valeur
+    if(skyDome){
+      this._mixColor(skyDome.material.uniforms.topColor.value, a.top, b.top, u);
+      skyDome.material.uniforms.bottomColor.value.copy(scene.fog.color);
+      if(typeof camera!=='undefined'&&camera)
+        skyDome.position.set(camera.position.x,0,camera.position.z);
+      if(typeof skyStars!=='undefined'&&skyStars)
+        skyStars.material.opacity=Math.pow(Math.max(0,1-this.kDay*1.6),1.5)*0.9;   // étoiles la nuit
+    }
+    this.lampBoost=a.lamp+(b.lamp-a.lamp)*u;
+    this._el=el;
+  }
+};
+
+/* v56 — LE CIEL ET L'EAU VIVENT : nuages qui dérivent, oiseaux qui tournoient,
+   bateaux qui tanguent. Coût minuscule, présence énorme. */
+const WorldBeauty={
+  clouds:[], birds:[], ready:false,
+  init(){
+    if(this.ready) return; this.ready=true;
+    for(let i=0;i<4;i++){ const c=createCloud();
+      c.position.set(-120+i*70+Math.random()*30, 42+Math.random()*12, -90+Math.random()*180);
+      c.userData.v=0.9+Math.random()*0.9; scene.add(c); this.clouds.push(c); }
+    for(let i=0;i<5;i++){ const b=createBird(); scene.add(b);
+      this.birds.push({obj:b, cx:-60+Math.random()*150, cz:-70+Math.random()*140,
+        r:9+Math.random()*9, y:22+Math.random()*9, a:Math.random()*6.28, v:0.35+Math.random()*0.3, ph:Math.random()*6.28}); }
+  },
+  update(dt){
+    if(!this.ready) return;
+    const kd=(typeof DayCycle!=='undefined')?DayCycle.kDay:1;
+    for(const c of this.clouds){ c.position.x+=c.userData.v*dt;
+      if(c.position.x>140){ c.position.x=-140; c.position.z=-90+Math.random()*180; }
+      c.children.forEach(m=>{ if(m.material) m.material.opacity=0.25+0.67*kd; }); }   // v60 : nuages d'encre la nuit
+    for(const b of this.birds){ b.obj.visible=kd>0.2; if(!b.obj.visible) continue;   // v60 : les oiseaux se couchent
+      b.a+=b.v*dt;
+      const o=b.obj; o.position.set(b.cx+Math.cos(b.a)*b.r, b.y+Math.sin(t*2+b.ph)*0.8, b.cz+Math.sin(b.a)*b.r);
+      o.rotation.y=-b.a;                                      // tangent au cercle
+      const f=Math.sin(t*9+b.ph)*0.55;                        // battement d'ailes
+      if(o.userData.w1){ o.userData.w1.rotation.z=f; o.userData.w2.rotation.z=-f; } }
+    for(const bt of _boats){ bt.position.y=Math.sin(t*1.1+bt.position.z)*0.12;
+      bt.rotation.z=Math.sin(t*0.9+bt.position.z)*0.04; }
+  }
+};
+
+/* v53 — navetteurs : la force de travail vit au quartier ouvrier COMMUN et
+   marche chaque jour vers chaque usine — la tienne comme les leurs. Un
+   navetteur par firme vivante, en boucle (aller au travail / retour). */
+CompetitorWorld.commuters=[];
+CompetitorWorld.updateCommuters=function(dt){
+  if(!this.revealed) return;
+  const QO=zonePos('Quartier ouvrier'); if(!QO) return;
+  const firms=this.firms();
+  // initialisation paresseuse
+  if(!this.commuters.length){
+    for(const c of firms){
+      const f=createWorkerFigure({color:c.couleur,scale:0.95}); scene.add(f);
+      this.commuters.push({obj:f, firm:c, p:Math.random()});
+    }
+  }
+  for(const cm of this.commuters){
+    const c=cm.firm, o=cm.obj;
+    const ok=c.vivant && !c.enGreve && c.workers>0;
+    o.visible=ok; if(!ok) continue;
+    cm.p=(cm.p+dt/14)%1;                                   // ~14 s pour un aller-retour
+    const k=cm.p<0.5? cm.p*2 : (1-cm.p)*2;                  // aller puis retour
+    const tx=c.district.x+3.5, tz=c.district.z+6.5;
+    o.position.set(QO.x+(tx-QO.x)*k, 0, QO.z+(tz-QO.z)*k);
+    o.rotation.y=Math.atan2((cm.p<0.5?1:-1)*(tx-QO.x),(cm.p<0.5?1:-1)*(tz-QO.z));
+    if(typeof animateWorker==='function') animateWorker(o,dt,true);
+  }
+};
+
+/* v49 — flux ambiants : le circuit des autres capitaux, visible dans l'espace.
+   Toutes les ~4 s (hors modale), une firme vivante envoie ses marchandises au
+   marché COMMUN ; selon son état, elle tire aussi de l'or de la banque (crédit)
+   ou un ouvrier du marché du travail. Chaque caisse qui roule dit : mêmes
+   institutions, mêmes débouchés, même circuit. */
+CompetitorWorld.ambient=function(dt){
+  if(!this.revealed || (typeof anyModalOpen==='function'&&anyModalOpen())) return;
+  if(typeof shouldRunHeavySceneEffects==='function' && !shouldRunHeavySceneEffects()) return;
+  this._amb=(this._amb||0)+dt;
+  if(this._amb<4) return; this._amb=0;
+  const alive=this.firms().filter(c=>c.vivant&&!c.enGreve);
+  if(!alive.length) return;
+  const c=alive[Math.floor(Math.random()*alive.length)];
+  if(typeof fxCrate!=='function') return;
+  fxCrate(c.zoneName,'Marché de vente',COL.rouge);                 // M′ → marché commun
+  const r=Math.random();
+  if(r<0.30 && c.debt>120) fxCrate('Banque',c.zoneName,COL.or);     // crédit : la même banque
+  else if(r<0.55)          fxCrate('Marché du travail',c.zoneName,COL.bleu); // la même force de travail
+  else if(c._justInvestedVisible){ fxCrate('Marché des moyens',c.zoneName,COL.brun); c._justInvestedVisible=false; }
+};
+
+/* v47 — Alertes progressives : le système prévient AVANT la crise, par paliers.
+   Chaque alerte ne se déclenche qu'au franchissement du seuil (pas de spam),
+   se réarme quand on redescend, et pointe le LIEU de la tension (halo rouge). */
+const ALERTS=[
+  {id:'colere1', zone:'Quartier ouvrier', test:s=>s.colere>0.45, msg:'La colère monte au quartier ouvrier. Le rapport social se tend.'},
+  {id:'colere2', zone:'Quartier ouvrier', test:s=>s.colere>0.65, msg:'Colère ouvrière critique : la grève devient probable. Le point P du circuit est menacé.'},
+  {id:'stocks1', zone:'Entrepôt',         test:s=>s.stocks>0.5*(STOCK_SEUIL+(s.stockCapaciteBonus||0)), msg:'Les stocks s’accumulent : la production dépasse la demande solvable.'},
+  {id:'dette1',  zone:'Banque',           test:s=>s.dette>0.6*Math.max(1,s.plafondCredit||600), msg:'La dette approche du plafond : les intérêts pèsent sur chaque cycle, la banque devient méfiante.'},
+  {id:'vente1',  zone:'Marché de vente',  test:s=>(s.d&&s.d.tauxVente!=null)&&s.d.tauxVente<0.75, msg:'Mévente : une grande partie de la production ne trouve pas d’acheteur. Crise de réalisation en germe.'},
+  {id:'perte2',  zone:'Banque',           test:s=>(s._endStreaks&&s._endStreaks.alertPerte||0)>=2, msg:'Deux cycles déficitaires de suite : le capital avancé ne revient plus augmenté. La crise approche.'},
+];
+function checkAlerts(){
+  const st=state; st._alerts=st._alerts||{};
+  // streak de pertes pour l'alerte 'perte2' (réutilise le compteur endStreak)
+  if(typeof endStreak==='function'){ const net=(st.d&&(st.d.resultatNet!=null?st.d.resultatNet:st.d.profitRealise))||0; endStreak(st,'alertPerte',net<0); }
+  for(const a of ALERTS){
+    const on=!!a.test(st);
+    if(on && !st._alerts[a.id]){
+      st._alerts[a.id]=true;
+      pushLog('⚠ Alerte', a.msg, 'warn');
+      if(typeof fxHalo==='function'){ fxHalo(a.zone, COL.rouge); fxPing(a.zone); }
+      const pz=zonePos(a.zone); if(typeof floatText==='function') floatText('⚠ '+a.zone,{x:pz.x,y:13,z:pz.z},'warn');
+    } else if(!on && st._alerts[a.id]){
+      st._alerts[a.id]=false;   // réarmement : l'alerte pourra resservir si la tension revient
+    }
+  }
+}
+function markPressureExperience(s){
+  const d=s.d||{};
+  const pressure = (d.risqueCrise||0)>0.28 || (d.partJoueur!=null&&d.partJoueur<0.30)
+    || s.stocks>35 || s.dette>160 || s.colere>0.38 || !!d.faillitesConc;
+  if(pressure && !s._pressureExperienced){
+    s._pressureExperienced=true;
+    addHistoricalEvent('crise','Première pression systémique traversée : la formation sociale n’avance plus seulement par accumulation, mais par contradiction.');
+  }
+}
+/* v47 — NEUTRALISÉ : ce panneau "période résolue" faisait doublon avec le bilan de cycle
+   (il n'était d'ailleurs plus appelé). Conservé pour référence, court-circuité. */
+function showPeriodDiagnostic(aged){
+  return; // doublon du bilan — cf. showSocialCycleReport
+  if(typeof showWhap!=='function') return;
+  const d=state.d||{}, net=Math.round(d.resultatNet!=null?d.resultatNet:(d.profitRealise||0));
+  const contr=dominantContradiction(state), pr=Math.round(ageProgress(state)*100);
+  const fx=[
+    ['résultat '+money(net), net>=0?'+':'-'],
+    ['capital '+money(Math.round(state.argent)), state.argent>=0?'+':'-'],
+    ['stocks '+Math.round(state.stocks), state.stocks>80?'-':'+'],
+    ['âge '+(AGES[state.age||1]||'Atelier'), '+'],
+    ['progression '+pr+' %', '+']
+  ];
+  const chain=[
+    `Période ${state.cycle} résolue`,
+    `Contradiction dominante : ${contr}`,
+    `Actions réinitialisées : 3 interventions possibles`,
+    aged?'Passage d’âge : la carte et les règles changent':'Le cycle productif est calculé en arrière-plan'
+  ];
+  showWhap({
+    action:`Période résolue : <b>${net>=0?'profit':'perte'} ${money(net)}</b>.`,
+    fx, chain,
+    marx:'Le circuit fonctionne maintenant comme une <b>contrainte systémique</b> : tu n’es plus obligé de faire le tour, mais chaque période rappelle ce qui bloque la formation sociale.'
+  });
+}
+const CycleCinematic={
+  active:false, start:0, duration:6400, points:[], labels:[], lastIndex:-1,
+  actors:null, workers:[], money:[], goods:[], savedVehicle:null, savedCargo:null,
+  begin(labels,duration){
+    this.active=true; this.start=performance.now(); this.duration=duration||6400; this.labels=labels||[]; this.lastIndex=-1;
+    this.points=CIRCUIT.map(c=>{ const p=zonePos(c.zone); return new THREE.Vector3(p.x,0,p.z); });
+    this.savedVehicle={pos:Vehicle.pos.clone(), heading:Vehicle.heading, speed:Vehicle.speed};
+    this.savedCargo=(typeof MiniCircuit!=='undefined'?MiniCircuit.cargo:null);
+    Vehicle.speed=0; Input.fwd=Input.back=Input.left=Input.right=false;
+    this.buildActors();
+  },
+  buildActors(){
+    this.clearActors();
+    if(typeof scene==='undefined'||!scene) return;
+    const g=new THREE.Group(); g.name='CycleCinematicActors'; scene.add(g); this.actors=g;
+    const travail=zonePos('Marché du travail'), usine=zonePos('Usine'), banque=zonePos('Banque'), moyens=zonePos('Marché des moyens'), entrepot=zonePos('Entrepôt'), vente=zonePos('Marché de vente');
+    const workerN=Math.max(4,Math.min(9,state.travailleurs||6));
+    for(let i=0;i<workerN;i++){
+      const w=createWorkerFigure({color:i%2?COL.bleu:COL.froid,scale:0.88});
+      const off={x:(i%3-1)*1.6, z:(Math.floor(i/3)-1)*1.3};
+      w.position.set(travail.x+off.x,0,travail.z+off.z); w.visible=false; g.add(w);
+      this.workers.push({obj:w,off,phase:Math.random()*6.28});
+    }
+    for(let i=0;i<10;i++){
+      const coin=new THREE.Mesh(new THREE.CylinderGeometry(0.35,0.35,0.12,14),
+        new THREE.MeshStandardMaterial({color:COL.or,metalness:.25,roughness:.45,flatShading:true}));
+      coin.rotation.x=Math.PI/2; coin.visible=false; g.add(coin);
+      this.money.push({obj:coin,phase:i/10,a:{x:banque.x,z:banque.z},b:{x:moyens.x,z:moyens.z},mode:'advance'});
+    }
+    for(let i=0;i<8;i++){
+      const c=createCrate(1.15, i%2?0x9a5a3e:0x8a6b49); c.visible=false; g.add(c);
+      this.goods.push({obj:c,phase:i/8,a:{x:usine.x,z:usine.z},b:{x:entrepot.x,z:entrepot.z},c:{x:vente.x,z:vente.z}});
+    }
+  },
+  clearActors(){
+    if(this.actors&&scene){ scene.remove(this.actors); }
+    this.actors=null; this.workers=[]; this.money=[]; this.goods=[];
+  },
+  cargoFor(p){
+    if(p<0.20) return 'argent';
+    if(p<0.58) return 'moyens';
+    return 'marchandises';
+  },
+  positionVehicle(p){
+    if(!this.points.length||!Vehicle||!Vehicle.group) return;
+    const span=this.points.length-1;
+    const raw=p*span, idx=Math.min(span-1,Math.floor(raw)), local=raw-idx;
+    const a=this.points[idx], b=this.points[Math.min(idx+1,span)];
+    const pos=new THREE.Vector3().lerpVectors(a,b,local);
+    const dx=b.x-a.x, dz=b.z-a.z;
+    Vehicle.pos.copy(pos); Vehicle.heading=Math.atan2(dx,dz); Vehicle.speed=0;
+    Vehicle.group.position.set(pos.x,0,pos.z); Vehicle.group.rotation.y=Vehicle.heading; Vehicle.group.rotation.z=0;
+    if(typeof MiniCircuit!=='undefined') MiniCircuit.cargo=this.cargoFor(p);
+    if(Vehicle.cargoGroups){ const cg=(typeof MiniCircuit!=='undefined'?MiniCircuit.cargo:this.cargoFor(p));
+      for(const k in Vehicle.cargoGroups) Vehicle.cargoGroups[k].visible=(k===cg); }
+  },
+  updateWorkers(p,dt){
+    if(!this.workers.length) return;
+    const travail=zonePos('Marché du travail'), usine=zonePos('Usine');
+    const k=clamp((p-0.20)/0.32);
+    const prodPulse=Math.max(0,Math.sin(clamp((p-0.48)/0.18)*Math.PI));
+    this.workers.forEach((w,i)=>{
+      const o=w.obj; o.visible=p>0.14 && p<0.82;
+      if(!o.visible) return;
+      const wave=Math.sin(performance.now()*0.003+w.phase)*0.5;
+      const sx=travail.x+w.off.x, sz=travail.z+w.off.z;
+      const ux=usine.x-5+w.off.x*0.9, uz=usine.z+4+w.off.z*0.8;
+      o.position.set(sx+(ux-sx)*k,0,sz+(uz-sz)*k);
+      o.rotation.y=Math.atan2(ux-sx,uz-sz);
+      if(k>0.98){ o.position.x+=Math.sin(t*5+i)*0.35*prodPulse; o.position.z+=Math.cos(t*4+i)*0.28*prodPulse; }
+      animateWorker(o,dt||0.04,k<0.98||prodPulse>0.05);
+    });
+  },
+  updateMoney(p){
+    if(!this.money.length) return;
+    const banque=zonePos('Banque'), vente=zonePos('Marché de vente');
+    this.money.forEach((m,i)=>{
+      const o=m.obj;
+      const advance=p<0.34, realize=p>0.78;
+      o.visible=advance||realize;
+      if(!o.visible) return;
+      const a=advance?m.a:{x:vente.x,z:vente.z};
+      const b=advance?m.b:{x:banque.x,z:banque.z};
+      const base=advance ? p/0.34 : (p-0.78)/0.22;
+      const k=(base+m.phase)%1;
+      o.position.set(a.x+(b.x-a.x)*k,2.2+Math.sin(k*Math.PI)*3.2,a.z+(b.z-a.z)*k);
+      o.rotation.z+=0.18; o.rotation.y+=0.10;
+    });
+  },
+  updateGoods(p){
+    if(!this.goods.length) return;
+    this.goods.forEach((g,i)=>{
+      const o=g.obj;
+      o.visible=p>0.50 && p<0.96;
+      if(!o.visible) return;
+      let k=clamp((p-0.50)/0.46); let a=g.a, b=g.b;
+      if(k>0.50){ a=g.b; b=g.c; k=(k-0.50)/0.50; }
+      else { k=k/0.50; }
+      const delay=(i%4)*0.04;
+      k=clamp(k-delay);
+      o.position.set(a.x+(b.x-a.x)*k+(i%3-1)*0.9,1.2+Math.sin(k*Math.PI)*1.6,a.z+(b.z-a.z)*k+Math.floor(i/3)*0.75);
+      o.rotation.y+=0.03;
+    });
+  },
+  update(){
+    if(!this.active||!this.points.length) return;
+    const p=clamp((performance.now()-this.start)/this.duration);
+    const span=this.points.length-1;
+    const raw=p*span, idx=Math.min(span-1,Math.floor(raw)), local=raw-idx;
+    const a=this.points[idx], b=this.points[Math.min(idx+1,span)];
+    const focus=new THREE.Vector3().lerpVectors(a,b,local);
+    const drift=Math.sin(p*Math.PI*2)*10;
+    const desired=new THREE.Vector3(focus.x-30+drift,78+Math.sin(p*Math.PI)*8,focus.z+34);
+    camera.position.lerp(desired,0.12);
+    camera.lookAt(focus.x,0,focus.z);
+    this.positionVehicle(p);
+    this.updateWorkers(p,0.04); this.updateMoney(p); this.updateGoods(p);
+    if(idx!==this.lastIndex){
+      this.lastIndex=idx;
+      const c=CIRCUIT[Math.min(idx,CIRCUIT.length-1)];
+      if(c){ fxHalo(c.zone, idx>=3?COL.rouge:COL.or); fxPing(c.zone); floatText(c.sym,{x:a.x,y:12,z:a.z}, idx>=3?'warn':'gain'); }
+      if(idx===2) floatText('travail vivant', {x:focus.x,y:14,z:focus.z}, 'warn');
+      if(idx===3) floatText('production', {x:focus.x,y:14,z:focus.z}, 'gain');
+      if(idx===4) floatText('marchandises', {x:focus.x,y:14,z:focus.z}, 'gain');
+    }
+  },
+  end(){
+    this.active=false; this.points=[]; this.lastIndex=-1; this.clearActors();
+    if(this.savedVehicle&&Vehicle){
+      Vehicle.pos.copy(this.savedVehicle.pos); Vehicle.heading=this.savedVehicle.heading; Vehicle.speed=0;
+      if(Vehicle.group){ Vehicle.group.position.set(Vehicle.pos.x,0,Vehicle.pos.z); Vehicle.group.rotation.y=Vehicle.heading; Vehicle.group.rotation.z=0; }
+    }
+    if(typeof MiniCircuit!=='undefined' && this.savedCargo!=null) MiniCircuit.cargo=this.savedCargo;
+    this.savedVehicle=null; this.savedCargo=null;
+  }
+};
+function playCycleAnimation(done){
+  const ov=document.getElementById('cycleplay');
+  if(!ov){ done(); return; }
+  const steps=[...ov.querySelectorAll('.cpstep')];
+  const bar=document.getElementById('cpbar');
+  const txt=document.getElementById('cp-text');
+  const title=document.getElementById('cp-title');
+  const labels=['A — avance de capital','M — moyens et machines','Ft — force de travail','P — production','M′ — stocks / marchandises','A′ — vente / réalisation'];
+  const explains=[
+    'la trésorerie disponible et la dette lancent la période',
+    'les moyens de production déterminent la capacité productive',
+    'la main-d’œuvre, les salaires et la colère entrent dans le procès',
+    'l’usine transforme travail et machines en marchandises',
+    'les marchandises passent par l’entrepôt : stocks ou invendus apparaissent',
+    'le marché réalise — ou non — la valeur sous forme d’argent'
+  ];
+  let start=performance.now(); const duration=6400;
+  ov.classList.add('on'); refreshModalMode(); CycleCinematic.begin(labels,duration);
+  function frame(now){
+    const p=clamp((now-start)/duration); const i=Math.min(steps.length-1,Math.floor(p*steps.length));
+    steps.forEach((s,k)=>s.classList.toggle('on',k===i));
+    if(bar) bar.style.width=Math.round(p*100)+'%';
+    if(txt) txt.textContent=labels[i]+' : '+explains[i]+'.';
+    if(title) title.textContent='Vue drone du cycle productif';
+    if(p<1) requestAnimationFrame(frame);
+    else setTimeout(()=>{ CycleCinematic.end(); ov.classList.remove('on'); refreshModalMode(); done(); },300);
+  }
+  requestAnimationFrame(frame);
+}
+function showSocialCycleReport(aged){
+  const s=state, d=s.d||{}, p=s.prev||{};
+  const sheet=document.getElementById('report-sheet'); if(!sheet) return;
+  const net=Math.round(d.resultatNet!=null?d.resultatNet:(d.profitRealise||0));
+  const produites=Math.round(d.Q||0), vendues=Math.round(d.unitesVendues||0), invendus=Math.round(d.invendus||0);
+  const pr=Math.round(ageProgress(s)*100);
+  const reqs=ageRequirements(s);
+  const reqHtml=reqs.length?`<div class="repsec">Passage vers ${nextAgeName(s)}</div><div class="objline">${reqs.map(r=>`<span class="${r.done?'gauge':'manque'}">${r.done?'✓':'□'} ${r.label} — ${r.value}</span>`).join('<br>')}</div>`:'';
+  const regimeLabel=(REGIME_LABEL[s.regime?s.regime.type:'liberal']||'—');
+  const recent=(s.history||[]).slice(0,4).map(e=>`<span class="lk">${e.text||e}</span>`).join('');
+  const ageMsg=aged?`<p class="auto"><b>Passage d’âge.</b> La formation sociale change d’échelle : nouvelles règles, nouveaux risques, nouvelles contradictions.</p>`:'';
+  sheet.innerHTML=`
+    <div class="stamp">Bilan social · Cycle ${s.cycle} · An ${s.annee||1}</div>
+    <h3>Bilan du cycle productif</h3>
+    <p class="verdict ${net>=0?'ok':'ko'}">${net>=0?'✓ Cycle profitable':'✗ Cycle déficitaire'} — ${net>=0?'+ ':'− '}${money(Math.abs(net))}</p>
+    ${ageMsg}
+    <div class="led compte">
+      <span class="k">Âge historique</span><span class="v gold">${AGES[s.age||1]||'Atelier'}</span>
+      <span class="k">Rang</span><span class="v">${(s.ranking&&s.ranking.rankName)||'—'}</span>
+      <span class="k">Progression vers ${nextAgeName(s)}</span><span class="v gold">${pr} %</span>
+      <span class="k">Régime</span><span class="v blue">${regimeLabel}</span>
+      <span class="k">Contradiction dominante</span><span class="v red">${dominantContradiction(s)}</span>
+    </div>
+    <div class="repsec">Compte du cycle</div>
+    <div class="led compte">
+      <span class="k">Capital au début</span><span class="v">${money(p.argent||0)}</span>
+      <span class="k">Résultat productif</span><span class="v ${net>=0?'gold':'red'}">${net>=0?'+ ':'− '}${money(Math.abs(net))}</span>
+      <span class="k">Frais / dette / État</span><span class="v red">${(d.interets||0)+(d.impot||0)>0?'− '+money((d.interets||0)+(d.impot||0)):'—'}</span>
+      <span class="k">Capital final</span><span class="v gold">${money(s.argent)}</span>
+      <span class="k">Dette finale</span><span class="v ${(s.dette||0)>0?'red':''}">${money(s.dette||0)}</span>
+    </div>
+    <div class="repsec">Production et réalisation</div>
+    <div class="led">
+      <span class="k">Produites</span><span class="v">${produites}</span>
+      <span class="k">Vendues</span><span class="v gold">${vendues}</span>
+      <span class="k">Invendues ce cycle</span><span class="v ${invendus>0?'red':''}">${invendus}</span>
+      <span class="k">Stocks totaux</span><span class="v ${(s.stocks||0)>70?'red':''}">${Math.round(s.stocks||0)}</span>
+      <span class="k">Prix unitaire</span><span class="v">${money2(s.prixUnitaire||0)}</span>
+      <span class="k">Part de marché</span><span class="v">${pct(d.partJoueur||0)}</span>
+    </div>
+    <div class="repsec">Travail et conflit</div>
+    <div class="led">
+      <span class="k">Ouvriers employés</span><span class="v">${s.travailleurs||0}</span>
+      <span class="k">Chômage</span><span class="v ${s.chomage>0.2?'red':''}">${pct(s.chomage||0)}</span>
+      <span class="k">Colère ouvrière</span><span class="v ${s.colere>0.55?'red':''}">${pct(s.colere||0)}</span>
+      <span class="k">Conscience collective</span><span class="v">${pct(s.conscience||0)}</span>
+    </div>
+    ${reqHtml}
+    <div class="repsec">Journal récent</div>
+    <div class="repchain">${recent || '<span class="lk">Aucun événement notable.</span>'}</div>
+    <div class="interp"><div class="veilline">Lecture marxienne</div>Le cycle n’est plus seulement un trajet : il transforme les rapports sociaux. Le bilan indique ce que l’accumulation a produit — profit, dette, stocks, conflit, régime.</div>
+    <button class="go" id="social-report-go">Continuer la période suivante ▸</button>`;
+  document.getElementById('report').classList.add('on'); refreshModalMode();
+  document.getElementById('social-report-go').onclick=()=>{ document.getElementById('report').classList.remove('on'); refreshModalMode();
+    if(typeof maybeShowFirstContradiction==='function') maybeShowFirstContradiction();   // v47 — phase 3
+    resumePlay(); };
+}
+function resolvePeriod(){
+  if(gameMode==='commune') return resolveCommunePeriod();
+  if(gameMode!=='socialFormation'||gameOver||anyModalOpen()) return;
+  playCycleAnimation(()=>{
+    cooldownReal=1.0;
+    runCycle();
+    const frais=fraisPeriode();
+    if(frais>0){ state.argent-=frais; pushLog('Période',`Frais d’installation : −${frais} £. L’atelier jeune accumule lentement — le temps joue contre lui.`,'warn'); }
+    state.actionsRestantes=3;
+    if(state.cycle>0 && state.cycle%4===0) state.annee=(state.annee||1)+1;
+    markPressureExperience(state);           // la Manufacture exige une contradiction traversée
+    const aged=checkAgeTransition();         // l'âge peut basculer (utilise les seuils post-cycle)
+    applyAgeRules(state);                    // règles structurelles de l'âge courant
+    updateSocialGroups(state); updateRegime(state); computeRanking(state);
+    evaluateHistoricalBifurcations(state); generativeChronicle();
+    CompetitorWorld.onPeriod();               // v48 : le monde avance — décisions autonomes des firmes
+    checkAlerts();                            // v47 : alertes progressives, par paliers
+    checkObjectives();
+    if(typeof buildSocialTableau==='function') buildSocialTableau();
+    renderFormationPanel(); renderCircuitBar(); updateConsequences();
+    if(!state._socialTutorialDone){
+      state._socialTutorialDone=true;
+      TutorialCoach.active=false;
+      TutorialCoach.hide();
+    } else tutorialCoachRefresh(true);
+    const toBilan=()=>{
+      showSocialCycleReport(aged);
+      checkEndgame();
+    };
+    if(state.enGreve) showGreveConflict(toBilan); else toBilan();
+  });
+}
+
+function enterSocialFormation(){
+  if(gameMode==='socialFormation') return;
+  gameMode='socialFormation';
+  state.actionsRestantes=3; state.annee=1; state.age=Math.max(1,state.age||1); state._pressureExperienced=!!state._pressureExperienced;
+  if(state.objIndex==null) state.objIndex=0; if(state.niveau==null) state.niveau=1;
+  if(!state.regime) initRegime(state);
+  if(!state.groups) initGroups(state);
+  const f=document.getElementById('formation'); if(f) f.classList.add('on');
+  const q=document.getElementById('quest'); if(q) q.style.display='none';
+  if(circuitLine) circuitLine.visible=false;
+  if(targetMarker) targetMarker.visible=false;
+  if(groundArrow) groundArrow.visible=false;
+  updateSocialGroups(state); computeRanking(state); updateRegime(state); renderFormationPanel(); renderCircuitBar();
+  if(typeof buildSocialTableau==='function') buildSocialTableau();
+  addHistoricalEvent('age','Naissance de la formation sociale : le circuit devient une contrainte systémique.');
+  CompetitorWorld.reveal();          // v48 : le monde dépasse le joueur — les autres capitaux apparaissent
+  tutorialCoachRefresh(true);
+  showConcept({stamp:'Formation sociale', title:'Le circuit devient diagnostic',
+    body:'<p>Tu as terminé la première boucle. Désormais, tu ne suis plus une route obligatoire : tu interviens dans une <b>formation sociale</b>.</p><p><b>Panneau de droite</b> : âge, objectif, contradictions, actions restantes. <b>Circuit du haut</b> : diagnostic des blocages. <b>Bouton tout en bas du panneau</b> : <i>Lancer le cycle productif</i>, pour transformer tes interventions en bilan.</p>',
+    unlock:['Haut : circuit diagnostic','Droite : Formation sociale','3 interventions / période','Bas du panneau : Lancer le cycle productif']});
+}
+
+function renderCommunePanel(){
+  const c=state.commune; if(!c) return;
+  const hx=cc=>'#'+((cc>>>0)&0xffffff).toString(16).padStart(6,'0');
+  set('f-time',`An ${c.an} de la Commune`);
+  set('f-age','La Commune'); set('f-rank','Producteurs associés');
+  set('f-level','Commune'); set('f-obj','Coordonner le travail aux besoins');
+  const couv=Math.min(1,(c.production+c.stocksCommuns)/Math.max(1,c.besoins));
+  set('f-nextage','besoins couverts'); set('f-progpct',Math.round(couv*100)+' %');
+  const pr=document.getElementById('f-prog'); if(pr) pr.style.width=Math.round(couv*100)+'%';
+  let contra='Coordonner le travail aux besoins';
+  if(c.bureaucratie>0.55) contra='Danger : la bureaucratie se sépare de la base';
+  else if(c.penurie>0.5) contra='Danger : la pénurie use la Commune';
+  else if(c.participation<0.35) contra='Danger : l’apathie démocratique';
+  set('f-contra','Tension : '+contra);
+  set('f-regime','Logique : association libre · plus d’accumulation');
+  set('f-rules','Couvrir les besoins · démocratie vivante · pas d’appareil séparé');
+  const gz=[['Besoins couverts',couv,COL.or],['Coordination',c.coordination,COL.bleu],
+    ['Pénurie',c.penurie,COL.rouge],['Participation',c.participation,COL.vert],
+    ['Bureaucratie',c.bureaucratie,COL.crise]];
+  const gel=document.getElementById('f-gauges'); if(gel) gel.innerHTML=gz.map(g=>
+    `<div class="gz"><span class="gn">${g[0]}</span><span class="gb"><i style="width:${Math.round(clamp(g[1])*100)}%;background:${hx(g[2])}"></i></span></div>`).join('');
+  const grpEl=document.getElementById('f-groups'); if(grpEl) grpEl.innerHTML='';
+  set('f-actnum',`${state.actionsRestantes} / 3`);
+  const dots=document.getElementById('f-actdots'); if(dots) dots.innerHTML=[0,1,2].map(i=>`<div class="dot${i>=state.actionsRestantes?' used':''}"></div>`).join('');
+  const cb=document.getElementById('f-cyclebox'), ch=document.getElementById('f-cyclehint');
+  if(cb) cb.classList.toggle('ready', (state.actionsRestantes||0)<=0);
+  if(ch) ch.textContent=(state.actionsRestantes||0)<=0 ? 'Maintenant : lance le cycle' : 'Après tes actions : lance le cycle';
+  renderHistLog();
+}
+function renderFormationPanel(){
+  if(gameMode==='commune') return renderCommunePanel();
+  if(gameMode!=='socialFormation') return;
+  if(typeof updateVilleBadge==='function') updateVilleBadge();
+  const s=state, rk=s.ranking||computeRanking(s);
+  set('f-time',`Cycle ${s.cycle} · An ${s.annee||1}`);
+  set('f-age',AGES[s.age||1]||'Atelier'); set('f-rank',rk.rankName); set('f-nextage',nextAgeName(s));
+  set('f-level','Niveau '+(s.niveau||1));
+  const ob=currentObjective(s); set('f-obj', ob?('Objectif : '+ob.label+'  ·  +'+money(ob.r)):'Tous les objectifs accomplis');
+  const p=Math.round(ageProgress(s)*100); set('f-progpct',p+' %');
+  const pr=document.getElementById('f-prog'); if(pr) pr.style.width=p+'%';
+  const reqEl=document.getElementById('f-reqs');
+  if(reqEl){
+    const reqs=ageRequirements(s);
+    if(reqs.length){ reqEl.style.display='block'; reqEl.innerHTML='<div class="ah">Passage vers '+nextAgeName(s)+'</div>'+reqs.map(r=>{
+        const cls=r.done?'done':(r.score<0.35?'block':'');
+        return `<div class="req ${cls}"><span>${r.done?'✓':'□'} ${r.label}</span><span class="rv">${r.value}</span></div>`;
+      }).join(''); }
+    else { reqEl.style.display='none'; reqEl.innerHTML=''; }
+  }
+  set('f-contra','Contradiction dominante : '+dominantContradiction(s));
+  set('f-regime','Régime : '+(REGIME_LABEL[s.regime?s.regime.type:'liberal']||'—'));
+  set('f-rules', s.ageRules||AGE_RULES_DESC[s.age||1]||'—');
+  const hx=c=>'#'+((c>>>0)&0xffffff).toString(16).padStart(6,'0');
+  const gz=[['Productive',rk.productivePower,COL.brun],['Débouchés',rk.marketPower,COL.or],
+    ['Dette',clamp(s.dette/600),COL.rouge],['Org. ouvrière',(s.regime?s.regime.workerPower:0),COL.bleu],
+    ['Stabilité pol.',rk.politicalStability,COL.vert],['Risque crise',rk.crisisRisk,COL.crise]];
+  const gel=document.getElementById('f-gauges'); if(gel) gel.innerHTML=gz.map(g=>
+    `<div class="gz"><span class="gn">${g[0]}</span><span class="gb"><i style="width:${Math.round(clamp(g[1])*100)}%;background:${hx(g[2])}"></i></span></div>`).join('');
+  set('f-actnum',`${s.actionsRestantes} / 3`);
+  const dots=document.getElementById('f-actdots'); if(dots) dots.innerHTML=[0,1,2].map(i=>`<div class="dot${i>=s.actionsRestantes?' used':''}"></div>`).join('');
+  const rb=document.getElementById('f-resolve');
+  if(rb){ rb.textContent='Lancer le cycle productif ▸'; rb.title='Transforme tes interventions en production, vente, dette, stocks et conflit social.'; }
+  const cb=document.getElementById('f-cyclebox'), ch=document.getElementById('f-cyclehint');
+  if(cb) cb.classList.toggle('ready', (s.actionsRestantes||0)<=0);
+  if(ch) ch.textContent=(s.actionsRestantes||0)<=0 ? 'Maintenant : lance le cycle' : 'Après tes actions : lance le cycle';
+  const grpEl=document.getElementById('f-groups');
+  if(grpEl && s.groups){ grpEl.innerHTML='<div class="fgh">Forces sociales</div>'+GROUP_VIEW.map(v=>{
+      const gg=s.groups[v[1]]||{}; const force=clamp(gg.force||0); const sat=(gg.satisfaction!=null?gg.satisfaction:0.5);
+      const tip=(gg.satisfaction!=null)?(sat>0.55?'satisfait':sat<0.4?'mécontent':'tendu'):'';
+      return `<div class="gz"><span class="gn">${v[0]}</span><span class="gb"><i style="width:${Math.round(force*100)}%;background:${hx(v[3])}"></i></span><span class="sat" title="${tip}" style="opacity:${(0.3+sat*0.7).toFixed(2)}">●</span></div>`;
+    }).join('');
+    const w=s.groups.workers||{}, bk=s.groups.bankers||{}; const ranc=w.rancune||0, conf=w.confiance||0, mef=bk.mefiance||0;
+    const memW = ranc>0.45?'<b style="color:'+hx(COL.rouge)+'">rancune tenace</b>':conf>0.45?'<b style="color:'+hx(COL.vert)+'">confiance</b>':ranc>0.2?'méfiance':'—';
+    const memB = mef>0.45?' · banque : <b style="color:'+hx(COL.or)+'">méfiante</b>':'';
+    grpEl.innerHTML+=`<div class="fmem">Mémoire ouvrière : ${memW}${memB}</div>`;
+  }
+  CompetitorWorld.renderRanking();   // v48 : classement industriel
+  renderHistLog();
+  if(state._socialTutorialDone) TutorialCoach.hide();
+  else tutorialCoachRefresh();
+}
+
+// boutons (les éléments existent dans le HTML)
+(function wireFormation(){
+  const rb=document.getElementById('f-resolve'); if(rb) rb.addEventListener('click',resolvePeriod);
+  // v47 : repli/dépli des détails de la formation sociale
+  const dt=document.getElementById('f-details-toggle'), dd=document.getElementById('f-details');
+  if(dt&&dd) dt.addEventListener('click',()=>{ const on=dd.style.display==='none';
+    dd.style.display=on?'block':'none'; dt.textContent=(on?'▾':'▸')+' Détails de la formation sociale'; });
+  const zc=document.getElementById('za-close'); if(zc) zc.addEventListener('click',()=>{ document.getElementById('zoneact').classList.remove('on'); refreshModalMode(); tutorialCoachRefresh(true); });
+  const cic=document.getElementById('ci-close'); if(cic) cic.addEventListener('click',closeCircuitInfo);
+  const cip=document.getElementById('circuit-info'); if(cip) cip.addEventListener('click',e=>{ if(e.target===cip) closeCircuitInfo(); });
+})();
+
+let _coachTick=0;
+function loop(){
+  requestAnimationFrame(loop);
+  const dt=Math.min(0.05,clock.getDelta()); t+=dt;
+  _coachTick+=dt; if(_coachTick>0.35){ _coachTick=0; tutorialCoachRefresh(); }
+  Vehicle.update(dt,Input);
+  CameraController.update();
+  handleZones(dt);
+  cooldownReal=Math.max(0,cooldownReal-dt);
+  if(flashTimer>0){ flashTimer-=dt; document.getElementById('flash').style.opacity=Math.max(0,flashTimer); }
+  // balise du prochain lieu
+  if(targetMarker&&targetMarker.visible){
+    targetMarker.userData.cone.position.y=16+Math.sin(t*2.4)*0.8;
+    targetMarker.userData.cone.rotation.y=t*1.6;
+    targetMarker.userData.beam.material.opacity=0.22+0.14*Math.sin(t*2.4);
+  }
+  updateGroundArrow();
+  const prod=Math.min(1.7, state.heures/10);     // intensité de production -> fumée
+  const risk=state.d.risqueCrise||0;             // spéculation -> bulles
+  if(shouldRunHeavySceneEffects()){
+    scene.traverse(o=>{
+      if(o.userData&&o.userData.smoke){ o.position.y=15.5+Math.sin(t*1.5+o.position.x)*0.6*prod;
+        o.material.opacity=Math.max(0.05,(0.25+Math.sin(t*2+o.position.x)*0.12)*prod); o.scale.setScalar(0.7+0.5*prod); }
+      if(o.userData&&o.userData.bubble!==undefined){ const amp=0.25+risk*0.9;
+        o.scale.setScalar((1+amp*Math.sin(t*1.2+o.userData.bubble*2))*(1+risk*0.6));
+        o.material.opacity=0.5+0.3*Math.sin(t*1.2+o.userData.bubble*2); }
+      if(o.userData&&o.userData.pulse){ o.scale.setScalar(0.8+0.4*Math.sin(t*4)); }
+    });
+  }
+  CompetitorWorld.ambient(dt);        // v49 : flux des autres capitaux vers les marchés communs
+  CompetitorWorld.updateCommuters(dt);// v53 : navetteurs quartier ouvrier -> chaque usine
+  CityGrowth.updateRails(dt);         // v54 : wagon navette usines -> port
+  WorldBeauty.update(dt);             // v56 : nuages, oiseaux, tangage des bateaux
+  DayCycle.update();                  // v57 : la lumière du jour respire
+  updateWindowGlow();                 // v62 : les fenêtres de la ville s'allument la nuit
+  Atmosphere.update(dt);              // v58 : brume + position du soleil
+  PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
+  AmbientSound.update(dt);            // v58 : mixage par proximité
+  updateLwTweens();
+  updateLivingWorld(dt);
+  updateInteractiveProps(dt);
+  updateFx();
+  updateFloaters();
+  if(pendingEnterSF && !anyModalOpen()){ pendingEnterSF=false; enterSocialFormation(); }
+  if(composer) composer.render(); else renderer.render(scene,camera);
+}
+
+// M0 — init() est appelé depuis src/main.js après le préchargement des assets.
+
+/* ----------------------------------------------------------------------
+   Exports : ré-exposés par les facades src/{world,vehicle,camera,input,
+   ui,sim,fx}/ pour respecter le découpage annoncé. Les variables `let`
+   exportées (scene, renderer, camera, composer) sont des "live bindings"
+   ES — les modules clients lisent toujours la valeur courante.
+   ---------------------------------------------------------------------- */
+export {
+  THREE,
+  // World
+  buildWorld, defineZone, zones, zoneGroups, obstacles, HALF,
+  // Boucle de rendu
+  scene, renderer, camera, composer, bloomPass,
+  // Acteurs principaux
+  Vehicle, CameraController, Input, KEYMAP,
+  // Simulation (stub)
+  SimulationState, ProductionSystem, CompetitionSystem, MarketSystem,
+  LaborSystem, CrisisSystem, CreditSystem, StateSystem,
+  CapitalCircuit, EventLog, MiniCircuit, runCycle, state, log, circuit,
+  // UI
+  updateHUD, updateMarx, renderLeviers, renderCircuitBar, renderQuest,
+};

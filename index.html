@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Le Circuit du Capital — Prototype 3D v66</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23e9ddc6'/%3E%3Ctext x='8' y='12' text-anchor='middle' font-size='12' font-family='monospace' fill='%238a2c1d'%3E%C2%A3%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@600;700&family=Spectral:ital@0;1&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --papier:#e9ddc6; --encre:#241f17; --rouge:#8a2c1d; --or:#a8812c;
+    --bleu:#4d5f70; --brun:#5a4530;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#cfc4ab;
+    font-family:"Spectral",Georgia,serif;color:var(--encre)}
+  #app{position:fixed;inset:0}
+  #app::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:5;
+    background:radial-gradient(ellipse at center, rgba(36,31,23,0) 56%, rgba(36,31,23,0.17) 100%)}
+  canvas{display:block}
+
+  /* ---- HUD ---- */
+  .hud{position:fixed;top:14px;left:14px;z-index:10;background:rgba(233,221,198,.92);
+    border:1.5px solid var(--encre);box-shadow:3px 4px 0 rgba(36,31,23,.25);
+    padding:10px 13px;min-width:190px;backdrop-filter:blur(2px)}
+  .hud h1{font-family:"Zilla Slab",serif;font-size:14px;letter-spacing:1px;margin:0 0 8px;
+    text-transform:uppercase;border-bottom:2px solid var(--encre);padding-bottom:5px}
+  .hud .r{display:flex;justify-content:space-between;gap:14px;font-size:13px;padding:2px 0}
+  .hud .r b{font-family:"IBM Plex Mono",monospace}
+  .hud .r .gold{color:var(--or)} .hud .r .red{color:var(--rouge)} .hud .r .blue{color:var(--bleu)}
+  /* v47 — deltas du dernier cycle + couleurs de seuil (vert implicite / ambre / rouge) */
+  .hud .r .delta{font:600 10px "IBM Plex Mono",monospace;font-style:normal;min-width:34px;text-align:right}
+  .hud .r .delta.up{color:#5a6e3a}.hud .r .delta.dn{color:var(--rouge)}
+  .hud .r b.warnv{color:#8a6b1f}.hud .r b.dangerv{color:var(--rouge);animation:hudpulse 1.4s ease-in-out infinite}
+  .hud .r.hobj{border-top:1px dashed rgba(36,31,23,.35);margin-top:4px;padding-top:5px}
+  @keyframes hudpulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+  /* ---- journal historique : bouton minimal (fermé par défaut) ---- */
+  .log{position:fixed;bottom:14px;left:14px;z-index:10}
+  .log #log-open{font-family:"Zilla Slab",serif;font-size:12px;letter-spacing:.5px;text-transform:uppercase;
+    border:1.5px solid var(--encre);background:rgba(233,221,198,.92);color:var(--encre);cursor:pointer;
+    box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:7px 12px}
+  .log #log-open:hover{background:var(--encre);color:var(--papier)}
+  .log #chantier-btn{display:block;margin-bottom:8px;font-family:"Zilla Slab",serif;font-size:12px;
+    letter-spacing:.5px;text-transform:uppercase;border:1.5px solid var(--encre);background:var(--rouge);
+    color:var(--papier);cursor:pointer;box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:7px 12px}
+  .log #chantier-btn:hover{filter:brightness(1.12)}
+
+  /* ---- invite de zone ---- */
+  .prompt{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:10;
+    background:var(--encre);color:var(--papier);font-family:"Zilla Slab",serif;font-weight:600;
+    padding:8px 16px;letter-spacing:.5px;opacity:0;transition:.2s;pointer-events:none;white-space:nowrap}
+  .prompt.on{opacity:1}
+  .prompt small{display:block;font-weight:400;font-style:italic;opacity:.8;font-size:12px;letter-spacing:0}
+
+  /* ---- aide / paramètres : fermé par défaut pour libérer Formation sociale ---- */
+  .help{position:fixed;top:14px;right:14px;z-index:90;width:286px;text-align:right;font-size:12px;line-height:1.7;pointer-events:auto}
+  .help #settings-toggle{font-family:"Zilla Slab",serif;font-size:12px;letter-spacing:.7px;text-transform:uppercase;pointer-events:auto;
+    border:1.5px solid var(--encre);background:rgba(233,221,198,.94);color:var(--encre);cursor:pointer;
+    box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:7px 11px}
+  .help #settings-toggle:hover{background:var(--encre);color:var(--papier)}
+  .help .help-panel{display:none;margin-top:8px;background:rgba(233,221,198,.96);border:1.5px solid var(--encre);pointer-events:auto;
+    box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:8px 11px;min-width:286px;text-align:left}
+  .help.open .help-panel{display:block}
+  .help kbd{font-family:"IBM Plex Mono",monospace;border:1px solid var(--encre);border-bottom-width:2px;
+    border-radius:3px;padding:0 5px;background:var(--papier);font-size:11px}
+  .help .hsep{border-top:1px solid #bdab8b;margin:6px 0 5px;padding-top:5px;font-style:italic;opacity:.78}
+  @media (max-width:1180px){.help{right:14px;top:14px;bottom:auto;width:286px}.help .help-panel{min-width:286px}}
+
+  /* ---- voile de démarrage ---- */
+  .gate{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;background:rgba(207,196,171,.96);text-align:center;cursor:pointer}
+  .gate h2{font-family:"Zilla Slab",serif;font-size:30px;margin:0}
+  .gate .f{font-family:"IBM Plex Mono",monospace;font-size:16px;margin:8px 0 22px;letter-spacing:1px}
+  .gate .f b{color:var(--rouge)}
+  .gate .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:15px;border:2px solid var(--encre);
+    padding:10px 22px;background:var(--rouge);color:var(--papier);letter-spacing:1px}
+  .gate small{display:block;margin-top:16px;font-style:italic;opacity:.7}
+  .gate.hidden{opacity:0;pointer-events:none;transition:.4s}
+  /* M0 — barre de chargement insérée dans le gate, neutre vis-à-vis du rendu jeu */
+  .gate .lbar{width:min(420px,72vw);height:6px;border:1.5px solid var(--encre);background:rgba(36,31,23,.08);margin-top:14px;position:relative;overflow:hidden}
+  .gate .lbar i{display:block;height:100%;background:var(--rouge);width:0%;transition:width .15s linear}
+  .gate .lmsg{margin-top:8px;font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.5px;opacity:.78}
+  .gate .lerr{margin-top:8px;font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--rouge);min-height:14px;text-align:center;max-width:80vw}
+
+  /* ---- bloc marxien (révélé par V) ---- */
+  .veilline{font-style:italic;font-size:11px;color:var(--encre);opacity:.7;border-top:2px solid var(--rouge);
+    margin-top:7px;padding-top:5px;text-transform:uppercase;letter-spacing:1px}
+  #marxbox .r b.red{color:var(--rouge)}
+
+  #flash{position:fixed;inset:0;background:var(--rouge);opacity:0;pointer-events:none;z-index:15;
+    mix-blend-mode:multiply;transition:opacity .1s}
+  #marxbox{max-height:40vh;overflow-y:auto}
+  /* petits écrans : on resserre les colonnes pour éviter tout chevauchement */
+  @media (max-height:780px){
+    .quest{top:158px} .whap{top:170px}
+  }
+  @media (max-width:1180px){
+    .quest{width:198px} .whap{width:250px}
+  }
+
+  /* ---- barre de progression du circuit (haut, centre) ---- */
+  .circuit{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:11;
+    display:flex;align-items:center;gap:0;background:rgba(233,221,198,.94);
+    border:1.5px solid var(--encre);box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:7px 10px}
+  .circuit .stp{display:flex;flex-direction:column;align-items:center;min-width:46px;opacity:.5;transition:.25s}
+  .circuit .stp .sym{font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:16px;
+    width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+    border:1.5px solid var(--encre);background:var(--papier)}
+  .circuit .stp .nm{font-size:9px;letter-spacing:.3px;text-transform:uppercase;margin-top:3px;white-space:nowrap}
+  .circuit .stp.done{opacity:.9}
+  .circuit .stp.done .sym{background:var(--encre);color:var(--papier)}
+  .circuit .stp.now{opacity:1}
+  .circuit .stp.now .sym{background:var(--rouge);color:var(--papier);border-color:var(--rouge);
+    animation:pulseStep 1.1s ease-in-out infinite}
+  @keyframes pulseStep{0%,100%{box-shadow:0 0 0 0 rgba(138,44,29,.5)}50%{box-shadow:0 0 0 6px rgba(138,44,29,0)}}
+  .circuit .arr{font-family:"IBM Plex Mono",monospace;opacity:.45;margin:0 1px 14px;font-size:13px}
+
+  .circuit .stp{border:0;background:transparent;color:inherit;padding:0;font:inherit}
+  .circuit .stp:focus-visible .sym{outline:2px solid var(--or);outline-offset:2px}
+  .circuit .stp:hover .sym{transform:translateY(-1px);box-shadow:2px 3px 0 rgba(36,31,23,.22)}
+
+  /* ---- panneau Objectif actuel (sous l'aide clavier, à droite) ---- */
+  .quest{position:fixed;top:172px;right:14px;z-index:10;width:218px;
+    background:rgba(233,221,198,.94);border:1.5px solid var(--encre);
+    border-left:5px solid var(--rouge);box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:10px 12px}
+  .quest .qt{font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;
+    border-bottom:2px solid var(--encre);padding-bottom:4px;margin-bottom:6px;display:flex;justify-content:space-between}
+  .quest .qt b{color:var(--rouge)}
+  .quest .qgoal{font-size:13px;line-height:1.4;margin:0 0 6px}
+  .quest .qrow{font-size:12px;display:flex;gap:6px;padding:1px 0}
+  .quest .qrow .lab{font-family:"Zilla Slab",serif;text-transform:uppercase;letter-spacing:.5px;
+    font-size:10px;min-width:62px;opacity:.7}
+  .quest .qrow.rew .lab{color:var(--or)} .quest .qrow.risk .lab{color:var(--rouge)}
+  .quest .qnext{margin-top:7px;border-top:1px solid #bdab8b;padding-top:6px;font-size:12px;font-style:italic}
+  .quest .qgauge{font-style:normal;font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--bleu);
+    margin-bottom:4px;line-height:1.4}
+  .quest .qnext b{font-style:normal;font-family:"IBM Plex Mono",monospace;color:var(--rouge)}
+  .quest .solist{margin-bottom:6px}
+  .quest .solist .so{font-size:11px;font-style:normal;padding:1px 0;opacity:.7}
+  .quest .solist .so.done{opacity:1;color:var(--vert,#475a44)}
+
+  /* gestionnaire d'interface : une modale ouverte masque les panneaux flottants */
+  body.modal-open .quest,
+  body.modal-open .whap,
+  body.modal-open #levers,
+  body.modal-open #formation,
+  body.modal-open #prompt { display:none !important; }
+
+  /* panneaux latéraux adaptatifs */
+  .quest{max-height:42vh;overflow-y:auto}
+  .whap{max-height:46vh;overflow-y:auto}
+  @media (max-height:680px){
+    .quest{top:auto;bottom:12px;max-height:38vh}
+  }
+  @media (max-width:760px){
+    .quest{width:172px;font-size:11px}
+    .levers{width:210px;bottom:54px}
+  }
+
+  /* QA interne */
+  #qa{position:fixed;left:8px;bottom:8px;z-index:60;background:rgba(36,31,23,.86);color:#e9ddc6;
+    font-family:"IBM Plex Mono",monospace;font-size:10px;line-height:1.5;padding:6px 8px;
+    border:1px solid #b8924a;max-width:260px;white-space:pre;display:none}
+  body.qa #qa{display:block}
+
+  /* ---- statut du lieu de production (lecture seule, sans conflit avec Formation sociale) ---- */
+  .levers{position:fixed;bottom:58px;left:14px;right:auto;z-index:11;width:238px;
+    background:rgba(233,221,198,.94);border:1.5px solid var(--encre);
+    box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:9px 11px}
+  .levers .lt{font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;
+    border-bottom:2px solid var(--encre);padding-bottom:4px;margin-bottom:6px}
+  .levers .lv{display:flex;justify-content:space-between;align-items:center;font-size:13px;padding:2px 0}
+  .levers .lv b{font-family:"IBM Plex Mono",monospace}
+  .levers .lhint{font-size:11px;font-style:italic;opacity:.7;margin-top:7px;border-top:1px solid #bdab8b;padding-top:6px}
+  .levers .lhint b{font-style:normal;color:var(--rouge)}
+
+  /* ---- bouton "ouvrir le journal complet" + toggle mode guidé ---- */
+  .log .t{display:flex;justify-content:space-between;align-items:center}
+  .log .t button{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.5px;
+    border:1px solid var(--encre);background:var(--papier);color:var(--encre);cursor:pointer;
+    padding:1px 6px;text-transform:none}
+  .log .t button:hover{background:var(--encre);color:var(--papier)}
+  .help .guidetog{display:flex;align-items:center;gap:5px;justify-content:flex-end;margin-top:5px;
+    border-top:1px solid #bdab8b;padding-top:5px;cursor:pointer;font-size:12px}
+  .help .guidetog input{accent-color:var(--rouge);cursor:pointer}
+
+  /* ---- panneau "Ce qui vient de se passer" (colonne gauche, sous le tableau de bord) ---- */
+  .whap{position:fixed;left:14px;top:184px;z-index:12;width:288px;
+    background:rgba(233,221,198,.96);border:1.5px solid var(--encre);border-top:5px solid var(--rouge);
+    box-shadow:4px 6px 0 rgba(36,31,23,.28);padding:11px 13px;display:none}
+  .whap.on{display:block;animation:whapIn .25s ease-out}
+  @keyframes whapIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+  .whap .wt{font-family:"Zilla Slab",serif;font-size:12px;letter-spacing:1px;text-transform:uppercase;
+    border-bottom:2px solid var(--encre);padding-bottom:5px;margin-bottom:8px;
+    display:flex;justify-content:space-between;align-items:center}
+  .whap .wt button{border:none;background:none;font-size:13px;cursor:pointer;color:var(--encre);line-height:1;padding:0}
+  .whap .wt .wbtns{display:flex;gap:10px;align-items:center}
+  .whap .wt #whap-expand{font-family:"IBM Plex Mono",monospace;font-size:10px;text-transform:none;
+    letter-spacing:.3px;display:none;border:1px solid var(--encre);padding:1px 5px}
+  .whap .wt #whap-expand:hover{background:var(--encre);color:var(--papier)}
+  .whap .wt #whap-x{font-size:15px}
+  .whap .wblk{margin:0 0 9px}
+  .whap .wlab{font-family:"Zilla Slab",serif;font-size:10px;letter-spacing:1px;text-transform:uppercase;
+    opacity:.65;margin-bottom:3px}
+  .whap .wlab.eff{color:var(--bleu);opacity:1}
+  .whap .wlab.marxl{color:var(--rouge);opacity:1}
+  .whap p{margin:0;font-size:13.5px;line-height:1.45}
+  .whap .marx p,.whap p#whap-marx{font-style:italic}
+  .whap .marx{border-left:4px solid var(--rouge);padding-left:9px;margin-bottom:0}
+  .whap .wtags{display:flex;flex-wrap:wrap;gap:5px}
+  .whap .wtags span{font-family:"IBM Plex Mono",monospace;font-size:12px;padding:2px 7px;
+    border:1px solid var(--encre);background:var(--papier)}
+  .whap .wtags span.up{border-color:var(--vert,#475a44);color:var(--vert,#475a44)}
+  .whap .wtags span.dn{border-color:var(--rouge);color:var(--rouge)}
+  .whap .wchain{font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.6}
+  .whap .wchain .lk{display:block;padding-left:14px;position:relative}
+  .whap .wchain .lk:before{content:"↳";position:absolute;left:0;opacity:.55;color:var(--rouge)}
+  .whap .wchain .lk.head{padding-left:0;font-weight:600}
+  .whap .wchain .lk.head:before{content:""}
+  /* version compacte : seule l'action reste visible, le reste se replie */
+  .whap.compact{width:248px}
+  .whap.compact .wblk:not(:first-of-type){display:none!important}
+  .whap.compact #whap-expand{display:inline-block}
+  .whap.compact .wblk:first-of-type{margin-bottom:0}
+
+  /* ---- écran de concept (révélations majeures) ---- */
+  .concept{position:fixed;inset:0;z-index:41;display:none;align-items:center;justify-content:center;
+    background:rgba(36,31,23,.55)}
+  .concept.on{display:flex}
+  .concept .cpanel{background:var(--papier);border:2px solid var(--encre);box-shadow:8px 10px 0 rgba(36,31,23,.35);
+    padding:30px 34px;width:min(540px,92vw);text-align:left;position:relative}
+  .concept .cstamp{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;
+    color:var(--rouge);margin-bottom:8px}
+  .concept h2{font-family:"Zilla Slab",serif;font-size:30px;margin:0 0 18px;letter-spacing:.5px;line-height:1.1}
+  .concept .cbody p{font-size:15px;line-height:1.55;margin:0 0 12px}
+  .concept .cbody p b{color:var(--rouge)}
+  .concept .cbody .formula{font-family:"IBM Plex Mono",monospace;font-size:17px;letter-spacing:1.5px;
+    text-align:center;margin:14px 0;opacity:.9}
+  .concept .cbody .formula b{color:var(--rouge)}
+  .concept .cunlock{font-family:"Zilla Slab",serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+    font-size:13px;border:2px solid var(--rouge);color:var(--rouge);padding:9px 12px;margin:6px 0 18px;
+    display:flex;flex-direction:column;gap:4px}
+  .concept .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:10px 20px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer}
+
+  /* ---- Choisir une amélioration ---- */
+  .upgrade{position:fixed;inset:0;z-index:34;display:none;align-items:center;justify-content:center;
+    background:rgba(36,31,23,.5)}
+  .upgrade.on{display:flex}
+  .upgrade .upanel{background:var(--papier);border:2px solid var(--encre);box-shadow:8px 10px 0 rgba(36,31,23,.35);
+    padding:24px 28px;width:min(720px,94vw);max-height:88vh;overflow-y:auto}
+  .upgrade .ustamp{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;
+    color:var(--rouge);margin-bottom:6px}
+  .upgrade h2{font-family:"Zilla Slab",serif;font-size:25px;margin:0 0 6px;letter-spacing:.5px}
+  .upgrade .usub{font-style:italic;font-size:13px;opacity:.82;margin:0 0 8px;line-height:1.4}
+  .upgrade .ucapital{font-family:"IBM Plex Mono",monospace;font-size:13px;margin:0 0 14px}
+  .upgrade .ucapital b{color:var(--or)}
+  .upgrade .ucheck{margin-top:8px;border-top:1px solid #cbbf9f;padding-top:8px}
+  .upgrade .ucheck .so{font-size:12px;padding:1px 0;opacity:.7}
+  .upgrade .ucheck .so.done{opacity:1;color:var(--vert,#475a44)}
+  .upgrade .skip:disabled{opacity:.4;cursor:not-allowed}
+  .upgrade .udeck{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+  .upgrade .ucard{border:1.5px solid var(--encre);background:rgba(255,250,240,.6);padding:11px 12px;text-align:left;
+    cursor:pointer;display:flex;flex-direction:column;gap:5px;box-shadow:2px 3px 0 rgba(36,31,23,.18);font:inherit}
+  .upgrade .ucard:hover:not(:disabled){background:var(--encre);color:var(--papier)}
+  .upgrade .ucard:hover:not(:disabled) .ucost{color:var(--papier)}
+  .upgrade .ucard:disabled{opacity:.4;cursor:not-allowed}
+  .upgrade .ucard .uct{font-family:"Zilla Slab",serif;font-weight:700;font-size:15px;display:flex;
+    justify-content:space-between;align-items:baseline;gap:6px}
+  .upgrade .ucard .ulvl{font-family:"IBM Plex Mono",monospace;font-size:10px;opacity:.6;font-weight:500}
+  .upgrade .ucard .ucost{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--or)}
+  .upgrade .ucard .ueff{font-size:12px;line-height:1.35}
+  .upgrade .ucard .ueff .ef{color:var(--vert,#475a44);font-weight:600}
+  .upgrade .ucard .ueff .cq{color:var(--rouge)}
+  .upgrade .ucard .uvis{font-size:11px;font-style:italic;opacity:.7;border-top:1px solid #cbbf9f;padding-top:4px;margin-top:2px}
+  .upgrade .skip{margin-top:16px;font-family:"Zilla Slab",serif;font-weight:700;font-size:13px;border:2px solid var(--encre);
+    padding:8px 16px;background:var(--papier);color:var(--encre);letter-spacing:.5px;cursor:pointer}
+  .upgrade .skip:hover{background:var(--encre);color:var(--papier)}
+  .upgrade .result{text-align:left}
+  .upgrade .ureffects{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 14px}
+  .upgrade .ureffects span{font-family:"IBM Plex Mono",monospace;font-size:12px;padding:2px 8px;border:1px solid var(--encre)}
+  .upgrade .ureffects .ef{border-color:var(--vert,#475a44);color:var(--vert,#475a44)}
+  .upgrade .ureffects .cq{border-color:var(--rouge);color:var(--rouge)}
+  .upgrade .urmarx{font-style:italic;font-size:15px;line-height:1.55;border-left:4px solid var(--rouge);
+    padding:4px 0 4px 12px;margin:0 0 18px}
+  .upgrade .urmarx b{font-style:normal;color:var(--rouge)}
+  .upgrade .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:10px 20px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer}
+
+  /* ---- badge niveau de ville ---- */
+  .villebadge{position:fixed;bottom:60px;left:14px;z-index:10;width:190px;background:rgba(233,221,198,.92);border:1.5px solid var(--encre);box-shadow:2px 3px 0 rgba(36,31,23,.22);
+    padding:5px 12px;text-align:left;line-height:1.2}
+  .villebadge .vlab{display:block;font-family:"Zilla Slab",serif;font-size:9px;letter-spacing:1px;text-transform:uppercase;opacity:.6}
+  .villebadge .vval{font-family:"IBM Plex Mono",monospace;font-size:12px}
+  .villebadge .vval b{color:var(--rouge);font-size:14px}
+  .log .villebadge{position:static;display:block;margin:0 0 8px 0;width:190px;min-width:190px}
+
+  /* ---- journal complet (modale) ---- */
+  .journal{position:fixed;inset:0;z-index:32;display:none;align-items:center;justify-content:center;
+    background:rgba(207,196,171,.82)}
+  .journal.on{display:flex}
+  .journal .jpanel{background:var(--papier);border:2px solid var(--encre);box-shadow:6px 8px 0 rgba(36,31,23,.3);
+    padding:22px 26px;width:min(560px,92vw);max-height:84vh;display:flex;flex-direction:column}
+  .journal h3{font-family:"Zilla Slab",serif;font-size:22px;margin:0;letter-spacing:.5px;text-transform:uppercase}
+  .journal .jsub{font-style:italic;font-size:13px;opacity:.8;margin:4px 0 12px}
+  .journal .jbody{overflow-y:auto;border-top:1px solid #bdab8b;padding-top:10px;margin-bottom:14px}
+  .journal .jbody p{font-size:13.5px;line-height:1.5;margin:0 0 9px;font-style:italic}
+  .journal .jbody p b{font-style:normal}
+  .journal .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:9px 18px;background:var(--encre);color:var(--papier);letter-spacing:1px;cursor:pointer;align-self:flex-start}
+
+  /* ---- mode guidé : pause explicative ---- */
+  .guide{position:fixed;inset:0;z-index:33;display:none;align-items:center;justify-content:center;
+    background:rgba(36,31,23,.34)}
+  .guide.on{display:flex}
+  .guide .gpanel{background:var(--papier);border:2px solid var(--encre);box-shadow:6px 8px 0 rgba(36,31,23,.3);
+    padding:24px 28px;width:min(440px,92vw);text-align:left;position:relative}
+  .guide .gsym{position:absolute;top:-18px;left:24px;font-family:"IBM Plex Mono",monospace;font-weight:600;
+    font-size:20px;width:44px;height:44px;display:flex;align-items:center;justify-content:center;
+    background:var(--rouge);color:var(--papier);border:2px solid var(--encre)}
+  .guide h3{font-family:"Zilla Slab",serif;font-size:21px;margin:14px 0 14px;letter-spacing:.5px}
+  .guide .gblk{margin:0 0 11px}
+  .guide .glab{font-family:"Zilla Slab",serif;font-size:10px;letter-spacing:1px;text-transform:uppercase;
+    opacity:.6;margin-bottom:2px}
+  .guide .glab.todo{color:var(--bleu);opacity:1}
+  .guide .glab.marxl{color:var(--rouge);opacity:1}
+  .guide .gblk p{margin:0;font-size:14px;line-height:1.45}
+  .guide .gblk:last-of-type p{font-style:italic}
+  .guide .go{margin-top:6px;font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:9px 18px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer}
+
+  /* ---- infobulles barre circuit + noms complets cycle 1 ---- */
+  .circuit .stp{cursor:help}
+  /* circuit en mode diagnostic (formation sociale) */
+  .circuit .stp.alert .sym{background:var(--rouge);color:var(--papier);border-color:var(--rouge);
+    animation:diagpulse 1s ease-in-out infinite}
+  @keyframes diagpulse{0%,100%{box-shadow:0 0 0 0 rgba(138,44,29,.0)}50%{box-shadow:0 0 0 5px rgba(138,44,29,.35)}}
+  /* panneau Formation sociale */
+  .formation{position:fixed;top:62px;right:14px;z-index:10;width:286px;
+    background:rgba(233,221,198,.95);border:1.5px solid var(--encre);
+    box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:11px 13px;display:none;max-height:calc(100vh - 76px);overflow-y:auto}
+  .formation.on{display:block}
+  .formation .ft{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1.5px solid var(--encre);padding-bottom:5px;margin-bottom:7px}
+  .formation .ft span{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.06em;text-transform:uppercase;opacity:.7}
+  .formation .ft b{font-family:"Zilla Slab",serif;font-size:15px}
+  .formation .frow{display:flex;justify-content:space-between;font-size:12.5px;margin:3px 0}
+  .formation .frow .l{opacity:.7}
+  .formation .age{font-family:"Zilla Slab",serif;font-size:17px;font-weight:700;line-height:1.1}
+  .formation .rank{font-size:12px;opacity:.85;margin-bottom:6px}
+  .formation .prog{height:9px;background:rgba(36,31,23,.14);border:1px solid var(--encre);margin:4px 0 2px}
+  .formation .prog i{display:block;height:100%;background:var(--or)}
+  .formation .ageconds{margin:6px 0 7px;border:1px dashed rgba(36,31,23,.35);background:rgba(255,250,240,.28);padding:6px 7px}
+  .formation .ageconds .ah{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:4px}
+  .formation .ageconds .req{display:flex;justify-content:space-between;gap:7px;font-size:11px;line-height:1.35;margin:2px 0;opacity:.72}
+  .formation .ageconds .req.done{opacity:1;color:var(--vert,#475a44)}
+  .formation .ageconds .req.block{color:var(--rouge);opacity:.95}
+  .formation .ageconds .req .rv{font-family:"IBM Plex Mono",monospace;white-space:nowrap}
+  .formation .contradiction{margin:7px 0;padding:5px 7px;background:rgba(138,44,29,.12);border-left:3px solid var(--rouge);font-size:12px}
+  .formation .regime{font-size:12px;margin:5px 0;padding:4px 7px;background:rgba(77,95,112,.14);border-left:3px solid var(--bleu)}
+  .formation .gauges{margin:6px 0}
+  .formation .fgroups{margin:6px 0;border-top:1px dashed rgba(36,31,23,.4);padding-top:5px}
+  .formation .fgroups .fgh{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:3px}
+  .formation .fgroups .sat{font-size:10px;width:12px;text-align:center}
+  .formation .fgroups .fmem{font:11px/1.4 "Spectral",serif;margin-top:4px;opacity:.85}
+  .formation .fobj{display:flex;align-items:center;gap:8px;margin:5px 0 7px;font:12px/1.3 "Spectral",serif}
+  .formation .fobj .lvl{flex:none;background:#241f17;color:#f4ecd8;font:600 10px "IBM Plex Mono",monospace;letter-spacing:.04em;padding:3px 7px;border:2px solid #241f17;box-shadow:2px 2px 0 rgba(36,31,23,.25)}
+  .formation .fobj .obj{flex:1;color:#5a3826}
+  #levelup{position:fixed;left:50%;top:19%;transform:translate(-50%,-12px);z-index:60;pointer-events:none;
+    background:#241f17;color:#f4ecd8;border:3px solid #a8812c;box-shadow:6px 6px 0 rgba(36,31,23,.35);
+    padding:13px 24px;text-align:center;opacity:0;transition:opacity .35s ease,transform .35s ease;font-family:"Spectral",serif;max-width:80vw}
+  #levelup.show{opacity:1;transform:translate(-50%,0)}
+  #levelup .lu-k{font:600 11px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:#d8b15a}
+  #levelup .lu-n{font:700 26px "Zilla Slab",serif;margin:1px 0}
+  #levelup .lu-o{font-size:13px;opacity:.92}
+  #levelup .lu-g{margin-top:6px;font:600 14px "IBM Plex Mono",monospace;color:#e7c873}
+  .za-state{font:12px/1.5 "IBM Plex Mono",monospace;background:rgba(36,31,23,.06);border-left:3px solid #a8812c;padding:6px 9px;margin:8px 0 10px;color:#3a2f22}
+  .za-state b{color:#7a1f12}
+  .formation .gz{display:flex;align-items:center;gap:6px;font-size:10.5px;margin:2px 0}
+  .formation .gz .gn{width:74px;opacity:.72;text-transform:uppercase;letter-spacing:.03em}
+  .formation .gz .gb{flex:1;height:7px;background:rgba(36,31,23,.13);border:1px solid rgba(36,31,23,.4)}
+  .formation .gz .gb i{display:block;height:100%}
+  .formation .actions-left{display:flex;gap:4px;margin:8px 0 4px}
+  .formation .actions-left .dot{width:15px;height:15px;border:1.5px solid var(--encre);background:var(--papier)}
+  .formation .actions-left .dot.used{background:var(--encre)}
+  .formation .f-actiontop{
+    display:flex;align-items:center;gap:8px;margin:7px 0 8px;padding:8px 9px;
+    background:var(--rouge);border:2px solid var(--encre);box-shadow:3px 4px 0 rgba(36,31,23,.28);
+    color:var(--papier);font-family:"IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.04em
+  }
+  .formation .f-actiontop .arr{font-size:20px;color:var(--papier);line-height:1;animation:coachPulse 1.1s ease-in-out infinite}
+  .formation .f-actiontop .alab{font-size:10px;opacity:.92;flex:1}
+  .formation .f-actiontop b{font-size:17px;color:var(--rouge);background:var(--papier);border:2px solid var(--papier);padding:2px 8px;box-shadow:2px 2px 0 rgba(36,31,23,.28)}
+  .formation .actions-left.topdots{margin:0 0 8px}
+  .formation .how-actions{
+    margin:0 0 9px;padding:8px 9px;border:1.5px dashed rgba(36,31,23,.55);
+    background:rgba(255,250,240,.36);box-shadow:2px 2px 0 rgba(36,31,23,.10)
+  }
+  .formation .how-actions .ht{
+    font:700 10px "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--rouge);margin-bottom:6px
+  }
+  .formation .how-actions .steps{
+    display:grid;grid-template-columns:1fr;gap:5px
+  }
+  .formation .how-actions .step{
+    display:flex;align-items:center;gap:7px;font-size:11.5px;line-height:1.25
+  }
+  .formation .how-actions .num{
+    flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+    background:var(--rouge);color:var(--papier);border:1.5px solid var(--encre);
+    font:700 10px "IBM Plex Mono",monospace;box-shadow:1px 1px 0 rgba(36,31,23,.28)
+  }
+  .formation .how-actions b{color:var(--rouge)}
+  .formation .cyclebox{
+    position:relative;margin:0 0 9px;padding:8px 8px 9px;
+    background:rgba(168,129,44,.20);border:2px solid var(--or);
+    box-shadow:2px 3px 0 rgba(36,31,23,.22)
+  }
+  .formation .cyclebox .cyarrow{
+    position:absolute;left:-24px;top:50%;transform:translateY(-50%);
+    font-size:26px;color:var(--rouge);font-family:"IBM Plex Mono",monospace;
+    animation:cycleArrow 0.9s ease-in-out infinite
+  }
+  .formation .cyclebox .cyhint{
+    font:700 10px "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--rouge);margin-bottom:5px
+  }
+  .formation .cyclebox .resolve{width:100%;margin:0}
+  .formation .cyclebox.ready{
+    background:rgba(138,44,29,.18);border-color:var(--rouge);
+    animation:coachPulse 1.2s ease-in-out infinite
+  }
+  @keyframes cycleArrow{0%,100%{transform:translate(-2px,-50%)}50%{transform:translate(4px,-50%)}}
+  .formation .resolve{width:100%;margin-top:7px;padding:8px;border:1.5px solid var(--encre);background:var(--encre);
+    color:var(--papier);font:600 13px "Zilla Slab",serif;cursor:pointer;box-shadow:2px 2px 0 rgba(36,31,23,.3)}
+  .formation .resolve:hover{background:#3a3225}
+  .formation .resolve:disabled{opacity:.45;cursor:not-allowed}
+  .formation .histlog{margin-top:8px;border-top:1px dashed rgba(36,31,23,.4);padding-top:6px;font-size:11px;max-height:120px;overflow-y:auto}
+  .formation .histlog .he{margin:3px 0;opacity:.85;line-height:1.3}
+  .formation .histlog .he b{font-family:"IBM Plex Mono",monospace;font-size:10px}
+  /* modale d'intervention de zone */
+  .zoneact{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;background:rgba(36,31,23,.42)}
+  .zoneact.on{display:flex}
+  .zoneact .box{width:min(440px,92vw);background:var(--papier);border:2px solid var(--encre);box-shadow:6px 7px 0 rgba(36,31,23,.35);padding:18px 20px}
+  .zoneact .zt{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px solid var(--encre);padding-bottom:7px;margin-bottom:10px}
+  .zoneact .zt b{font-family:"Zilla Slab",serif;font-size:20px}
+  .zoneact .zt span{font:600 10px "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.06em;opacity:.7}
+  .zoneact .za-actiontop{
+    display:flex;align-items:center;gap:8px;margin:8px 0 10px;padding:8px 10px;
+    background:var(--rouge);border:2px solid var(--encre);box-shadow:3px 4px 0 rgba(36,31,23,.28);
+    color:var(--papier);font-family:"IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.04em
+  }
+  .zoneact .za-actiontop .arr{font-size:20px;color:var(--papier);animation:coachPulse 1.1s ease-in-out infinite}
+  .zoneact .za-actiontop .alab{font-size:10px;opacity:.92;flex:1}
+  .zoneact .za-actiontop b{font-size:15px;color:var(--rouge);background:var(--papier);border:2px solid var(--papier);padding:2px 8px;box-shadow:2px 2px 0 rgba(36,31,23,.28)}
+  .zoneact .za{display:block;width:100%;text-align:left;margin:6px 0;padding:9px 11px;border:1.5px solid var(--encre);
+    background:rgba(255,255,255,.25);cursor:pointer;font-family:"Spectral",serif;transition:.12s}
+  .zoneact .za:hover{background:rgba(168,129,44,.18)}
+  .zoneact .za:disabled{opacity:.4;cursor:not-allowed}
+  .zoneact .za b{font-family:"Zilla Slab",serif;font-size:14px}
+  .zoneact .za .s{display:block;font-size:11px;opacity:.78;margin-top:2px}
+  .zoneact .zclose{margin-top:8px;width:100%;padding:7px;border:1.5px solid var(--encre);background:transparent;cursor:pointer;font-family:"Zilla Slab",serif}
+  .circuit .stp .full{font-size:9px;letter-spacing:.2px;text-transform:none;margin-top:3px;
+    white-space:nowrap;max-width:74px;line-height:1.1;font-style:italic;opacity:.85}
+
+  /* ---- cartes de décision (usine) ---- */
+  .cards{position:fixed;inset:0;z-index:30;display:none;align-items:center;justify-content:center;
+    background:rgba(36,31,23,.55);backdrop-filter:blur(2px)}
+  .cards.on{display:flex}
+  .cards .panel{background:var(--papier);border:2px solid var(--encre);box-shadow:6px 8px 0 rgba(36,31,23,.3);
+    width:min(880px,94vw);max-height:92vh;overflow:auto;padding:18px 20px}
+  .cards h3{font-family:"Zilla Slab",serif;font-size:20px;margin:0;letter-spacing:.5px;text-transform:uppercase}
+  .cards .sub{font-style:italic;font-size:13px;opacity:.8;margin:4px 0 14px}
+  .cards .now{display:flex;gap:14px;flex-wrap:wrap;font-family:"IBM Plex Mono",monospace;font-size:13px;
+    border:1.5px dashed var(--encre);padding:7px 10px;margin-bottom:14px;background:rgba(168,129,44,.08)}
+  .cards .now b{color:var(--rouge)}
+  .deck{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .card{border:1.5px solid var(--encre);background:var(--papier);box-shadow:2px 3px 0 rgba(36,31,23,.22);
+    padding:11px 11px 12px;display:flex;flex-direction:column;cursor:pointer;transition:.12s;text-align:left}
+  .card:hover{transform:translateY(-3px);box-shadow:3px 5px 0 rgba(36,31,23,.3)}
+  .card:disabled{opacity:.4;cursor:not-allowed;transform:none}
+  .card .ct{font-family:"Zilla Slab",serif;font-weight:600;font-size:15px;margin-bottom:6px;
+    border-bottom:2px solid var(--encre);padding-bottom:4px}
+  .card .eff{display:flex;flex-direction:column;gap:2px;font-size:12px;flex:1}
+  .card .eff span{display:flex;gap:5px;align-items:baseline}
+  .card .up{color:var(--vert,#475a44);font-family:"IBM Plex Mono",monospace;font-weight:600}
+  .card .dn{color:var(--rouge);font-family:"IBM Plex Mono",monospace;font-weight:600}
+  .card .cost{margin-top:7px;font-family:"IBM Plex Mono",monospace;font-size:11px;opacity:.7}
+  .card .cost.debt{opacity:1;color:var(--papier);background:var(--rouge);font-weight:700;
+    padding:3px 7px;display:inline-block;letter-spacing:.3px;box-shadow:2px 2px 0 rgba(36,31,23,.3)}
+  .cards .foot{display:flex;justify-content:space-between;align-items:center;margin-top:16px;
+    border-top:2px solid var(--encre);padding-top:12px}
+  .cards .foot .note{font-style:italic;font-size:12px;opacity:.75;max-width:62%}
+  .cards .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:9px 20px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer}
+  .cards .go:hover{filter:brightness(1.12)}
+
+
+  /* ---- explication cliquable du circuit ---- */
+  .diagpanel{position:fixed;inset:0;z-index:59;display:none;align-items:center;justify-content:center;background:rgba(36,31,23,.38)}
+  .diagpanel.on{display:flex}
+  .diagpanel .dibox{width:min(560px,92vw);background:var(--papier);border:2px solid var(--encre);
+    box-shadow:7px 8px 0 rgba(36,31,23,.34);padding:21px 24px;text-align:left}
+  .diagpanel .distamp{font:600 11px "IBM Plex Mono",monospace;letter-spacing:2px;text-transform:uppercase;color:var(--rouge);margin-bottom:6px}
+  .diagpanel h3{font-family:"Zilla Slab",serif;font-size:26px;margin:0 0 8px;line-height:1.1}
+  .diagpanel .distatus{font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;margin:0 0 12px}
+  .diagpanel .distatus.ok{color:var(--vert,#475a44)} .diagpanel .distatus.alert{color:var(--rouge)}
+  .diagpanel .diblock{border-top:1.5px solid rgba(36,31,23,.35);padding-top:9px;margin-top:9px}
+  .diagpanel .dilab{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.08em;text-transform:uppercase;opacity:.62;margin-bottom:4px}
+  .diagpanel p{font-size:14px;line-height:1.48;margin:0}
+  .diagpanel ul{margin:0;padding-left:18px;font-size:14px;line-height:1.45}
+  .diagpanel li+li{margin-top:3px}
+  .diagpanel .dihelp{background:rgba(168,129,44,.14);border-left:4px solid var(--or);padding:8px 10px;margin-top:10px;font-size:13.5px;line-height:1.45}
+  .diagpanel .go{margin-top:16px;font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:9px 18px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer;width:100%}
+  .diagpanel .go:hover{filter:brightness(1.12)}
+
+  /* ---- animation courte du cycle productif ---- */
+  .cycleplay{position:fixed;inset:0;z-index:58;display:none;align-items:flex-end;justify-content:center;
+    background:rgba(36,31,23,.14);backdrop-filter:none;pointer-events:none;padding:0 18px 22px}
+  .cycleplay.on{display:flex}
+  .cycleplay .cpbox{width:min(660px,94vw);background:rgba(233,221,198,.95);border:2px solid var(--encre);
+    box-shadow:7px 8px 0 rgba(36,31,23,.35);padding:14px 18px;text-align:center}
+  .cycleplay .cpstamp{font:600 11px "IBM Plex Mono",monospace;letter-spacing:2px;text-transform:uppercase;color:var(--rouge);margin-bottom:8px}
+  .cycleplay h3{font-family:"Zilla Slab",serif;font-size:21px;margin:0 0 4px}
+  .cycleplay p{margin:0 0 10px;font-size:13.5px;font-style:italic;opacity:.88}
+  .cycleplay .cpsteps{display:flex;justify-content:center;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .cycleplay .cpstep{font-family:"IBM Plex Mono",monospace;font-size:12px;border:1.5px solid var(--encre);
+    background:rgba(255,250,240,.55);padding:6px 8px;opacity:.45;transition:.18s}
+  .cycleplay .cpstep.on{background:var(--rouge);color:var(--papier);opacity:1;transform:translateY(-2px);box-shadow:2px 3px 0 rgba(36,31,23,.25)}
+  .cycleplay .cpbar{height:8px;background:rgba(36,31,23,.13);border:1px solid var(--encre);margin:15px 0 2px}
+  .cycleplay .cpbar i{display:block;height:100%;width:0%;background:var(--or);transition:width .18s}
+
+  /* ---- bilan de fin de cycle / fin de partie ---- */
+  .report{position:fixed;inset:0;z-index:31;display:none;align-items:center;justify-content:center;
+    background:rgba(36,31,23,.62);backdrop-filter:blur(2px)}
+  .report.on{display:flex}
+  .report .sheet{background:var(--papier);border:2px solid var(--encre);box-shadow:6px 8px 0 rgba(36,31,23,.3);
+    width:min(560px,94vw);max-height:92vh;overflow:auto;padding:20px 24px}
+  .report .stamp{font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:2px;text-transform:uppercase;
+    color:var(--rouge);border:1.5px solid var(--rouge);display:inline-block;padding:2px 9px;margin-bottom:8px}
+  .report h3{font-family:"Zilla Slab",serif;font-size:23px;margin:0 0 4px;letter-spacing:.5px}
+  .report .verdict{font-family:"IBM Plex Mono",monospace;font-size:13px;font-weight:600;margin:0 0 14px}
+  .report .verdict.ok{color:var(--vert,#475a44)} .report .verdict.ko{color:var(--rouge)}
+  .report .led{display:grid;grid-template-columns:1fr auto;gap:3px 18px;font-size:14px;
+    border-top:1.5px solid var(--encre);border-bottom:1.5px solid var(--encre);padding:11px 0;margin-bottom:14px}
+  .report .led .k{opacity:.8} .report .led .v{font-family:"IBM Plex Mono",monospace;font-weight:600;text-align:right}
+  .report .led .v.red{color:var(--rouge)} .report .led .v.gold{color:var(--or)} .report .led .v.blue{color:var(--bleu)}
+  .report .led .v .up{color:var(--vert,#475a44)} .report .led .v .dn{color:var(--rouge)} .report .led .v .flat{opacity:.55}
+  .report .led.compte{margin-bottom:10px}
+  .report .led .v.tot{border-top:1.5px solid var(--encre);padding-top:3px}
+  .report .auto{font-size:14px;line-height:1.5;background:rgba(184,146,74,.13);border-left:4px solid var(--or);
+    padding:8px 12px;margin:0 0 14px}
+  .report .repsec{font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;
+    opacity:.6;margin:2px 0 4px}
+  .report .repsum{font-size:14px;line-height:1.5;margin:0 0 12px}
+  .report .repsum b{font-family:"IBM Plex Mono",monospace;color:var(--rouge)}
+  .report .repchain{font-family:"IBM Plex Mono",monospace;font-size:12px;line-height:1.6;margin:0 0 12px}
+  .report .repchain .lk{display:block;padding-left:14px;position:relative}
+  .report .repchain .lk:before{content:"↳";position:absolute;left:0;opacity:.55;color:var(--rouge)}
+  .report .repchain .lk.head{padding-left:0;font-weight:600}
+  .report .repchain .lk.head:before{content:""}
+  .report .interp{font-style:italic;font-size:14px;line-height:1.5;border-left:4px solid var(--rouge);
+    padding:4px 0 4px 12px;margin-bottom:16px}
+  .report .dnote{font-size:12px;font-style:italic;color:var(--rouge);margin:-8px 0 14px}
+  .report .objline{font-size:13px;line-height:1.5;margin:0 0 14px}
+  .report .objline .gauge{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--bleu)}
+  .report .objline .manque{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--rouge)}
+  .report .objline .aide{font-size:12px;color:var(--or);font-weight:600}
+  .report .interp .veilline{font-style:normal;font-size:10px;letter-spacing:1px;text-transform:uppercase;
+    color:var(--rouge);margin-bottom:4px;border:0;padding:0}
+  .report .go{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:10px 22px;background:var(--rouge);color:var(--papier);letter-spacing:1px;cursor:pointer;width:100%}
+  .report .go:hover{filter:brightness(1.12)}
+  .report.final .sheet{border-width:3px}
+  .report .grandtitle{font-family:"Zilla Slab",serif;font-size:30px;margin:0 0 2px}
+
+  /* ---- crise : voile rouge persistant + alerte banque ---- */
+  #crisisVeil{position:fixed;inset:0;pointer-events:none;z-index:8;opacity:0;transition:opacity .6s;
+    box-shadow:inset 0 0 200px 40px rgba(138,44,29,.55)}
+  #crisisVeil.on{opacity:1;animation:crisisPulse 2.4s ease-in-out infinite}
+  @keyframes crisisPulse{0%,100%{opacity:.55}50%{opacity:.9}}
+  .crisisTag{position:fixed;top:62px;left:50%;transform:translateX(-50%);z-index:12;display:none;
+    background:var(--rouge);color:var(--papier);font-family:"Zilla Slab",serif;font-weight:700;
+    letter-spacing:2px;text-transform:uppercase;padding:5px 16px;font-size:13px;box-shadow:3px 4px 0 rgba(36,31,23,.3)}
+  .crisisTag.on{display:block;animation:pulseStep 1s ease-in-out infinite}
+
+  /* ---- tutoriel narratif ---- */
+  .tuto{position:fixed;inset:0;z-index:40;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;background:rgba(207,196,171,.985);text-align:center;padding:24px}
+  .tuto.hidden{opacity:0;pointer-events:none;transition:.45s}
+  .tuto .frame{max-width:580px}
+  .tuto .count{font-family:"IBM Plex Mono",monospace;font-size:12px;letter-spacing:2px;opacity:.6;margin-bottom:16px}
+  .tuto .line{font-family:"Zilla Slab",serif;font-size:30px;line-height:1.25;margin:0 0 10px;min-height:120px;
+    display:flex;align-items:center;justify-content:center}
+  .tuto .line b{color:var(--rouge)}
+  .tuto .formula{font-family:"IBM Plex Mono",monospace;font-size:18px;letter-spacing:2px;margin:0 0 26px;opacity:.85}
+  .tuto .formula b{color:var(--rouge)}
+  .tuto .nav{display:flex;gap:12px;justify-content:center;align-items:center}
+  .tuto button{font-family:"Zilla Slab",serif;font-weight:700;font-size:14px;border:2px solid var(--encre);
+    padding:10px 22px;background:var(--papier);color:var(--encre);letter-spacing:1px;cursor:pointer}
+  .tuto button:hover{background:var(--encre);color:var(--papier)}
+  .tuto button.primary{background:var(--rouge);color:var(--papier);border-color:var(--rouge)}
+  .tuto button.primary:hover{filter:brightness(1.12)}
+  .tuto .dots{display:flex;gap:7px;justify-content:center;margin-top:20px}
+  .tuto .dots i{width:8px;height:8px;border:1.5px solid var(--encre);display:inline-block;transition:.2s}
+  .tuto .dots i.on{background:var(--rouge);border-color:var(--rouge)}
+
+  /* ---- intro bande-annonce centrée ---- */
+  .introtrailer{position:fixed;inset:0;z-index:72;display:block;pointer-events:none;
+    background:radial-gradient(circle at center, rgba(36,31,23,.04) 0%, rgba(36,31,23,.08) 35%, rgba(36,31,23,.22) 68%, rgba(36,31,23,.54) 100%)}
+  .introtrailer.hidden{opacity:0;pointer-events:none;transition:opacity .45s ease}
+  body.intro-open .hud,
+  body.intro-open .circuit,
+  body.intro-open .formation,
+  body.intro-open .help,
+  body.intro-open .log,
+  body.intro-open .quest,
+  body.intro-open .levers,
+  body.intro-open .villebadge,
+  body.intro-open .whap,
+  body.intro-open .prompt,
+  body.intro-open #levelup,
+  body.intro-open #marxbox{display:none!important}
+  .introtrailer .skip{position:absolute;top:16px;right:16px;pointer-events:auto;border:1.5px solid rgba(233,221,198,.82);
+    background:rgba(36,31,23,.42);color:var(--papier);font:700 12px "Zilla Slab",serif;letter-spacing:.8px;
+    text-transform:uppercase;padding:8px 12px;cursor:pointer;box-shadow:3px 4px 0 rgba(36,31,23,.22);backdrop-filter:blur(3px)}
+  .introtrailer .skip:hover{background:rgba(36,31,23,.78)}
+  .introtrailer .centerwrap{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(820px,88vw);
+    text-align:center;color:var(--papier);text-shadow:0 3px 4px rgba(0,0,0,.95),0 8px 24px rgba(0,0,0,.95),0 0 42px rgba(0,0,0,.75)}
+  .introtrailer .stamp{font:600 11px "IBM Plex Mono",monospace;letter-spacing:2px;text-transform:uppercase;color:#f1d48a;margin-bottom:10px;opacity:.92}
+  .introtrailer .formula{font:600 13px "IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;opacity:.82;margin-bottom:10px}
+  .introtrailer h2{font-family:"Zilla Slab",serif;font-size:48px;line-height:1.02;margin:0 auto 10px;max-width:12.5em;
+    text-shadow:0 4px 4px rgba(0,0,0,1),0 12px 30px rgba(0,0,0,.95),0 0 56px rgba(0,0,0,.85)}
+  .introtrailer .body{font-size:19px;line-height:1.42;max-width:32em;margin:0 auto;opacity:.98;
+    text-shadow:0 3px 4px rgba(0,0,0,1),0 9px 24px rgba(0,0,0,.95),0 0 40px rgba(0,0,0,.8)}
+  .introtrailer .body b,.introtrailer h2 b{color:#f1d48a}
+  .introtrailer .tags{display:flex;justify-content:center;flex-wrap:wrap;gap:10px;margin-top:14px;min-height:20px;opacity:.9}
+  .introtrailer .tags span{font:600 12px "IBM Plex Mono",monospace;letter-spacing:.04em;text-shadow:0 2px 3px rgba(0,0,0,1),0 7px 20px rgba(0,0,0,.95)}
+  .introtrailer .progressline{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;color:rgba(233,221,198,.88);text-shadow:0 2px 10px rgba(0,0,0,.7)}
+  .introtrailer .dots{display:flex;gap:7px;flex-wrap:wrap;justify-content:center}
+  .introtrailer .dots i{width:8px;height:8px;border:1.5px solid rgba(233,221,198,.82);display:inline-block;background:transparent}
+  .introtrailer .dots i.on{background:var(--rouge);border-color:var(--rouge)}
+  .introtrailer .meta{font:600 11px "IBM Plex Mono",monospace;letter-spacing:.08em;text-transform:uppercase;opacity:.82}
+  @media (max-width:760px){
+    .introtrailer .centerwrap{width:92vw}
+    .introtrailer h2{font-size:34px}
+    .introtrailer .body{font-size:16px}
+    .introtrailer .formula{font-size:11px;letter-spacing:.08em}
+  }
+
+
+
+  /* ---- tutoriel contextuel v34 ---- */
+  .coach{position:fixed;left:50%;bottom:118px;transform:translateX(-50%);z-index:22;width:min(520px,88vw);
+    background:rgba(36,31,23,.88);color:var(--papier);border:1.5px solid rgba(233,221,198,.75);
+    box-shadow:5px 6px 0 rgba(36,31,23,.28);padding:12px 15px 13px;backdrop-filter:blur(3px);
+    text-align:left;transition:opacity .2s ease, transform .2s ease}
+  .coach.hidden{opacity:0;pointer-events:none;transform:translateX(-50%) translateY(10px)}
+  .coach .ctop{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:5px}
+  .coach .ck{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:#f1d48a}
+  .coach .cmin{border:1px solid rgba(233,221,198,.55);background:transparent;color:var(--papier);cursor:pointer;
+    font:600 11px "IBM Plex Mono",monospace;padding:2px 6px}
+  .coach h3{font:700 18px/1.1 "Zilla Slab",serif;margin:0 0 5px;color:#f4ecd8}
+  .coach p{margin:0;font-size:13.5px;line-height:1.42}
+  .coach .keys{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font:600 11px "IBM Plex Mono",monospace}
+  .coach .keys span{border:1px solid rgba(233,221,198,.52);padding:2px 6px;background:rgba(233,221,198,.08)}
+  .coach.min h3,.coach.min p,.coach.min .keys{display:none}
+  .coach.min{width:auto;max-width:88vw;padding:7px 10px;bottom:88px}
+  .coach.min .ctop{margin:0}
+  .coach-pulse{animation:coachPulse 1.1s ease-in-out infinite!important;outline:3px solid #f1d48a!important;outline-offset:4px}
+  @keyframes coachPulse{0%,100%{box-shadow:0 0 0 0 rgba(241,212,138,.55)}50%{box-shadow:0 0 0 8px rgba(241,212,138,0)}}
+
+  /* v56 — vignette douce façon carte ancienne (sous l'interface) */
+  #app::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:2;
+    background:radial-gradient(ellipse at center, transparent 52%, rgba(36,31,23,.16) 100%)}
+  /* v66 — grain papier retiré : il voilait le rendu (identité dessin abandonnée). */
+  /* v48 — classement industriel */
+  .frank{margin-top:7px;border-top:1px dashed rgba(36,31,23,.35);padding-top:6px}
+  .frank .fkh{font:600 10px "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.8px;opacity:.75;margin-bottom:3px}
+  .frank .row{display:flex;align-items:baseline;gap:6px;font-size:11.5px;padding:1.5px 2px}
+  .frank .row.me{background:rgba(168,129,44,.16);outline:1px dashed rgba(168,129,44,.55)}
+  .frank .row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .frank .row .st{opacity:.7;font-size:10px}
+  .frank .row .pt{font-family:"IBM Plex Mono",monospace;font-weight:600;min-width:36px;text-align:right}
+  .frank .row .dot{width:7px;height:7px;border-radius:50%;border:1px solid var(--encre);flex:none}
+  .frank .conc{font-size:10px;opacity:.75;margin-top:3px;font-style:italic}
+  /* v47 — repli des détails du panneau Formation sociale */
+  .fdetails-toggle{display:block;width:100%;margin:8px 0 2px;padding:5px 8px;text-align:left;cursor:pointer;
+    font:600 11px "IBM Plex Mono",monospace;background:transparent;border:1px dashed rgba(36,31,23,.4);color:inherit}
+  .fdetails-toggle:hover{background:rgba(36,31,23,.08)}
+  .resolve-hint{position:fixed;z-index:31;display:none;max-width:205px;background:rgba(36,31,23,.92);color:var(--papier);
+    border:1.5px solid #f1d48a;box-shadow:4px 5px 0 rgba(36,31,23,.28);padding:8px 10px;
+    font:600 12px/1.25 "Zilla Slab",serif;text-align:left;pointer-events:none}
+  .resolve-hint.on{display:block}
+  .resolve-hint b{color:#f1d48a}
+  .resolve-hint:after{content:'';position:absolute;right:-9px;top:50%;transform:translateY(-50%);
+    width:0;height:0;border-top:8px solid transparent;border-bottom:8px solid transparent;border-left:9px solid #f1d48a}
+  @media(max-width:760px){.resolve-hint{display:none!important}}
+
+
+
+  .coach .movegrid{display:grid;grid-template-columns:repeat(3,auto);gap:5px;justify-content:start;margin-top:8px}
+  .coach .movegrid b{display:inline-flex;min-width:34px;height:28px;align-items:center;justify-content:center;
+    border:1.5px solid rgba(233,221,198,.75);background:rgba(233,221,198,.12);color:#f4ecd8;
+    font:700 12px "IBM Plex Mono",monospace;box-shadow:2px 2px 0 rgba(36,31,23,.35)}
+  .coach .movegrid .ghost{opacity:.28}
+
+  .coach .cnav{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:9px}
+  .coach .cnav .cprog{font:600 11px "IBM Plex Mono",monospace;color:#f1d48a;opacity:.9}
+  .coach .cnav .cbtns{display:flex;gap:6px}
+  .coach .cnav button{border:1px solid rgba(233,221,198,.55);background:rgba(233,221,198,.08);color:var(--papier);cursor:pointer;
+    font:600 11px "IBM Plex Mono",monospace;padding:4px 8px}
+  .coach .cnav button[disabled]{opacity:.35;cursor:default}
+  .tuto-focus{position:fixed;z-index:28;display:none;pointer-events:none}
+  .tuto-focus.on{display:block}
+  .tuto-focus .ring{position:absolute;inset:0;border:3px solid #f1d48a;border-radius:10px;
+    box-shadow:0 0 0 9999px rgba(36,31,23,.10),0 0 0 6px rgba(241,212,138,.16);animation:coachPulse 1.1s ease-in-out infinite}
+  .tuto-focus .label{position:absolute;left:0;top:-38px;background:rgba(36,31,23,.92);color:var(--papier);border:1.5px solid #f1d48a;
+    box-shadow:4px 5px 0 rgba(36,31,23,.24);padding:6px 9px;font:700 12px/1.15 "Zilla Slab",serif;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis}
+  @media(max-width:760px){.tuto-focus .label{top:auto;bottom:calc(100% + 6px);max-width:180px}}
+
+
+  /* v47 — densité d'interface pilotée par la phase tutorielle (body.tuto-pN) */
+  body.tuto-p0 .quest, body.tuto-p0 .log, body.tuto-p0 .villebadge{opacity:.25;pointer-events:none}
+  body.tuto-p5 .how-actions{display:none!important}
+  body.tuto-p5 #tutorial-coach{display:none!important}
+  /* v46 — l'interface pédagogique ne reste pas après le tutoriel */
+  body:not(.tutorial-emphasis) .formation .f-actiontop{
+    margin:5px 0 4px;padding:0;background:transparent;border:0;box-shadow:none;color:var(--encre);
+    display:flex;align-items:center;gap:6px;font-family:"Spectral",serif;text-transform:none;letter-spacing:0
+  }
+  body:not(.tutorial-emphasis) .formation .f-actiontop .arr{display:none}
+  body:not(.tutorial-emphasis) .formation .f-actiontop .alab{font-size:12px;opacity:.72;flex:1}
+  body:not(.tutorial-emphasis) .formation .f-actiontop b{
+    font:600 12px "IBM Plex Mono",monospace;color:var(--encre);background:transparent;border:0;padding:0;box-shadow:none
+  }
+  body:not(.tutorial-emphasis) .formation .actions-left.topdots{margin:3px 0 5px}
+  body:not(.tutorial-emphasis) .formation .how-actions{display:none}
+  body:not(.tutorial-emphasis) .formation .cyclebox{
+    margin:6px 0 8px;padding:0;background:transparent;border:0;box-shadow:none;animation:none
+  }
+  body:not(.tutorial-emphasis) .formation .cyclebox .cyarrow,
+  body:not(.tutorial-emphasis) .formation .cyclebox .cyhint{display:none}
+  body:not(.tutorial-emphasis) .formation .cyclebox .resolve{
+    width:100%;margin-top:7px;padding:8px;border:1.5px solid var(--encre);background:var(--encre);
+    color:var(--papier);font:600 13px "Zilla Slab",serif;cursor:pointer;box-shadow:2px 2px 0 rgba(36,31,23,.3)
+  }
+  body:not(.tutorial-emphasis) .zoneact .za-actiontop{
+    margin:4px 0 8px;padding:0;background:transparent;border:0;box-shadow:none;color:var(--encre);
+    display:flex;align-items:center;gap:6px;font-family:"Spectral",serif;text-transform:none;letter-spacing:0
+  }
+  body:not(.tutorial-emphasis) .zoneact .za-actiontop .arr{display:none}
+  body:not(.tutorial-emphasis) .zoneact .za-actiontop .alab{font-size:12px;opacity:.72;flex:1}
+  body:not(.tutorial-emphasis) .zoneact .za-actiontop b{
+    font:600 12px "IBM Plex Mono",monospace;color:var(--encre);background:transparent;border:0;padding:0;box-shadow:none
+  }
+
+  body.modal-open .coach{display:none!important}
+  body.modal-open .coach.zoneact-help{display:block!important}
+  @media(max-width:760px){.coach{bottom:92px;width:calc(100vw - 24px)}.coach h3{font-size:16px}.coach p{font-size:12.5px}}
+
+</style>
+<!-- v24: panneaux repositionnés, circuit nettoyé, animation drone avec chariot, ouvriers, argent et marchandises. -->
+</head>
+<body>
+<div id="app"></div>
+
+<!-- M0 — gate : écran de chargement des assets. Disparaît dès le manifest résolu,
+     puis l'introtrailer prend le relais. Si un asset critique manque, message lisible. -->
+<div class="gate" id="gate" aria-live="polite">
+  <h2>Le Circuit du Capital</h2>
+  <div class="f">prototype 3D · <b>v66</b> — préchargement</div>
+  <div class="lbar"><i id="gate-bar"></i></div>
+  <div class="lmsg" id="gate-msg">Chargement…</div>
+  <div class="lerr" id="gate-err"></div>
+  <small>Three.js, HDRI, modèles compressés</small>
+</div>
+
+<div class="hud" id="hud">
+  <h1 id="hud-title">Tableau de bord</h1>
+  <!-- v47 : les 6 variables structurantes sont TOUJOURS visibles, avec delta du dernier cycle -->
+  <div class="r"><span>Capital</span><b class="gold" id="h-argent">—</b><i class="delta" id="d-argent"></i></div>
+  <div class="r"><span>Dette</span><b id="h-dette">—</b><i class="delta" id="d-dette"></i></div>
+  <div class="r"><span>Profit (cycle)</span><b id="h-profit">—</b><i class="delta" id="d-profit"></i></div>
+  <div class="r"><span>Stocks</span><b id="h-stocks">—</b><i class="delta" id="d-stocks"></i></div>
+  <div class="r"><span>Chômage</span><b id="h-chomage">—</b><i class="delta" id="d-chomage"></i></div>
+  <div class="r"><span>Colère ouvrière</span><b class="red" id="h-colere">—</b><i class="delta" id="d-colere"></i></div>
+  <div class="r"><span>Risque de crise</span><b class="red" id="h-risque">—</b><i class="delta" id="d-risque"></i></div>
+  <div class="r hobj"><span>Objectif</span><b id="h-obj">—</b></div>
+  <div id="marxbox" style="display:none">
+    <div class="veilline">sous le voile — rapports sociaux</div>
+    <div class="r"><span>Plus-value</span><b class="red" id="m-pv">—</b></div>
+    <div class="r"><span>Taux d’exploitation</span><b class="red" id="m-tx">—</b></div>
+    <div class="r"><span>Capital constant (c)</span><b id="m-c">—</b></div>
+    <div class="r"><span>Capital variable (v)</span><b id="m-v">—</b></div>
+    <div class="r"><span>Taux de profit</span><b id="m-tp">—</b></div>
+    <div class="r"><span>Compo. organique c/v</span><b id="m-co">—</b></div>
+    <div class="r"><span>Part de marché</span><b class="gold" id="m-part">—</b></div>
+    <div class="r"><span>Stocks invendus</span><b id="m-stocks">—</b></div>
+  </div>
+</div>
+
+<div class="help" id="help">
+  <button id="settings-toggle" title="Afficher les contrôles">⚙ Paramètres</button>
+  <div class="help-panel" id="help-panel">
+    <div><kbd>↑</kbd><kbd>↓</kbd> / <kbd>Z</kbd><kbd>S</kbd> — avancer / reculer</div>
+    <div><kbd>←</kbd><kbd>→</kbd> / <kbd>Q</kbd><kbd>D</kbd> — tourner</div>
+    <div><kbd>E</kbd> — agir dans un lieu</div>
+    <div id="help-voile" style="opacity:.35"><kbd>V</kbd> — lever le voile</div>
+    <div><kbd>R</kbd> — replacer le véhicule</div>
+    <div><kbd>B</kbd> — son d'ambiance</div>
+    <div class="hsep"><kbd>L</kbd>/<kbd>K</kbd>/<kbd>J</kbd> — performance, qualité, densité</div>
+  </div>
+</div>
+
+<div class="circuit" id="circuit"></div>
+
+
+<div class="diagpanel" id="circuit-info">
+  <div class="dibox">
+    <div class="distamp">Diagnostic du circuit</div>
+    <h3 id="ci-title">—</h3>
+    <p class="distatus" id="ci-status">—</p>
+    <div class="diblock"><div class="dilab">Ce que signifie cette lettre</div><p id="ci-meaning">—</p></div>
+    <div class="diblock"><div class="dilab">Pourquoi c’est rouge</div><ul id="ci-reasons"></ul></div>
+    <div class="diblock"><div class="dilab">Que faire maintenant</div><ul id="ci-actions"></ul></div>
+    <div class="dihelp">Le rouge ne veut pas dire “échec immédiat” : il indique le point du circuit où la formation sociale se tend. Ce panneau précise la cause et l’intervention possible.</div>
+    <button class="go" id="ci-close">Revenir au jeu ▸</button>
+  </div>
+</div>
+
+<div class="quest" id="quest">
+  <div class="qt"><span>Objectif actuel</span><b id="q-cycle">Cycle 1</b></div>
+  <p class="qgoal" id="q-goal">—</p>
+  <div class="qrow rew"><span class="lab">Récompense</span><span id="q-rew">—</span></div>
+  <div class="qrow risk"><span class="lab">Risque</span><span id="q-risk">—</span></div>
+  <div class="qnext" id="q-next">Prochaine étape : <b>Banque (A)</b></div>
+</div>
+
+<div class="formation" id="formation">
+  <div class="ft"><span>Formation sociale</span><b id="f-time">Cycle 1 · An 1</b></div>
+  <div class="f-actiontop" id="f-actiontop"><span class="arr">➜</span><span class="alab">Actions restantes</span><b id="f-actnum">3 / 3</b></div>
+  <div class="actions-left topdots" id="f-actdots"></div>
+  <div class="how-actions" id="f-howactions">
+    <div class="ht">Pour utiliser 1 action</div>
+    <div class="steps">
+      <div class="step"><span class="num">1</span><span>Conduis vers un <b>bâtiment</b>.</span></div>
+      <div class="step"><span class="num">2</span><span>Quand son nom apparaît, appuie sur <b>E</b>.</span></div>
+      <div class="step"><span class="num">3</span><span>Dans la fenêtre, clique un <b>bouton d’intervention</b>.</span></div>
+    </div>
+  </div>
+  <div class="cyclebox" id="f-cyclebox">
+    <div class="cyarrow">➜</div>
+    <div class="cyhint" id="f-cyclehint">Après tes actions : lance le cycle</div>
+    <button class="resolve" id="f-resolve">Lancer le cycle productif ▸</button>
+  </div>
+  <div class="age" id="f-age">Atelier</div>
+  <div class="rank" id="f-rank">Capitaliste d’atelier</div>
+  <div class="fobj" id="f-objrow"><span class="lvl" id="f-level">Niveau 1</span><span class="obj" id="f-obj">Objectif : dégager un profit</span></div>
+  <div class="frow"><span class="l">Vers <b id="f-nextage">Manufacture</b></span><span id="f-progpct">0 %</span></div>
+  <div class="prog"><i id="f-prog" style="width:0%"></i></div>
+  <div class="contradiction" id="f-contra">Contradiction dominante : —</div>
+  <div class="gauges" id="f-gauges"></div>
+  <!-- v48 : classement industriel — le joueur est un capital parmi d'autres -->
+  <div class="frank" id="f-ranking"></div>
+  <!-- v47 : tout ce qui relève de la lecture approfondie est replié par défaut.
+       Toujours visible : actions, bouton cycle, âge, objectif, contradiction, jauges. -->
+  <button class="fdetails-toggle" id="f-details-toggle">▸ Détails de la formation sociale</button>
+  <div class="fdetails" id="f-details" style="display:none">
+    <div class="ageconds" id="f-reqs"></div>
+    <div class="regime" id="f-regime">Régime : libéral instable</div>
+    <div class="frow" id="f-rules-row" style="font-size:11px;opacity:.8"><span class="l">Règles : <span id="f-rules">—</span></span></div>
+    <div class="fgroups" id="f-groups"></div>
+    <div class="histlog" id="f-hist"></div>
+  </div>
+</div>
+
+<div class="zoneact" id="zoneact">
+  <div class="box">
+    <div class="zt"><b id="za-title">Lieu</b></div>
+    <div class="za-actiontop" id="za-actiontop"><span class="arr">➜</span><span class="alab">Actions restantes</span><b id="za-actions">3 actions restantes</b></div>
+    <div id="za-state" class="za-state"></div>
+    <div id="za-list"></div>
+    <button class="zclose" id="za-close">Fermer (sans agir)</button>
+  </div>
+</div>
+
+<div class="levers" id="levers" style="display:none">
+  <div class="lt" id="lev-title">État de l’usine</div>
+  <div class="lv"><span>Journée</span><b id="vh">10 h</b></div>
+  <div class="lv"><span>Salaire</span><b id="vs">5 £</b></div>
+  <div class="lv"><span>Ouvriers</span><b id="vl">10</b></div>
+  <div class="lv"><span>Machines</span><b id="vm">niv. 1</b></div>
+  <div class="lhint">Bâtiment : <b id="lev-place">Usine</b> · stade : <b id="lev-stage">Atelier</b>. Appuie sur <b>E</b> dans l’usine pour ouvrir les décisions.</div>
+</div>
+
+<div id="crisisVeil"></div>
+<div class="crisisTag" id="crisisTag">⚠ Crise — les marchandises ne se vendent plus</div>
+
+<div id="flash"></div>
+
+<div class="log" id="log">
+  <button id="chantier-btn" title="Débloqué plus tard" style="display:none!important">⚒ Plan du chantier</button>
+  <!-- Badge : niveau de ville capitaliste -->
+  <div class="villebadge" id="villebadge" title="Développement du capital">
+    <span class="vlab">Développement du capital</span>
+    <span class="vval"><b id="ville-niv">0</b> / 7 — <span id="ville-stade">Argent dormant</span></span>
+  </div>
+  <button id="log-open" title="Ouvrir le journal historique">📖 Journal historique</button>
+  <div id="log-body" style="display:none"></div>
+</div>
+
+<div class="prompt" id="prompt"></div>
+<div id="qa"></div>
+<div class="coach hidden" id="tutorial-coach">
+  <div class="ctop"><span class="ck" id="coach-k">Tutoriel</span><button class="cmin" id="coach-min" title="Réduire le tutoriel">—</button></div>
+  <h3 id="coach-title">Prends le chariot.</h3>
+  <p id="coach-body">Suis la balise rouge, approche-toi du lieu indiqué, puis appuie sur E pour agir.</p>
+  <div class="keys" id="coach-keys"></div>
+  <div class="cnav" id="coach-nav" style="display:none">
+    <div class="cprog" id="coach-prog">1 / 1</div>
+    <div class="cbtns"><button id="coach-prev">◂</button><button id="coach-next">▸</button></div>
+  </div>
+</div>
+<div class="tuto-focus" id="tuto-focus"><div class="ring"></div><div class="label" id="tuto-focus-label">Panneau</div></div>
+<!-- v47 : élément référencé par TutorialCoach.setResolveHint (était absent : la bulle ne s'affichait jamais) -->
+<div class="resolve-hint" id="resolve-hint">Tes interventions sont faites : <b>clique ici</b> pour lancer le cycle productif et lire le bilan.</div>
+
+
+<!-- Ce qui vient de se passer (panneau pédagogique latéral) -->
+<div class="whap" id="whap">
+  <div class="wt"><span>Ce qui vient de se passer</span><span class="wbtns"><button id="whap-expand" title="déplier">détails</button><button id="whap-x" title="fermer">✕</button></span></div>
+  <div class="wblk"><div class="wlab">Action</div><p id="whap-action">—</p></div>
+  <div class="wblk"><div class="wlab eff">Effet de jeu</div><div id="whap-effect" class="wtags"></div></div>
+  <div class="wblk chain" id="whap-chainblk"><div class="wlab">Enchaînement</div><div id="whap-chain" class="wchain"></div></div>
+  <div class="wblk marx"><div class="wlab marxl">Lecture marxienne</div><p id="whap-marx">—</p></div>
+</div>
+
+<!-- Journal historique complet (modale) -->
+<div class="journal" id="journal">
+  <div class="jpanel">
+    <h3>Journal historique</h3>
+    <p class="jsub">Toute la chronique narrative du circuit, cycle après cycle.</p>
+    <div class="jbody" id="journal-body"></div>
+    <button class="go" id="journal-close">Fermer ▸</button>
+  </div>
+</div>
+
+<!-- Mode guidé : pause explicative à chaque étape -->
+<div class="guide" id="guide">
+  <div class="gpanel">
+    <div class="gsym" id="guide-sym">A</div>
+    <h3 id="guide-place">—</h3>
+    <div class="gblk"><div class="glab">Le lieu</div><p id="guide-lieu">—</p></div>
+    <div class="gblk"><div class="glab todo">À faire ici</div><p id="guide-todo">—</p></div>
+    <div class="gblk"><div class="glab marxl">Dans le circuit du capital</div><p id="guide-sens">—</p></div>
+    <button class="go" id="guide-ok">J’ai compris — agir ▸</button>
+  </div>
+</div>
+
+<!-- Écran de concept (révélations pédagogiques majeures) -->
+<div class="concept" id="concept">
+  <div class="cpanel">
+    <div class="cstamp" id="concept-stamp">Concept</div>
+    <h2 id="concept-title">—</h2>
+    <div class="cbody" id="concept-body"></div>
+    <div class="cunlock" id="concept-unlock" style="display:none"></div>
+    <button class="go" id="concept-ok">Continuer ▸</button>
+  </div>
+</div>
+
+<div class="concept" id="greve">
+  <div class="cpanel">
+    <div class="cstamp" style="color:var(--rouge)">Conflit social</div>
+    <h2 id="greve-title">Grève</h2>
+    <div class="cbody" id="greve-body"></div>
+    <div class="cunlock" id="greve-revend" style="display:none"></div>
+    <div id="greve-choices" style="display:flex;flex-direction:column;gap:8px;margin-top:14px"></div>
+  </div>
+</div>
+
+<!-- Choisir une amélioration (après le bilan) -->
+<div class="upgrade" id="upgrade">
+  <div class="upanel" id="upanel-choose">
+    <div class="ustamp" id="upgrade-stade">Développement du capital : niveau 1 / 7</div>
+    <h2 id="upgrade-h2">Choisir une amélioration</h2>
+    <p class="usub" id="upgrade-sub">Le profit réalisé peut être réinvesti : accumuler, c’est transformer l’espace social. Choisis une amélioration — ou garde ton capital.</p>
+    <div class="ucapital" id="upgrade-capital">Capital disponible : —</div>
+    <div class="udeck" id="upgrade-deck"></div>
+    <button class="skip" id="upgrade-skip">Garder mon capital ▸</button>
+  </div>
+  <div class="upanel result" id="upanel-result" style="display:none">
+    <div class="ustamp">Amélioration réalisée</div>
+    <h2 id="ures-title">—</h2>
+    <div class="ureffects" id="ures-effects"></div>
+    <div class="urmarx" id="ures-marx">—</div>
+    <button class="go" id="upgrade-continue">Continuer ▸</button>
+  </div>
+</div>
+
+<!-- Cartes de décision (s'ouvrent à l'usine) -->
+<div class="cards" id="cards">
+  <div class="panel">
+    <h3>À l’usine — le procès de production</h3>
+    <p class="sub">C’est ici que le capital se valorise. Chaque décision arrache plus de valeur — et produit ses propres contradictions.</p>
+    <div class="now" id="cards-now"></div>
+    <div class="deck" id="cards-deck"></div>
+    <div class="foot">
+      <span class="note" id="cards-note">Joue autant de cartes que tu veux, puis reprends la route vers l’entrepôt (M′).</span>
+      <button class="go" id="cards-done">Reprendre la route ▸</button>
+    </div>
+  </div>
+</div>
+
+<!-- Animation courte du cycle productif -->
+<div class="cycleplay" id="cycleplay">
+  <div class="cpbox">
+    <div class="cpstamp">Cycle productif en cours</div>
+    <h3 id="cp-title">Le capital circule</h3>
+    <p id="cp-text">Les décisions de la période se transforment en production, vente, dette et conflit.</p>
+    <div class="cpsteps" id="cpsteps">
+      <span class="cpstep">A</span><span class="cpstep">M</span><span class="cpstep">Ft</span><span class="cpstep">P</span><span class="cpstep">M′</span><span class="cpstep">A′</span>
+    </div>
+    <div class="cpbar"><i id="cpbar"></i></div>
+  </div>
+</div>
+
+<!-- Bilan de fin de cycle / fin de partie -->
+<div class="report" id="report">
+  <div class="sheet" id="report-sheet"></div>
+</div>
+
+<div class="introtrailer" id="introtrailer">
+  <button class="skip" id="intro-skip">Passer l’introduction ▸</button>
+  <div class="centerwrap">
+    <div class="stamp" id="intro-stamp">Prologue</div>
+    <div class="formula" id="intro-formula">A → M → Ft → P → M′ → A′</div>
+    <h2 id="intro-title">Le capital commence comme argent dormant.</h2>
+    <p class="body" id="intro-body">Une somme d’argent cherche à devenir capital.</p>
+    <div class="tags" id="intro-tags"></div>
+  </div>
+  <div class="progressline">
+    <div class="dots" id="intro-dots"></div>
+    <div class="meta" id="intro-meta">séquence 1 / 7</div>
+  </div>
+</div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
