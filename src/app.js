@@ -1146,20 +1146,22 @@ function buildMainStreet(){
   flat(L,0.9,cx, 2.4,0x241f17,0.14);
   flat(L,0.9,cx,-2.4,0x241f17,0.14);
   // — trottoirs surélevés, bordures, joints de dalles
+  // M1c — sandstone sobre (était 0xd4c49c crème : bloomait sous le soleil)
   for(const sgn of [-1,1]){
     const tw=3.0, tz=sgn*(w/2+tw/2);
     const trot=new THREE.Mesh(new THREE.BoxGeometry(L,0.22,tw),
-      new THREE.MeshStandardMaterial({color:0xd4c49c,roughness:1}));
+      new THREE.MeshStandardMaterial({color:0xa89878,roughness:1}));
     trot.position.set(cx,0.11,tz); trot.receiveShadow=true; scene.add(trot);
     flat(L,0.4,cx,sgn*w/2,0x241f17,0.55,0.24);
     flat(L,0.25,cx,sgn*(w/2+tw),0x241f17,0.35,0.24);
     for(let jx=x0+4;jx<x1;jx+=8) flat(0.18,tw,jx,tz,0x241f17,0.18,0.23);
   }
   // — passages pavés clairs vers les institutions (nord) et les parcelles (sud)
+  // M1c — ocre désaturé (était 0xd8c8a0 : trop clair, bloomait)
   const acces=[[-105,-1],[-72,-1],[-40,-1],[-8,-1],[55,-1],
                [-60,1],[-15,1],[18,1],[52,1],[86,1],[0,1]];
   for(const [ax,sgn] of acces){
-    flat(6,9,ax,sgn*(w/2+4.5),0xd8c8a0,0.55,0.022);
+    flat(6,9,ax,sgn*(w/2+4.5),0xb09a78,0.55,0.022);
     for(let i=0;i<4;i++) flat(6,0.14,ax,sgn*(w/2+1.5+i*2.1),0x241f17,0.20,0.024);
   }
   // — bornes de pierre le long des trottoirs
