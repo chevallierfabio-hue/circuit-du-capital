@@ -1,23 +1,26 @@
 /* =====================================================================
-   src/app.js  —  legacy bundle M0 du portage Vite.
+   src/app.js  —  M1 : charte chromatique & chaîne de post-production.
 
-   Code du v66 (UMD r128) repris ici quasi à l'identique. Trois ajustements
-   localisés (et localisables) :
-     1. THREE devient un objet local qui combine le core ESM et les addons
-        de post-processing. Les références (Mesh, Material, etc.) restent
-        celles du module three : instanceof continue de fonctionner.
-     2. Compensation des "physically-correct lights" : depuis r155, le BRDF
-        intègre la division par π, ce qui assombrit les scènes legacy. On
-        multiplie chaque intensité de DirectionalLight / PointLight /
-        HemisphereLight / AmbientLight par LIGHT_GAIN = Math.PI au moment
-        où elle est posée — création + mutations du cycle jour/nuit.
-     3. Les CanvasTexture créées à la main (cartouches, plaques de bois,
-        sceau d'État, ciel peint…) sont marquées sRGB explicitement, ce
-        qui était implicite en r128.
+   M0 (portage Vite, r128 → r168 ESM) reste sous-jacent : THREE = core +
+   addons de post-processing, compensation BRDF moderne via LIGHT_GAIN,
+   CanvasTexture taguées sRGB. Voir l'historique du fichier pour le détail.
 
-   Les missions M1+ découperont ce fichier le long de la frontière déjà
+   M1 — « La Veille du Capital » : heure bleue industrielle, ombres bleu-
+   encre froides, hautes lumières ambre chaudes. La lumière représente le
+   capital. Trois ajouts strictement non destructifs :
+     1. COLORSCRIPT (source unique de vérité pour les couleurs de monde 3D :
+        ciel, brume, soleil, gaz/forge/or, palette héro des zones) — pose le
+        socle chromatique sans toucher aux builders, textures ou HUD.
+     2. Chaîne de post-prod : composer + UnrealBloomPass recalibré
+        (0.55 / 0.4 / 0.82) + GradePass final (split-tone + vignette + grain
+        animé). IBL relevé à ~0.7 (hemi compensé) pour faire respirer le HDRI.
+     3. Sélecteur qualité Basse/Moyenne/Haute (panneau réglages) appliqué à
+        chaud + #qa enrichi (fps lissé · calls · triangles). Repli gracieux
+        si EffectComposer absent : bypass propre, zéro erreur console.
+
+   Les missions M2+ découperont ce fichier le long de la frontière déjà
    annoncée dans l'en-tête v66 (World / Vehicle / CameraController / Input
-   / HUD / sim). M0 garde l'unité pour préserver la parité visuelle.
+   / HUD / sim).
    ===================================================================== */
 
 import * as THREE_BASE from 'three';
@@ -53,10 +56,12 @@ const physI = (v) => v * LIGHT_GAIN;
 })();
 
 // L'AssetManager fournit la texture HDR équirectangulaire ; init() compile
-// le PMREM une fois le renderer en place. ENV_INTENSITY (constante exposée)
-// est volontairement basse pour ne PAS modifier le rendu v66 maintenant ;
-// elle sera relevée en M1 quand on calibrera l'éclairage IBL.
-export const ENV_INTENSITY = 0.25;
+// le PMREM une fois le renderer en place. M1 : ENV_INTENSITY relevé de 0.25
+// à 0.7 — le HDRI industriel ambre/bleu devient une vraie source d'ambiance,
+// les MeshStandardMaterial respirent la lumière du ciel. hemiLight est
+// compensé à la baisse plus bas (0.45 → ajustable) plutôt que de redescendre
+// l'IBL si une zone semble trop claire.
+export const ENV_INTENSITY = 0.7;
 
 /* ===== MOTEUR ÉCONOMIQUE (modules sim, identiques au fichier moteur) ===== */
 /* =====================================================================
@@ -602,6 +607,30 @@ const COL = {
   fer:THEME.iron, fumee:THEME.smoke, crise:THEME.crisis,
 };
 
+/* M1 — « La Veille du Capital ». COLORSCRIPT est désormais la SOURCE
+   UNIQUE DE VÉRITÉ pour les couleurs du monde 3D (ciel, brume, soleil,
+   sources industrielles, palette héro des zones). THEME/COL restent pour
+   les éléments graphiques 2D (HUD, papier) et les builders existants ;
+   COLORSCRIPT pilote l'ambiance lumineuse. */
+const COLORSCRIPT = {
+  skyZenith:   0x1b2433,
+  skyHorizon:  0xd98a3d,
+  fogColor:    0x46506b,
+  sunColor:    0xff9a4d,
+  gasLight:    0xffb45e,
+  forgeLight:  0xff5a28,
+  goldLight:   0xffd98a,
+  banque:   { hero:0xc9a44a },
+  bourse:   { hero:0xe8c86a },
+  etat:     { hero:0x8c93a4 },
+  usine:    { hero:0x8a2c1d },
+  marche:   { hero:0xb0622f },
+  quartier: { hero:0x3d4a5c },
+  terres:   { hero:0x6b7a4a },
+  mines:    { hero:0x2a2622 },
+  port:     { hero:0x35586b },
+};
+
 /* ===================================================================
    MiniCircuit  —  STUB. Sera remplacé par le vrai CapitalCircuit.js
    (déjà écrit) au portage. Ici : juste de quoi rendre le HUD vivant
@@ -724,17 +753,20 @@ function createPaperGroundTexture(){
 
 function buildWorld(){
   scene=new THREE.Scene();
-  scene.background=new THREE.Color(0xcbbd9a);   // filet de sécurité derrière le dôme
+  // M1 — filet de sécurité derrière le dôme : passe à la brume bleu-encre.
+  scene.background=new THREE.Color(COLORSCRIPT.fogColor);
   buildSky();                                    // v59 : un vrai ciel
   buildHorizon();                                // v65/v66 : le monde continue au-delà du cadre
   buildNightLights();                            // v66 : les lumières qui peignent la nuit
-  scene.fog=new THREE.Fog(0xcbbd9a, 100, 310);   // v49
+  // M1 — fog : on garde near/far v49, seule la couleur bascule sur COLORSCRIPT.
+  scene.fog=new THREE.Fog(COLORSCRIPT.fogColor, 100, 310);
 
-  // lumières — soleil bas, chaud, poussiéreux + rebond doux (v57 : pilotés par DayCycle)
+  // lumières — M1 : ciel bleu froid / sol terre encre, intensité abaissée
+  // pour laisser l'IBL (ENV_INTENSITY=0.7) faire le gros de l'ambiance.
   // r128 → r16x : intensités multipliées par π (cf. en-tête, LIGHT_GAIN).
-  hemiLight=new THREE.HemisphereLight(0xefe2c6, 0x5a4d38, physI(.72)); scene.add(hemiLight);
+  hemiLight=new THREE.HemisphereLight(0x6b7a9c, 0x2e2820, physI(0.45)); scene.add(hemiLight);
   scene.add(new THREE.AmbientLight(0xb9a884, physI(.22)));
-  sunLight=new THREE.DirectionalLight(0xffe7bd, physI(1.0));
+  sunLight=new THREE.DirectionalLight(COLORSCRIPT.sunColor, physI(0.85));
   sunLight.position.set(58,72,42); sunLight.castShadow=true;
   sunLight.shadow.mapSize.set(2048,2048); sunLight.shadow.bias=-0.0004;
   sunLight.shadow.radius=3.5;           // v62 : pénombre douce, façon jouet
@@ -1354,6 +1386,9 @@ addEventListener('keydown',e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=true;e.pr
   if(e.code==='KeyB'){ AmbientSound.start(); AmbientSound.toggle(); }
   if(e.code==='KeyE'){ e.preventDefault(); if(currentZone) interactZone(currentZone); }
   if(e.code==='Backquote'){ e.preventDefault(); setQA(!QA_MODE); }
+  // M1b — F3 : toggle du panneau #qa (fps / calls / triangles). Même état
+  // que Backquote (legacy) ; l'état persiste pendant la session.
+  if(e.code==='F3'){ e.preventDefault(); setQA(!QA_MODE); }
 });
 addEventListener('keyup',  e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=false;e.preventDefault();} });
 function toggleSettingsPanel(force){
@@ -1366,6 +1401,17 @@ if(settingsToggle){
   settingsToggle.addEventListener('pointerdown',e=>{ e.stopPropagation(); });
   settingsToggle.addEventListener('click',e=>{ e.preventDefault(); e.stopPropagation(); toggleSettingsPanel(); });
 }
+// M1 — sélecteur Rendu (Basse/Moyenne/Haute), à chaud, dans le panneau réglages.
+(function bindRenderQualitySelector(){
+  const seg=document.getElementById('rq-seg'); if(!seg) return;
+  seg.addEventListener('click', e=>{
+    const btn=e.target.closest('.rq'); if(!btn) return;
+    const q=btn.dataset.q; if(!q || q===RENDER_QUALITY) return;
+    seg.querySelectorAll('.rq').forEach(b=>b.classList.toggle('active', b===btn));
+    applyRenderQuality(q);
+    pushLog('Affichage','Rendu : '+({low:'Basse',medium:'Moyenne',high:'Haute'}[q])+'.','plain');
+  });
+})();
 
 /* ===================================================================
    HUD + interaction de zone
@@ -4167,12 +4213,38 @@ function getCurrentDestination(){
   const c=CIRCUIT[step]; return c?c.zone:null;
 }
 let QA_MODE=false;
-function setQA(on){ QA_MODE=on; document.body.classList.toggle('qa',on); if(on) updateQA(); }
+// M1 — fps lissé (moyenne glissante) + dernières métriques renderer.info.
+// On échantillonne TOUJOURS, même panneau caché : coût négligeable et le
+// panneau affiche des valeurs fraîches dès le premier F3.
+let _qaFps=60, _qaAccum=0, _qaCalls=0, _qaTris=0;
+function qaSampleFrame(dt){
+  if(dt>0){
+    const inst = 1/Math.max(1e-4,dt);
+    _qaFps = _qaFps*0.92 + inst*0.08;       // EMA, ~constante de temps ~0.4 s
+  }
+  if(typeof renderer!=='undefined' && renderer && renderer.info){
+    _qaCalls = renderer.info.render.calls;
+    _qaTris  = renderer.info.render.triangles;
+  }
+  if(!QA_MODE) return;
+  _qaAccum += dt;
+  if(_qaAccum >= 0.1){ _qaAccum = 0; updateQA(); }   // panneau rafraîchi à 10 Hz
+}
+function setQA(on){
+  QA_MODE=on;
+  document.body.classList.toggle('qa',on);
+  if(on){ _qaAccum=0; updateQA(); }
+  console.info('[M1] QA panel', on?'ON (F3 toggle)':'OFF');
+}
 function updateQA(){
   if(!QA_MODE) return;
   const dest=getCurrentDestination();
+  const fps    = _qaFps.toFixed(1);
+  const calls  = _qaCalls;
+  const tris   = _qaTris.toLocaleString('fr-FR');
+  const compo  = composer ? (COMPOSER_BYPASS?'bypass':'on') : '—';
   document.getElementById('qa').textContent=
-    `phase   : ${gamePhase}\ncycle   : ${state.cycle}  objIndex: ${state.objectifIndex}\nstep    : ${step}  dest: ${dest||'—'}\ndestOK  : ${dest?zoneExists(dest):'—'}\nzone    : ${currentZone?currentZone.name:'—'}  canE: ${canInteractWithZone(currentZone)}\nmodal   : ${anyModalOpen()}  niveauVille: ${state.niveauVille}`;
+    `fps     : ${fps}  calls: ${calls}  tris: ${tris}\nrender  : ${RENDER_QUALITY}  composer: ${compo}\nphase   : ${gamePhase}\ncycle   : ${state.cycle}  objIndex: ${state.objectifIndex}\nstep    : ${step}  dest: ${dest||'—'}\ndestOK  : ${dest?zoneExists(dest):'—'}\nzone    : ${currentZone?currentZone.name:'—'}  canE: ${canInteractWithZone(currentZone)}\nmodal   : ${anyModalOpen()}  niveauVille: ${state.niveauVille}`;
 }
 function debugFlow(){
   const dest=getCurrentDestination();
@@ -4309,24 +4381,43 @@ export function init(opts={}){
   renderer=new THREE.WebGLRenderer({antialias:true});
   renderer.setSize(innerWidth,innerHeight);
   renderer.outputColorSpace=THREE.SRGBColorSpace;         // r128 → r16x : tag explicite
-  // v66 — composer + bloom : les émissifs (lampes, fenêtres, verrières, enseignes)
-  // débordent dans la brume. Seuil haut : le jour ne bloomera presque pas.
+  // M1 — couleur de fond renderer alignée sur la brume bleu-encre. Cohérent
+  // avec scene.background : pas de flash de papier ancien à l'init.
+  renderer.setClearColor(COLORSCRIPT.fogColor, 1.0);
+  // M1 — composer + bloom : les émissifs (lampes, fenêtres, verrières,
+  // enseignes) débordent dans la brume. Recalibré « Veille du Capital » :
+  // strength 0.55 / radius 0.4 / threshold 0.82 (le jour respire à peine,
+  // la nuit s'embrase). Puis GradePass : split-tone + vignette + grain.
+  // Repli gracieux : si EffectComposer absent, composer reste null et la
+  // boucle de rendu retombe sur renderer.render(scene,camera). Zéro erreur.
   if(typeof THREE.EffectComposer!=='undefined' && typeof THREE.UnrealBloomPass!=='undefined'){
-    composer=new THREE.EffectComposer(renderer);
-    composer.addPass(new THREE.RenderPass(scene,camera));
-    bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.45,0.55,0.78);
-    composer.addPass(bloomPass);
-    composer.setSize(innerWidth,innerHeight);
+    try{
+      composer=new THREE.EffectComposer(renderer);
+      composer.addPass(new THREE.RenderPass(scene,camera));
+      bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.55,0.4,0.82);
+      composer.addPass(bloomPass);
+      if(typeof THREE.ShaderPass!=='undefined'){
+        gradePass=new THREE.ShaderPass(GradeShader);
+        gradePass.uniforms.uTime.value=0;
+        composer.addPass(gradePass);
+      }
+      composer.setSize(innerWidth,innerHeight);
+    }catch(err){
+      console.warn('[M1] composer indisponible, bypass propre :', err&&err.message||err);
+      composer=null; bloomPass=null; gradePass=null;
+    }
   }
   renderer.setPixelRatio(Math.min(1.5,devicePixelRatio)); // v33 : cap léger pour retrouver une conduite fluide
   renderer.toneMapping=THREE.ACESFilmicToneMapping;        // v57 : rendu plus riche, hautes lumières douces
   renderer.toneMappingExposure=1.18;
   renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
   document.getElementById('app').appendChild(renderer.domElement);
+  // M1 — qualité par défaut : Haute. Le sélecteur du panneau réglages
+  // l'applique à chaud (composer bypass, taille shadowMap, grain).
+  applyRenderQuality(RENDER_QUALITY);
   // M0 — IBL : si l'AssetManager a livré une texture équirectangulaire HDR,
   // on compile son PMREM ici (le renderer existe) et on la pose sur la scène
-  // avec une intensité basse (ENV_INTENSITY = 0.25). La constante sera relevée
-  // en M1 ; M0 ne change PAS le rendu v66.
+  // avec ENV_INTENSITY = 0.7 (M1 : HDRI = source d'ambiance industrielle).
   if(opts && opts.hdrTexture){
     const pmrem=new THREE.PMREMGenerator(renderer);
     pmrem.compileEquirectangularShader();
@@ -4937,7 +5028,116 @@ function createConeMarker(){ const g=new THREE.Group();
 /* --- peuplement --- */
 let envGroup=null, envProps=[], kickProps=[], envLamps=[], envGears=[], envReady=false;
 let sunLight=null, hemiLight=null;   // v57 : poignées du cycle de lumière
-let composer=null, bloomPass=null;   // v66 : bloom (null si les scripts n'ont pas chargé)
+let composer=null, bloomPass=null, gradePass=null;   // v66/M1 : bloom + GradePass (null si bypass)
+
+/* M1 — GradeShader : ShaderPass terminal, trois effets dans un seul shader.
+   (a) split-tone : ombres tirées vers uShadowTint, hautes lumières vers
+       uHighlightTint, pivot par luminance Y autour de 0.5, force uSplitStrength.
+   (b) vignette radiale douce : assombrissement progressif à partir d'un rayon
+       interne, plafonné à uVignetteMax aux coins.
+   (c) grain de film animé : bruit hash 2D modulé par uTime, amplitude uGrain. */
+const GradeShader = {
+  uniforms:{
+    tDiffuse:        { value:null },
+    uTime:           { value:0 },
+    uShadowTint:     { value:new THREE_BASE.Color(0x2a3550) },
+    uHighlightTint:  { value:new THREE_BASE.Color(0xffc98a) },
+    uSplitPivot:     { value:0.5 },
+    uSplitStrength:  { value:0.35 },
+    uVignetteMax:    { value:0.22 },
+    uGrain:          { value:0.025 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main(){
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform vec3  uShadowTint;
+    uniform vec3  uHighlightTint;
+    uniform float uSplitPivot;
+    uniform float uSplitStrength;
+    uniform float uVignetteMax;
+    uniform float uGrain;
+    varying vec2 vUv;
+
+    float hash21(vec2 p){
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+
+    void main(){
+      vec4 src = texture2D(tDiffuse, vUv);
+      vec3 col = src.rgb;
+
+      // (a) split-tone par luminance
+      float Y = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      float shadowMask    = smoothstep(uSplitPivot, 0.0, Y);
+      float highlightMask = smoothstep(uSplitPivot, 1.0, Y);
+      col = mix(col, col * uShadowTint    * 2.0, shadowMask    * uSplitStrength);
+      col = mix(col, col * uHighlightTint * 2.0, highlightMask * uSplitStrength);
+
+      // (b) vignette radiale
+      vec2 d = vUv - 0.5;
+      float r = length(d) * 1.41421356;        // 0 au centre, ~1 aux coins
+      float vig = smoothstep(0.55, 1.0, r) * uVignetteMax;
+      col *= (1.0 - vig);
+
+      // (c) grain animé
+      if(uGrain > 0.0){
+        float n = hash21(vUv * vec2(1920.0, 1080.0) + uTime * 60.0) - 0.5;
+        col += n * uGrain;
+      }
+
+      gl_FragColor = vec4(col, src.a);
+    }
+  `,
+};
+
+/* M1 — qualité de rendu (Basse/Moyenne/Haute), distincte de GRAPHICS_QUALITY
+   (densité des effets de scène) et DETAIL_LEVEL (peuplement). Pilote la
+   chaîne post-prod : composer bypass, grain, taille shadowMap, ombres. */
+let RENDER_QUALITY = 'high';    // 'low' | 'medium' | 'high'
+let COMPOSER_BYPASS = false;    // forcé en 'low'
+
+function applyRenderQuality(q){
+  if(q !== 'low' && q !== 'medium' && q !== 'high') return;
+  RENDER_QUALITY = q;
+  // Haute  : composer + grain + shadowMap 2048.
+  // Moyenne: composer (post-prod active) + PAS de grain + shadowMap 1024.
+  // Basse  : composer COMPLÈTEMENT bypassé (pas de bloom, pas de grade) + ombres OFF.
+  COMPOSER_BYPASS = (q === 'low');
+  const grain = (q === 'high') ? 0.025 : 0.0;
+  if(gradePass){ gradePass.uniforms.uGrain.value = grain; }
+  let shadowsOn = false, shadowSize = 0;
+  if(typeof renderer !== 'undefined' && renderer){
+    if(q === 'low'){
+      renderer.shadowMap.enabled = false;
+    } else {
+      renderer.shadowMap.enabled = true;
+      shadowSize = (q === 'medium') ? 1024 : 2048;
+      if(sunLight && sunLight.shadow && sunLight.shadow.mapSize.x !== shadowSize){
+        sunLight.shadow.mapSize.set(shadowSize, shadowSize);
+        // dispose force la recréation de la shadow map à la prochaine frame.
+        if(sunLight.shadow.map){ sunLight.shadow.map.dispose(); sunLight.shadow.map = null; }
+      }
+    }
+    shadowsOn = renderer.shadowMap.enabled;
+  }
+  const composerState = (composer && !COMPOSER_BYPASS) ? 'on' : (composer ? 'bypass' : 'absent');
+  // M1b — log lisible pour valider que les 3 niveaux produisent des configs
+  // distinctes. Une seule ligne par changement, à la console.
+  console.info('[M1] render quality =', q,
+    '· composer:', composerState,
+    '· shadowMap:', shadowsOn ? (shadowSize+'×'+shadowSize) : 'off',
+    '· grain:', grain>0 ? 'on('+grain+')' : 'off');
+}
+if(typeof window !== 'undefined') window.applyRenderQuality = applyRenderQuality;
 function envPut(obj,x,z,rot=0,stage=0,kick=false){
   obj.position.set(x,0,z); if(rot) obj.rotation.y=rot; obj.userData.stage=stage;
   envGroup.add(obj); envProps.push({obj,stage});
@@ -7595,7 +7795,11 @@ function loop(){
   updateFx();
   updateFloaters();
   if(pendingEnterSF && !anyModalOpen()){ pendingEnterSF=false; enterSocialFormation(); }
-  if(composer) composer.render(); else renderer.render(scene,camera);
+  // M1 — uTime du GradePass (grain animé). Mis à jour même si bypassé : coût nul.
+  if(gradePass) gradePass.uniforms.uTime.value = t;
+  if(composer && !COMPOSER_BYPASS) composer.render(); else renderer.render(scene,camera);
+  // M1 — métriques #qa (lissées, mises à jour ~10 Hz).
+  qaSampleFrame(dt);
 }
 
 // M0 — init() est appelé depuis src/main.js après le préchargement des assets.

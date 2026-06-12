@@ -66,6 +66,14 @@
   .help kbd{font-family:"IBM Plex Mono",monospace;border:1px solid var(--encre);border-bottom-width:2px;
     border-radius:3px;padding:0 5px;background:var(--papier);font-size:11px}
   .help .hsep{border-top:1px solid #bdab8b;margin:6px 0 5px;padding-top:5px;font-style:italic;opacity:.78}
+  /* M1 — sélecteur Basse/Moyenne/Haute (post-prod) */
+  .help .rq-seg{display:flex;gap:0;margin-top:2px}
+  .help .rq-seg .rq{flex:1;font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:.6px;text-transform:uppercase;
+    border:1.5px solid var(--encre);background:var(--papier);color:var(--encre);cursor:pointer;
+    padding:5px 4px;border-right-width:0}
+  .help .rq-seg .rq:last-child{border-right-width:1.5px}
+  .help .rq-seg .rq:hover{background:#e0d2b6}
+  .help .rq-seg .rq.active{background:var(--encre);color:var(--papier)}
   @media (max-width:1180px){.help{right:14px;top:14px;bottom:auto;width:286px}.help .help-panel{min-width:286px}}
 
   /* ---- voile de démarrage ---- */
@@ -813,6 +821,15 @@
     <div><kbd>R</kbd> — replacer le véhicule</div>
     <div><kbd>B</kbd> — son d'ambiance</div>
     <div class="hsep"><kbd>L</kbd>/<kbd>K</kbd>/<kbd>J</kbd> — performance, qualité, densité</div>
+    <div><kbd>F3</kbd> — afficher fps / draw calls / triangles</div>
+    <div class="hsep" id="render-quality-row">
+      <div style="font-style:normal;opacity:1;text-transform:uppercase;letter-spacing:.7px;font-size:11px;margin-bottom:4px">Rendu (post-prod)</div>
+      <div class="rq-seg" id="rq-seg" role="group" aria-label="Qualité de rendu">
+        <button type="button" class="rq" data-q="low">Basse</button>
+        <button type="button" class="rq" data-q="medium">Moyenne</button>
+        <button type="button" class="rq active" data-q="high">Haute</button>
+      </div>
+    </div>
   </div>
 </div>
 
