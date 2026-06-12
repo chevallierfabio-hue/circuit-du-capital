@@ -1332,7 +1332,10 @@ const Vehicle = {
     }
     if(this.lantern){ const stressed=stress>0.35;
       this.lantern.material.emissive.setHex(stressed?0x8a2c1d:0xffb347);
-      this.lantern.material.emissiveIntensity=0.7+0.4*(0.5+0.5*Math.sin(t*4)); }
+      // M1c — veilleuse calibrée ≤ 1.2 : discrète le jour, douce la nuit, pulse rouge en stress.
+      const _nightF=(typeof DayCycle!=='undefined')?Math.max(0,1-DayCycle.kDay*1.7):0.5;
+      const _pulse=0.5+0.5*Math.sin(t*4);
+      this.lantern.material.emissiveIntensity=0.15+_nightF*(0.55+0.15*_pulse)+(stressed?0.30*_pulse:0); }
     // traînée de poussière à vitesse + vibration moteur à l'arrêt
     if(this.dust){ this._dustT-=dt;
       if(Math.abs(this.speed)>8 && this._dustT<=0){ this._dustT=0.08;
@@ -1762,9 +1765,11 @@ function buildCircuitLine(){
   for(let i=0;i<pts.length;i++){
     const a=pts[i], b=pts[(i+1)%pts.length];
     const dx=b.x-a.x, dz=b.z-a.z, len=Math.hypot(dx,dz);
-    const seg=box(0.5,0.04,len,COL.or,(a.x+b.x)/2,0.05,(a.z+b.z)/2,false);
+    // M1c — peinture au sol : ambre désaturé, jamais émissive (sous threshold bloom)
+    const seg=box(0.5,0.04,len,0x8a6f3a,(a.x+b.x)/2,0.05,(a.z+b.z)/2,false);
     seg.rotation.y=Math.atan2(dx,dz);
-    seg.material.transparent=true; seg.material.opacity=0.5;
+    seg.material.transparent=true; seg.material.opacity=0.42;
+    seg.material.emissiveIntensity=0;
     g.add(seg);
   }
   g.visible=false; circuitLine=g; scene.add(g);
@@ -1787,8 +1792,11 @@ let groundArrow=null;
 function buildGroundArrow(){
   const g=new THREE.Group();
   for(let i=0;i<7;i++){
-    const dash=box(0.42,0.04,1.25,COL.or,0,0.06,0,false);
-    dash.material.transparent=true; dash.material.opacity=0; g.add(dash);
+    // M1c — pointillés peinture au sol : ambre désaturé, jamais émissive
+    const dash=box(0.42,0.04,1.25,0x8a6f3a,0,0.06,0,false);
+    dash.material.transparent=true; dash.material.opacity=0;
+    dash.material.emissiveIntensity=0;
+    g.add(dash);
   }
   groundArrow=g; scene.add(g);
 }
@@ -4442,6 +4450,8 @@ export function init(opts={}){
   addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
   populateEnvironment();
   startIntroTrailer();
+  // M1c — audit one-shot des émissifs après peuplement complet (log console.table)
+  try{ auditEmissiveMaterials(); }catch(_){}
   addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;
     camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);
     if(composer) composer.setSize(innerWidth,innerHeight);});
@@ -4650,7 +4660,7 @@ function createWindow(w=0.8,h=1.0,frame=THEME.ink){ const g=new THREE.Group();
 const _glowCold=new THREE.Color(0x12202a), _glowWarm=new THREE.Color(0xffb45e);
 function updateWindowGlow(){
   const night=Math.max(0,1-DayCycle.kDay*1.7);            // 0 le jour, 1 la nuit
-  if(Vehicle.lampGlass){ Vehicle.lampGlass.material.emissiveIntensity=night*2.2;
+  if(Vehicle.lampGlass){ Vehicle.lampGlass.material.emissiveIntensity=night*1.2;  // M1c — lampe chariot calibrée
     if(Vehicle.lampPool) Vehicle.lampPool.material.opacity=night*0.5; }
   for(const m of distantGlows) m.emissiveIntensity=night*1.6;  // v66 : les villes lointaines veillent
   for(const L of nightLights) L.intensity=physI(night*1.35);
@@ -4666,6 +4676,60 @@ function updateWindowGlow(){
     p.material.emissiveIntensity=0.5+on*(1.6+0.5*Math.sin(t*0.8+p.userData.glowPhase*9));
   }
 }
+
+/* M1c — AUDIT ÉMISSIFS. Parcourt la scène, recense les matériaux émissifs
+   ou très clairs, calcule une luminance approximative (Rec.709 * intensité)
+   et signale ceux qui dépasseraient le threshold du bloom (0.82 par défaut).
+   One-shot à l'init + accessible en console : window.auditEmissiveMaterials().
+   Charte M1c : seuls peuvent fleurir lampes/flammes, fenêtres émissives, soleil
+   et marqueurs d'objectif ponctuels. Tout guidage permanent étendu reste
+   strictement sous le threshold (peinture au sol, pas néon). */
+function auditEmissiveMaterials(){
+  if(typeof scene==='undefined' || !scene){ console.warn('[M1c] audit : scène absente'); return []; }
+  const THRESH=(bloomPass && typeof bloomPass.threshold==='number') ? bloomPass.threshold : 0.82;
+  const rows=[]; const seen=new Set();
+  const ownerName=o=>{
+    let n=[]; let cur=o;
+    while(cur && n.length<3){ if(cur.name) n.push(cur.name); else if(cur.userData&&cur.userData.layer) n.push('@'+cur.userData.layer); cur=cur.parent; }
+    return n.length?n.join('/'):o.type||'mesh';
+  };
+  scene.traverse(o=>{
+    if(!o||!o.material) return;
+    const mats=Array.isArray(o.material)?o.material:[o.material];
+    for(const m of mats){
+      if(!m||seen.has(m.uuid)) continue; seen.add(m.uuid);
+      const eI=(typeof m.emissiveIntensity==='number')?m.emissiveIntensity:0;
+      const eHex=m.emissive?('#'+m.emissive.getHexString()):'-';
+      const cHex=m.color?('#'+m.color.getHexString()):'-';
+      // luminance Rec.709 de la couleur émissive (linéaire 0-1) * intensité
+      let lum=0;
+      if(m.emissive && eI>0){
+        lum=(0.2126*m.emissive.r + 0.7152*m.emissive.g + 0.0722*m.emissive.b)*eI;
+      }
+      // luminance approx de la couleur diffuse (info, ne déclenche pas le bloom seule)
+      let lumDiff=0;
+      if(m.color){ lumDiff=0.2126*m.color.r + 0.7152*m.color.g + 0.0722*m.color.b; }
+      if(eI<=0 && lumDiff<0.78) continue;       // ni émissif, ni très clair : on ignore
+      rows.push({
+        owner: ownerName(o),
+        emissive: eHex,
+        intensity: +eI.toFixed(3),
+        emissiveLum: +lum.toFixed(3),
+        color: cHex,
+        diffuseLum: +lumDiff.toFixed(3),
+        bloomsLikely: (lum>THRESH)?'YES':'no',
+      });
+    }
+  });
+  rows.sort((a,b)=>b.emissiveLum-a.emissiveLum);
+  const overs=rows.filter(r=>r.bloomsLikely==='YES');
+  console.groupCollapsed('[M1c] Audit émissifs · '+rows.length+' matériaux · threshold = '+THRESH.toFixed(2)+' · '+overs.length+' au-dessus');
+  console.table(rows);
+  if(overs.length) console.info('[M1c] Au-dessus du threshold (peuvent fleurir) :', overs.map(r=>r.owner+' @'+r.intensity).join(' · '));
+  console.groupEnd();
+  return rows;
+}
+if(typeof window!=='undefined') window.auditEmissiveMaterials=auditEmissiveMaterials;
 function createDoor(w=1.6,h=2.6,c=0x281f17){ const g=new THREE.Group();
   g.add(box(w+0.24,h+0.18,0.12,COL.brun,0,h/2,0,false));
   const dr=box(w,h,0.12,c,0,h/2,0.06,false); dr.material.map=texWood(); g.add(dr);
