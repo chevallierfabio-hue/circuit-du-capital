@@ -2092,33 +2092,427 @@ function buildEntrepot(g){            // ENTREPÔT — longue halle à arches nu
   // ENSEIGNE M'
   const sp=createSign("M'"); sp.scale.set(2.4, 1.6, 1); sp.position.set(0, 8.50, 5.40); g.add(sp);
 }
-function buildQuartier(g){
-  const rows=[[-6,-3],[-2,-3],[2,-3],[-6,1],[-2,1],[2,1],[5,-1]];
-  rows.forEach((p,i)=>{ const h=createWorkerHouse(2.8+(i%3)*0.5, i%2?COL.froid:0x5f6d79);
-    h.position.set(p[0],0,p[1]); h.rotation.y=(i%2)*0.1; g.add(h); });
-  const rope=createRopeLine(5); rope.position.set(-1,0,4); g.add(rope);
-  const lamp=createLampPost(); lamp.position.set(6,0,3); g.add(lamp);
-  g.add(box(2.4,0.4,0.7,0x5a4530,-5,0.4,4,false));     // banc
+/* =====================================================================
+   M6 Lot C — créations spécifiques au quartier ouvrier.
+   createTenementHouse : maison serrée 2-3 niveaux. Volume CLOS, enduit
+   décrépit laissant voir la brique par plaques (texture 'decrep'),
+   volets dépareillés, fenêtres taggées (M4 : ~25% allumées).
+   ===================================================================== */
+function createTenementHouse(width=3.0, height=6.0, depth=3.2, tone=0x3d4a5c){
+  const g=new THREE.Group();
+  // matières — brique décrépie (laisse voir l'enduit + brique)
+  const brique=briqueTexture('decrep');
+  const matEnduit=new THREE.MeshStandardMaterial({
+    color:tone, map:brique.map, roughnessMap:brique.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const matToit=new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true});
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matCharbon=new THREE.MeshStandardMaterial({color:0x2a241d, roughness:0.95, metalness:0, flatShading:true});
+  const matVolet=new THREE.MeshStandardMaterial({color:0x5a4530, roughness:0.95, metalness:0, flatShading:true});
+  // SOUBASSEMENT (ancrage)
+  g.add(_M5_box(width+0.30, 0.30, depth+0.30, matCharbon, 0, -0.05, 0));
+  // PLINTHE basse
+  g.add(_M5_box(width+0.15, 0.30, depth+0.15, matCharbon, 0, 0.15, 0));
+  // CORPS (volume CLOS)
+  g.add(_M5_box(width, height, depth, tone, 0, 0.30 + height/2, 0)).material=matEnduit;
+  // BANDEAU médian (rappel d'étage)
+  g.add(_M5_box(width+0.06, 0.12, depth+0.06, matCharbon, 0, 0.30 + height*0.45, 0));
+  // CORNICHE
+  g.add(_M5_box(width+0.20, 0.18, depth+0.20, matCharbon, 0, 0.30 + height + 0.09, 0));
+  // TOIT pitched fermé (pignons inclus)
+  const roof=_M6_pitchedClosed(width+0.4, depth+0.4, 0.8, matToit, matEnduit);
+  roof.position.y=0.30 + height + 0.18; g.add(roof);
+  // CHEMINÉE brique
+  g.add(_M5_box(0.45, 1.3, 0.45, matCharbon, width*0.30, 0.30 + height + 0.65, -depth*0.20));
+  g.add(_M5_box(0.55, 0.10, 0.55, matCharbon, width*0.30, 0.30 + height + 1.30, -depth*0.20, false));
+  // FENÊTRES + volets dépareillés (2-3 niveaux). Tagged via createWindow (M4).
+  const levels = Math.floor(height / 1.8);
+  for(let lvl=0; lvl<levels; lvl++){
+    const wy = 0.30 + 1.0 + lvl*1.8;
+    // 2 fenêtres par étage (façade +Z)
+    for(let i=0; i<2; i++){
+      const wx=-width*0.25 + i*(width*0.5);
+      const w=createWindow(0.50, 0.7);
+      w.position.set(wx, wy, depth/2 + 0.04);
+      g.add(w);
+      // 1-2 volets dépareillés (pas toujours pairs)
+      const has1 = ((lvl+i) % 3) !== 0;
+      const has2 = ((lvl*i+i) % 4) !== 0;
+      if(has1){
+        const vL=_M5_box(0.22, 0.78, 0.05, matVolet, wx - 0.40, wy, depth/2 + 0.05, false);
+        vL.rotation.y=-0.25; g.add(vL);
+      }
+      if(has2){
+        const vR=_M5_box(0.22, 0.78, 0.05, matVolet, wx + 0.40, wy, depth/2 + 0.05, false);
+        vR.rotation.y=0.25; g.add(vR);
+      }
+    }
+    // 1 fenêtre par étage (face arrière)
+    const wb=createWindow(0.45, 0.65);
+    wb.position.set(0, wy, -depth/2 - 0.04); wb.rotation.y=Math.PI;
+    g.add(wb);
+    // fenêtres latérales (1 par étage par côté)
+    for(const sx of [-1, 1]){
+      if((lvl + sx) % 2 === 0){
+        const wL=createWindow(0.40, 0.6);
+        wL.position.set(sx*(width/2 + 0.04), wy, 0);
+        wL.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2;
+        g.add(wL);
+      }
+    }
+  }
+  // PORTE rdc (côté +Z) + seuil
+  const dr=_M5_box(0.7, 1.5, 0.06, matBois, 0, 0.30 + 0.85, depth/2 + 0.03);
+  g.add(dr);
+  g.add(_M5_box(0.9, 0.10, 0.20, matCharbon, 0, 0.35, depth/2 + 0.12, false));
+  // décrépitude : 1-2 plaques sombres sur les murs (humidité)
+  for(const sx of [-1, 1]){
+    const mark=new THREE.Mesh(new THREE.PlaneGeometry(width*0.35, 0.55),
+      new THREE.MeshBasicMaterial({color:0x18141a, transparent:true, opacity:0.30, depthWrite:false}));
+    mark.position.set(sx*width*0.18, 0.55, depth/2 + 0.045);
+    g.add(mark);
+  }
+  return g;
 }
-function buildMarcheMP(g){            // moyens de production : halle, matières, machines
-  const hall=box(16,5.5,9,0x6e5c44,0,2.75,-1); hall.material.map=texBrick(); g.add(hall); addOutline(hall);
-  const roof=createRoof('pitched',16,9,0x4a3f33); roof.position.set(0,5.5,-1); g.add(roof);
-  g.add(box(4,4.2,0.3,0x2a221a,0,2.1,3.4,false));       // grande ouverture
-  const coal=createCoalPile(); coal.position.set(6,0,5); g.add(coal);
-  for(let i=0;i<3;i++){ const s=createSack(i%2?0xc9b78c:0xbfa97e); s.position.set(-7+i*1.2,0,5); g.add(s); }
-  const fer=createCrate(1.4,0x8a8076); fer.position.set(-7,0,3); g.add(fer);
-  const pulley=createPulley(); pulley.position.set(4,4,4); g.add(pulley);
-  const cart=createSmallCart(); cart.position.set(0,0,6); g.add(cart);
-  const sp=createSign('M'); sp.scale.set(2.1,1.6,1); sp.position.set(0,5.4,3.4); g.add(sp);
+function createLaundryLine(len=3.5, height=3.8){
+  const g=new THREE.Group();
+  const matCorde=new THREE.MeshStandardMaterial({color:0x2a241d, roughness:0.95, metalness:0});
+  const cols=[0xc8b878, 0x8a3b2a, 0x4d5f70, 0xb89758, 0x6b513a];
+  // corde
+  g.add(_M5_box(0.04, 0.04, len, matCorde, 0, height, 0, false));
+  // 4-5 linges suspendus (planches transparentes)
+  const N=4;
+  for(let i=0; i<N; i++){
+    const cz=-len/2 + 0.6 + i*((len-1.2)/(N-1));
+    const ch=0.7 + Math.random()*0.4;
+    const cl=cols[(i*3) % cols.length];
+    const cloth=new THREE.Mesh(new THREE.PlaneGeometry(0.55, ch),
+      new THREE.MeshStandardMaterial({color:cl, side:THREE.DoubleSide, roughness:0.95, flatShading:true}));
+    cloth.position.set(0, height - 0.05 - ch/2, cz);
+    cloth.rotation.y=Math.PI/2;
+    g.add(cloth);
+  }
+  return g;
 }
-function buildMarcheTravail(g){       // place sociale : bureau d'embauche + file d'ouvriers
-  const office=box(6,4,4,0x6c7d8c,-3,2,-2); office.material.map=texBrick(); g.add(office); addOutline(office);
-  const roof=createRoof('pitched',6,4,0x46393b); roof.position.set(-3,4,-2); g.add(roof);
-  const dr=createDoor(1.4,2.4,0x281f17); dr.position.set(-3,0,0.05); g.add(dr);
-  const sp=createSign('Ft'); sp.scale.set(2.2,1.5,1); sp.position.set(-3,5.2,0); g.add(sp);
-  g.add(box(3.4,0.4,0.7,0x5a4530,2,0.4,-3,false));      // banc
-  const wk=(x,z,pose)=>{ const w=createWorkerFigure({pose}); w.position.set(x,0,z); w.rotation.y=Math.random()*0.6-0.3; g.add(w); };
-  wk(2,1,'idle'); wk(3.3,2.1,'slump'); wk(1.4,3,'idle');
+
+function buildQuartier(g){            // QUARTIER OUVRIER — maisons étroites serrées, décrépit
+  // ALIGNEMENT serré (front à la rue) — 6 maisons collées en rangée
+  // empreinte de zone : ±9. On compose 3 rangées de 2.
+  const layouts=[
+    // [x, z, w, h, d, tone, rot]
+    [-6.0, -3.0, 2.8, 5.5, 3.0, 0x3d4a5c, 0.05],
+    [-3.0, -3.0, 2.4, 6.5, 3.0, 0x344151, 0],
+    [ 0.0, -3.0, 2.8, 5.2, 3.0, 0x4a5462, -0.02],
+    [ 3.0, -3.0, 2.4, 6.0, 3.0, 0x3a4654, 0],
+    [ 6.0, -3.0, 2.6, 5.8, 3.0, 0x3d4a5c, 0.03],
+    [-6.0,  2.0, 2.6, 5.0, 3.0, 0x4a5462, 0.05],
+    [-3.0,  2.0, 2.4, 6.2, 3.0, 0x344151, 0],
+    [ 0.0,  2.0, 2.8, 5.5, 3.0, 0x3d4a5c, 0],
+    [ 3.0,  2.0, 2.6, 5.8, 3.0, 0x3a4654, 0.04],
+    [ 6.0,  2.0, 2.4, 6.0, 3.0, 0x4a5462, 0],
+  ];
+  for(const [x,z,w,h,d,tone,rot] of layouts){
+    const house=createTenementHouse(w, h, d, tone);
+    house.position.set(x, 0, z); house.rotation.y=rot;
+    g.add(house);
+  }
+  // LINGE TENDU entre 2 maisons (façade ouest)
+  const laundry1=createLaundryLine(2.6, 3.5); laundry1.position.set(-4.5, 0, -1.5); g.add(laundry1);
+  const laundry2=createLaundryLine(2.6, 3.5); laundry2.position.set(1.5, 0, -1.5); g.add(laundry2);
+  const laundry3=createLaundryLine(2.6, 3.0); laundry3.position.set(-4.5, 0, 4.5); g.add(laundry3);
+
+  // RUELLE pavée centrale (sombre)
+  const pave=paveTexture(0);
+  pave.map.repeat.set(2.5, 0.5); pave.roughnessMap.repeat.set(2.5, 0.5);
+  const ruelle=new THREE.Mesh(new THREE.PlaneGeometry(18, 1.6),
+    new THREE.MeshStandardMaterial({color:0x55473a, map:pave.map, roughnessMap:pave.roughnessMap, roughness:1.0, metalness:0}));
+  ruelle.rotation.x=-Math.PI/2; ruelle.position.set(0, 0.02, -0.5);
+  ruelle.receiveShadow=true; g.add(ruelle);
+
+  // LAMPADAIRE + BANC (existants)
+  const lamp=createLampPost(); lamp.position.set(7, 0, -0.5); g.add(lamp);
+  g.add(_M5_box(2.4, 0.40, 0.7, new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true}),
+    -7, 0.20, -0.5));
+}
+
+function buildMarcheMP(g){            // HALLE BALTARD — fer + verre + colonnes fonte
+  const matFonte=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  const matFerLight=new THREE.MeshStandardMaterial({color:0x3a322a, roughness:0.6, metalness:0.5, flatShading:true});
+  const brique=briqueTexture('std');
+  const matBrique=new THREE.MeshStandardMaterial({
+    color:0x5a3026, map:brique.map, roughnessMap:brique.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const pierre=pierreDeTailleTexture('sombre');
+  const matPierre=new THREE.MeshStandardMaterial({
+    color:0x6b6055, map:pierre.map, roughnessMap:pierre.roughnessMap, roughness:1.0, metalness:0,
+  });
+  // VERRIÈRE émissive DOUCE (gasLight, pas forge — le marché brille tranquille)
+  const matVerriere=new THREE.MeshStandardMaterial({
+    color:0x5a564f, emissive:new THREE.Color(COLORSCRIPT.gasLight), emissiveIntensity:0.55,
+    transparent:true, opacity:0.85,
+    roughness:0.4, metalness:0.4, flatShading:true,
+  });
+
+  // SOUBASSEMENT + plinthe en pierre
+  g.add(_M5_box(17.0, 0.40, 10.0, matPierre, 0, -0.05, -1));
+  g.add(_M5_box(16.4, 0.50, 9.4, matPierre, 0, 0.25, -1));
+
+  // MUR BAS en brique périphérique (~1 m de haut)
+  // 4 panneaux, laissant des coins ouverts pour les colonnes d'angle
+  const wallH=1.2, wallTh=0.30;
+  // façades nord + sud
+  g.add(_M5_box(16.0, wallH, wallTh, matBrique, 0, 0.50 + wallH/2, -1 - 4.5 - wallTh/2));
+  g.add(_M5_box(16.0, wallH, wallTh, matBrique, 0, 0.50 + wallH/2, -1 + 4.5 + wallTh/2));
+  // flancs (avec ouverture centrale 2.4 m)
+  for(const sx of [-1, 1]){
+    g.add(_M5_box(wallTh, wallH, 3.0, matBrique, sx*(8.0 + wallTh/2), 0.50 + wallH/2, -1 - 2.7));
+    g.add(_M5_box(wallTh, wallH, 3.0, matBrique, sx*(8.0 + wallTh/2), 0.50 + wallH/2, -1 + 2.7));
+  }
+  // bandeau de pierre au-dessus du mur bas (couronnement)
+  for(const sz of [-1, 1])
+    g.add(_M5_box(16.8, 0.18, 0.36, matPierre, 0, 0.50 + wallH + 0.09, -1 + sz*(4.5 + wallTh)));
+  for(const sx of [-1, 1])
+    g.add(_M5_box(0.36, 0.18, 9.4, matPierre, sx*(8.0 + wallTh), 0.50 + wallH + 0.09, -1));
+
+  // COLONNES de FONTE — fines, fluted (suggéré par cylindres + bagues)
+  const colH=5.2;
+  for(let i=0; i<6; i++){
+    for(const sz of [-1, 1]){
+      const cx=-7.0 + i*2.8;
+      const cz=-1 + sz*4.3;
+      // base carrée
+      g.add(_M5_box(0.45, 0.20, 0.45, matFonte, cx, 0.62, cz));
+      // fût
+      const shaft=new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, colH, 12), matFonte);
+      shaft.position.set(cx, 0.72 + colH/2, cz); g.add(shaft);
+      // chapiteau
+      g.add(_M5_box(0.40, 0.20, 0.40, matFonte, cx, 0.72 + colH + 0.10, cz));
+      // bague à mi-hauteur
+      g.add(_M5_box(0.22, 0.10, 0.22, matFonte, cx, 0.72 + colH*0.5, cz));
+    }
+  }
+  // 2 colonnes centrales (longue arête médiane — soutiennent le faîte)
+  for(let i=0; i<4; i++){
+    const cx=-5.0 + i*3.3;
+    const shaft=new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, colH+1.5, 12), matFonte);
+    shaft.position.set(cx, 0.62 + (colH+1.5)/2, -1);
+    g.add(shaft);
+    g.add(_M5_box(0.40, 0.20, 0.40, matFonte, cx, 0.62 + colH+1.5 + 0.10, -1));
+  }
+
+  // POUTRES MAÎTRESSES horizontales (fer en treillis) — connectent les colonnes
+  // 4 poutres longitudinales le long de chaque côté + 6 poutres transversales
+  for(const sz of [-1, 1]){
+    g.add(_M5_box(16.0, 0.18, 0.18, matFonte, 0, 0.72 + colH + 0.22, -1 + sz*4.3));
+  }
+  for(let i=0; i<6; i++){
+    const cx=-7.0 + i*2.8;
+    g.add(_M5_box(0.18, 0.18, 8.4, matFonte, cx, 0.72 + colH + 0.22, -1));
+  }
+  // faîtière centrale (plus haute)
+  g.add(_M5_box(15.0, 0.20, 0.20, matFonte, 0, 0.62 + colH + 1.5 + 0.22, -1));
+
+  // VERRIÈRE — toit à 2 pentes en panneaux vitrés
+  const slope=0.45;
+  const panLen=Math.hypot(4.3, 1.7);
+  for(const sz of [-1, 1]){
+    const panel=new THREE.Mesh(new THREE.BoxGeometry(15.6, 0.10, panLen + 0.4), matVerriere);
+    panel.rotation.x = sz * slope;
+    panel.position.set(0, 0.72 + colH + 1.0, -1 + sz*4.3*0.5);
+    g.add(panel);
+  }
+  // structure fer entre les panneaux (faîtage)
+  g.add(_M5_box(15.6, 0.20, 0.20, matFonte, 0, 0.72 + colH + 1.6, -1));
+  // PIGNONS — fer + verre pour fermer les bouts (volume clos)
+  for(const sx of [-1, 1]){
+    const gablShape=new THREE.Shape();
+    gablShape.moveTo(-4.5, 0); gablShape.lineTo(4.5, 0);
+    gablShape.lineTo(0, 1.5); gablShape.lineTo(-4.5, 0);
+    const gablGeo=new THREE.ExtrudeGeometry(gablShape, {depth: 0.12, bevelEnabled:false});
+    const gable=new THREE.Mesh(gablGeo, matVerriere);
+    gable.position.set(sx*8.0, 0.72 + colH + 0.20, -1);
+    gable.rotation.y=sx>0 ? Math.PI/2 : -Math.PI/2;
+    g.add(gable);
+  }
+
+  // SOL PAVÉ sous la halle
+  const pave=paveTexture(2);
+  pave.map.repeat.set(3, 2); pave.roughnessMap.repeat.set(3, 2);
+  const sol=new THREE.Mesh(new THREE.PlaneGeometry(15.4, 8.4),
+    new THREE.MeshStandardMaterial({color:0x88796a, map:pave.map, roughnessMap:pave.roughnessMap, roughness:1.0, metalness:0}));
+  sol.rotation.x=-Math.PI/2; sol.position.set(0, 0.55, -1);
+  sol.receiveShadow=true; g.add(sol);
+
+  // ÉTALS sous la halle (3 stalls espacés)
+  for(let i=0; i<3; i++){
+    const stall=createMarketStall(i%2 ? COL.rouge : COL.bleu);
+    stall.position.set(-4.5 + i*4.5, 0.55, -1);
+    g.add(stall);
+  }
+
+  // MARCHANDISES (existant)
+  const coal=createCoalPile(); coal.position.set(6, 0.55, 1.8); g.add(coal);
+  for(let i=0; i<3; i++){
+    const s=createSack(i%2 ? 0xc9b78c : 0xbfa97e);
+    s.position.set(-7+i*1.2, 0.55, 1.8); g.add(s);
+  }
+  const fer=createCrate(1.4, 0x8a8076); fer.position.set(-7, 0.55, -0.5); g.add(fer);
+  const cart=createSmallCart(); cart.position.set(0, 0.55, 2.6); g.add(cart);
+
+  // ENSEIGNE M
+  const sp=createSign('M'); sp.scale.set(2.4, 1.7, 1);
+  sp.position.set(0, 0.72 + colH + 1.5, 3.6); g.add(sp);
+}
+
+function buildMarcheTravail(g){       // PLACE SOCIALE — bureau d'embauche + mur d'affiches
+  const brique=briqueTexture('std');
+  const matBrique=new THREE.MeshStandardMaterial({
+    color:0x5a3026, map:brique.map, roughnessMap:brique.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const briqueH=briqueTexture('haut');
+  const matBriqueH=new THREE.MeshStandardMaterial({
+    color:0x4a2620, map:briqueH.map, roughnessMap:briqueH.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const pierre=pierreDeTailleTexture('sombre');
+  const matPierre=new THREE.MeshStandardMaterial({
+    color:0x6b6055, map:pierre.map, roughnessMap:pierre.roughnessMap, roughness:1.0, metalness:0,
+  });
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  const matToit=new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true});
+
+  // BUREAU D'EMBAUCHE (volume CLOS)
+  // empreinte 6×4 ; soubassement + plinthe + corps + corniche + toit pitched fermé
+  const bcx=-3, bcz=-2;
+  g.add(_M5_box(6.6, 0.30, 4.6, matPierre, bcx, -0.05, bcz));
+  g.add(_M5_box(6.2, 0.45, 4.2, matPierre, bcx, 0.225, bcz));
+  g.add(_M5_box(6.0, 3.4, 4.0, matBrique, bcx, 0.45 + 1.7, bcz));
+  // bandeaux
+  g.add(_M5_box(6.2, 0.18, 4.2, matBriqueH, bcx, 0.45 + 3.4 + 0.09, bcz));
+  // toit pitched fermé
+  const bRoof=_M6_pitchedClosed(6.4, 4.4, 1.2, matToit, matBriqueH);
+  bRoof.position.set(bcx, 0.45 + 3.4 + 0.18, bcz); g.add(bRoof);
+  // petite cheminée
+  g.add(_M5_box(0.40, 1.0, 0.40, matBriqueH, bcx + 2.0, 0.45 + 3.4 + 0.50, bcz - 0.8));
+
+  // GUICHET (petit comptoir saillant côté façade +Z)
+  g.add(_M5_box(2.0, 1.6, 0.55, matBois, bcx + 1.6, 0.45 + 0.80, bcz + 2.05));
+  // tablette du guichet
+  g.add(_M5_box(2.2, 0.10, 0.65, matPierre, bcx + 1.6, 0.45 + 1.62, bcz + 2.05));
+  // grille du guichet
+  for(let i=0; i<5; i++){
+    g.add(_M5_box(0.03, 0.5, 0.03, matFer, bcx + 0.7 + i*0.45, 0.45 + 2.05, bcz + 2.10));
+  }
+
+  // PORTE
+  const dr=createDoor(1.0, 2.0, 0x281f17); dr.position.set(bcx - 1.6, 0.45, bcz + 2.0); g.add(dr);
+
+  // FENÊTRES (façade + flancs + arrière)
+  for(const wx of [bcx - 1.6 + 0.85]){
+    const w=createWindow(0.6, 0.85); w.position.set(wx, 0.45 + 2.4, bcz + 2.04); g.add(w);
+  }
+  for(const sx of [-1, 1]){
+    const w=createWindow(0.55, 0.8); w.position.set(bcx + sx*3.04, 0.45 + 2.0, bcz);
+    w.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2; g.add(w);
+  }
+  // arrière
+  for(const fx of [bcx - 1.5, bcx + 1.5]){
+    const w=createWindow(0.55, 0.8); w.position.set(fx, 0.45 + 2.0, bcz - 2.04);
+    w.rotation.y=Math.PI; g.add(w);
+  }
+
+  // MUR D'AFFICHES D'EMBAUCHE — 4 m de long, devant le bureau côté droit
+  // panneau bois + 6 affiches en planche colorée avec texte
+  const wallCx=2.5, wallCz=-1.5;
+  g.add(_M5_box(4.8, 2.6, 0.20, matBois, wallCx, 1.30, wallCz));
+  // poteaux du mur
+  for(const sx of [-1, 1])
+    g.add(_M5_box(0.20, 3.0, 0.20, matBois, wallCx + sx*2.4, 1.50, wallCz));
+  // toit débord (auvent) au-dessus du mur
+  g.add(_M5_box(5.2, 0.10, 0.85, matBois, wallCx, 2.75, wallCz + 0.32, false));
+  // 6 AFFICHES — créées par helper avec textes d'époque
+  const affichesT=[
+    'CHERCHE OUVRIERS\nUSINE BRANDT\n14 H/jour',
+    'TISSEURS\nÉCHELLE EXTRA',
+    'EMBAUCHE\nCHARRETIERS',
+    'MANŒUVRES\nde toutes mains',
+    'ON DEMANDE\nFEMMES\n+ ENFANTS',
+    'JOURNALIERS\nSOLDE QUOTIDIEN',
+  ];
+  for(let i=0; i<6; i++){
+    const af=_M6_afficheTex(affichesT[i], i);
+    const cx=wallCx - 2.0 + (i % 3)*2.0;
+    const cy= i < 3 ? 1.85 : 1.05;
+    const affiche=new THREE.Mesh(new THREE.PlaneGeometry(0.72, 0.90),
+      new THREE.MeshStandardMaterial({map:af, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true}));
+    affiche.position.set(cx, cy, wallCz + 0.11);
+    g.add(affiche);
+  }
+
+  // BARRIÈRE DE FILE en fer (zigzag) — 4 segments simples
+  const matRail=new THREE.MeshStandardMaterial({color:0x14181f, roughness:0.5, metalness:0.7, flatShading:true});
+  for(let i=0; i<4; i++){
+    const bx=0.5 + (i%2)*1.4;
+    const bz=1.5 - i*1.2;
+    // poteau
+    g.add(_M5_box(0.10, 1.0, 0.10, matRail, bx, 0.5, bz));
+    // rail vers le suivant
+    if(i < 3){
+      const nbx=0.5 + ((i+1)%2)*1.4;
+      const nbz=1.5 - (i+1)*1.2;
+      const dx=nbx - bx, dz=nbz - bz;
+      const L=Math.hypot(dx, dz);
+      const rail=_M5_box(L, 0.04, 0.06, matRail, (bx+nbx)/2, 0.85, (bz+nbz)/2, false);
+      rail.rotation.y=Math.atan2(dx, dz) - Math.PI/2;
+      g.add(rail);
+    }
+  }
+
+  // BANC (existant)
+  g.add(_M5_box(3.4, 0.40, 0.70, matBois, 4, 0.40, -3));
+
+  // ENSEIGNE Ft
+  const sp=createSign('Ft'); sp.scale.set(2.4, 1.6, 1); sp.position.set(bcx, 5.3, bcz + 2.1); g.add(sp);
+}
+
+/* _M6_afficheTex — affiche d'embauche canvas avec typo d'époque (script + numéral) */
+function _M6_afficheTex(text, seed=0){
+  const c=document.createElement('canvas'); c.width=256; c.height=320;
+  const x=c.getContext('2d');
+  // papier jauni vieilli
+  const baseR=224+(seed*7) % 16, baseG=210+(seed*5) % 12, baseB=180+(seed*3) % 14;
+  x.fillStyle=`rgb(${baseR},${baseG},${baseB})`;
+  x.fillRect(0,0,256,320);
+  // taches d'usure
+  for(let i=0; i<20; i++){
+    x.fillStyle='rgba(80,60,40,0.10)';
+    x.beginPath(); x.arc(Math.random()*256, Math.random()*320, 4+Math.random()*12, 0, Math.PI*2); x.fill();
+  }
+  // bord (cadre noir simple)
+  x.strokeStyle='#241f17'; x.lineWidth=4;
+  x.strokeRect(8, 8, 240, 304);
+  // ornement haut
+  x.strokeStyle='#241f17'; x.lineWidth=1.5;
+  for(let i=0; i<8; i++){
+    x.beginPath(); x.arc(32+i*28, 32, 5, 0, Math.PI*2); x.stroke();
+  }
+  // texte
+  x.fillStyle='#181410'; x.textAlign='center';
+  const lines=text.split('\n');
+  let fontH=lines[0].length > 12 ? 22 : 26;
+  for(let i=0; i<lines.length; i++){
+    x.font=`700 ${i===0 ? fontH : fontH-4}px "Zilla Slab", serif`;
+    x.fillText(lines[i], 128, 80 + i*32);
+  }
+  // numéral d'époque en bas
+  x.font='italic 18px "Zilla Slab", serif';
+  x.fillText('Ann. ' + (1850 + (seed*7)%30), 128, 290);
+  const tex=new THREE.CanvasTexture(c);
+  return tex;
 }
 function buildEtat(g){               // « la machine froide » — rigide, administrative
   const enduit=enduitTexture();
@@ -2322,15 +2716,159 @@ function buildEtat(g){               // « la machine froide » — rigide, admi
   // ---------- TAMPON ROUGE (clin d'œil bureaucratique, intact) ----------
   g.add(box(1.0, 1.0, 0.10, COL.rouge, 4.6, 5.2, 4.10, false));
 }
-function buildTerresCommunes(g){      // champs ouverts puis clôturés (enclosure)
-  for(let i=-1;i<=1;i++) g.add(box(7,0.3,7,0x77833f + i*0,i*8,0.15,0,false));
-  // clôtures : posts + rails (la séparation des producteurs et des moyens)
-  const fence=(x0,z0,x1,z1)=>{ const n=6;
-    for(let i=0;i<=n;i++){ const x=x0+(x1-x0)*i/n, z=z0+(z1-z0)*i/n; g.add(box(0.25,1.6,0.25,0x6b5436,x,0.8,z)); }
-    const dx=x1-x0,dz=z1-z0,len=Math.hypot(dx,dz);
-    const rail=box(len,0.2,0.15,0x6b5436,(x0+x1)/2,1.2,(z0+z1)/2,false);
-    rail.rotation.y=Math.atan2(dx,dz)-Math.PI/2; g.add(rail); };
-  fence(-9,-9,9,-9); fence(9,-9,9,9);
+/* =====================================================================
+   M6 Lot C — ARBRES AMÉLIORÉS pour les terres communes.
+   3 gabarits : trogne (large, court, ramassé), peuplier (étroit, élancé),
+   chêne (large, arrondi). Troncs en cylindres IRRÉGULIERS (segments
+   décalés), feuillage en sphères déformées (PAS de cônes — la doctrine
+   M6 interdit les cônes pour les arbres).
+   ===================================================================== */
+function _M6_tree(kind='chene'){
+  const g=new THREE.Group();
+  const matTronc=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matFeuillage=new THREE.MeshStandardMaterial({color:0x6b7a4a, roughness:0.95, metalness:0, flatShading:true});
+  const matFeuillageS=new THREE.MeshStandardMaterial({color:0x5a6a3e, roughness:0.95, metalness:0, flatShading:true});
+  if(kind==='trogne'){
+    // trogne : tronc court (1.5m), épais, branche-en-tête en boule rabattue + petites repousses
+    const trunk=new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.52, 1.6, 8), matTronc);
+    trunk.position.y=0.8; g.add(trunk);
+    // segment supérieur élargi (la tête noueuse)
+    const head=new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.55, 0.4, 8), matTronc);
+    head.position.y=1.80; g.add(head);
+    // feuillage : 1 grosse sphère aplatie + 3 petites repousses
+    const main=new THREE.Mesh(new THREE.SphereGeometry(1.35, 8, 6), matFeuillage);
+    main.scale.set(1.0, 0.55, 1.0);
+    main.position.y=2.4; g.add(main);
+    for(let i=0; i<3; i++){
+      const a=(i/3)*Math.PI*2;
+      const sm=new THREE.Mesh(new THREE.SphereGeometry(0.55, 7, 5), matFeuillageS);
+      sm.scale.set(0.95, 0.85, 0.95);
+      sm.position.set(Math.cos(a)*1.1, 2.0 + Math.sin(a)*0.3, Math.sin(a)*1.1);
+      g.add(sm);
+    }
+  } else if(kind==='peuplier'){
+    // peuplier : étroit, élancé, tronc 5m, feuillage en colonne (sphères empilées)
+    // tronc en 3 segments légèrement décalés (irrégularité)
+    const segs=[
+      {r1:0.30, r2:0.34, h:1.8, y:0.9, dx:0, dz:0},
+      {r1:0.26, r2:0.30, h:1.8, y:2.7, dx:0.04, dz:0.02},
+      {r1:0.20, r2:0.26, h:1.8, y:4.5, dx:0.06, dz:-0.03},
+    ];
+    for(const s of segs){
+      const m=new THREE.Mesh(new THREE.CylinderGeometry(s.r1, s.r2, s.h, 8), matTronc);
+      m.position.set(s.dx, s.y, s.dz); g.add(m);
+    }
+    // feuillage colonne : 3 sphères allongées empilées
+    for(let i=0; i<3; i++){
+      const m=new THREE.Mesh(new THREE.SphereGeometry(0.85, 8, 6), matFeuillage);
+      m.scale.set(0.6, 1.1, 0.6);
+      m.position.set((i%2 ? 0.10 : -0.05), 4.2 + i*1.3, (i%2 ? -0.05 : 0.10));
+      g.add(m);
+    }
+    // sphère sommitale plus petite
+    const top=new THREE.Mesh(new THREE.SphereGeometry(0.55, 7, 5), matFeuillageS);
+    top.scale.set(0.6, 1.0, 0.6); top.position.y=8.4; g.add(top);
+  } else {
+    // CHÊNE : large couronne arrondie, tronc en 2 segments
+    const seg1=new THREE.Mesh(new THREE.CylinderGeometry(0.50, 0.62, 1.6, 8), matTronc);
+    seg1.position.y=0.8; g.add(seg1);
+    const seg2=new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.50, 1.4, 8), matTronc);
+    seg2.position.set(0.05, 2.30, -0.04); g.add(seg2);
+    // couronne : 4 sphères qui se chevauchent
+    const cnt=[
+      [0,    3.4, 0,    1.65, 1.30, 1.65],
+      [0.95, 3.7, 0.5,  1.10, 0.95, 1.10],
+      [-0.7, 3.5, 0.8,  1.05, 0.90, 1.05],
+      [0.4,  3.9, -0.7, 0.95, 0.85, 0.95],
+    ];
+    for(const [x, y, z, sx, sy, sz] of cnt){
+      const m=new THREE.Mesh(new THREE.SphereGeometry(1.0, 9, 7),
+        (Math.random()<0.5 ? matFeuillage : matFeuillageS));
+      m.position.set(x, y, z); m.scale.set(sx, sy, sz);
+      g.add(m);
+    }
+  }
+  return g;
+}
+
+function buildTerresCommunes(g){      // CHAMPS OUVERTS PUIS CLÔTURÉS — enclosure
+  // matières
+  const matTerre=new THREE.MeshStandardMaterial({color:0x77833f, roughness:1.0, metalness:0, flatShading:true});
+  const matTerre2=new THREE.MeshStandardMaterial({color:0x6c7838, roughness:1.0, metalness:0, flatShading:true});
+  const matTerre3=new THREE.MeshStandardMaterial({color:0x807a45, roughness:1.0, metalness:0, flatShading:true});
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matHaie=new THREE.MeshStandardMaterial({color:0x5a6a3e, roughness:0.95, metalness:0, flatShading:true});
+
+  // 3 PARCELLES (les communs labourés, séparées par sillons)
+  g.add(_M5_box(7.5, 0.30, 7.5, matTerre, -8, 0.15, 0));
+  g.add(_M5_box(7.5, 0.30, 7.5, matTerre2, 0, 0.15, 0));
+  g.add(_M5_box(7.5, 0.30, 7.5, matTerre3, 8, 0.15, 0));
+  // sillons (lignes de labour) — overlays
+  for(const cx of [-8, 0, 8]){
+    for(let i=-3; i<=3; i++){
+      g.add(_M5_box(6.8, 0.04, 0.10,
+        new THREE.MeshStandardMaterial({color:0x55603a, roughness:1.0, metalness:0, flatShading:true}),
+        cx, 0.32, i*1.0, false));
+    }
+  }
+
+  // CLÔTURES D'ENCLOSURE — posts + rails (3 côtés : sud + est + ouest entièrement clôturés ;
+  // le côté nord reste ouvert pour préserver le couplage scénique existant).
+  // Posts épais en bois, plus durs que l'ancien
+  const fence=(x0, z0, x1, z1)=>{
+    const dx=x1-x0, dz=z1-z0, len=Math.hypot(dx, dz);
+    const n=Math.max(2, Math.round(len/2.0));
+    for(let i=0; i<=n; i++){
+      const x=x0 + dx*i/n, z=z0 + dz*i/n;
+      const post=_M5_box(0.28, 1.6, 0.28, matBois, x, 0.80, z);
+      g.add(post);
+    }
+    // 2 rails horizontaux
+    for(const ry of [0.45, 1.15]){
+      const rail=_M5_box(len, 0.18, 0.12, matBois, (x0+x1)/2, ry, (z0+z1)/2, false);
+      rail.rotation.y=Math.atan2(dx, dz) - Math.PI/2;
+      g.add(rail);
+    }
+  };
+  // 3 côtés clôturés (la cage économique de l'accumulation primitive)
+  fence(-11.5, -9, 11.5, -9);
+  fence( 11.5, -9, 11.5,  9);
+  fence(-11.5, -9, -11.5,  9);
+
+  // HAIES BASSES (sphères de feuillage le long des clôtures)
+  for(const [x0, z0, x1, z1] of [[-11.5,-9, 11.5,-9], [11.5,-9, 11.5,9], [-11.5,-9, -11.5,9]]){
+    const dx=x1-x0, dz=z1-z0, len=Math.hypot(dx, dz);
+    const n=Math.floor(len/1.4);
+    for(let i=0; i<n; i++){
+      const t=(i+0.5)/n;
+      const x=x0+dx*t, z=z0+dz*t;
+      const h=new THREE.Mesh(new THREE.SphereGeometry(0.55+Math.random()*0.20, 7, 5), matHaie);
+      h.scale.set(1.0, 0.55, 0.85 + Math.random()*0.2);
+      h.position.set(x, 0.40, z); g.add(h);
+    }
+  }
+
+  // ARBRES — 3 gabarits répartis (PAS de cônes)
+  // 2 chênes au centre des communs (généreux)
+  const chene1=_M6_tree('chene'); chene1.position.set(-3, 0.3, 5); g.add(chene1);
+  const chene2=_M6_tree('chene'); chene2.position.set(5, 0.3, -5); chene2.rotation.y=1.2; g.add(chene2);
+  // 1 trogne (le bétail vient s'y abriter)
+  const trogne=_M6_tree('trogne'); trogne.position.set(-7, 0.3, -6); g.add(trogne);
+  // 2 peupliers en alignement (rappellent la rive)
+  const peuplier1=_M6_tree('peuplier'); peuplier1.position.set(9, 0.3, 5); g.add(peuplier1);
+  const peuplier2=_M6_tree('peuplier'); peuplier2.position.set(11, 0.3, 7); g.add(peuplier2);
+
+  // PIERRE-BORNE au coin (rappel des bornes coutumières)
+  g.add(_M5_box(0.40, 0.85, 0.40,
+    new THREE.MeshStandardMaterial({color:0x8a7f6a, roughness:1.0, metalness:0, flatShading:true}),
+    -11.5, 0.425, 8.5));
+  // moutons en pierre suggérés (petites sphères blanches) — clin d'œil pastoral
+  for(let i=0; i<3; i++){
+    const sheep=new THREE.Mesh(new THREE.SphereGeometry(0.30, 7, 5),
+      new THREE.MeshStandardMaterial({color:0xb8b09a, roughness:0.95, metalness:0, flatShading:true}));
+    sheep.scale.set(1.2, 0.85, 0.8);
+    sheep.position.set(-4 + i*1.5, 0.55, -3); g.add(sheep);
+  }
 }
 function buildMines(g){               // MINES — chevalement, entrée étayée, terrils noirs
   const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
