@@ -806,6 +806,9 @@ function buildWorld(){
   defineZone('Port · Marché mondial',      102,  2, COL.bleu,   '',    buildPort);
 
   buildMainStreet();   // v52 : la grand-rue, épine dorsale visible dès le premier instant
+  buildGroundPatches();// M3 — transitions de classe au sol (4 matières distinctes)
+  buildPuddles();      // M3 — flaques réfléchissantes : seules surfaces non mates du sol
+  buildGroundDebris(); // M3 — papiers / éclats / pierres en InstancedMesh
   buildWaterEast();    // v56 : le littoral — le port donne sur l'eau, la rue débouche sur le monde
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
@@ -1094,22 +1097,181 @@ function buildBourse(g){              // capital fictif : tour abstraite, chiffr
    de dalles, PASSAGES pavés vers chaque institution (nord) et chaque parcelle
    (sud), BORNES de pierre régulières, flaques sombres. Quasi que des plans :
    coût de rendu négligeable. */
-function createCobbleTexture(){
-  const c=document.createElement('canvas'); c.width=c.height=256; const x=c.getContext('2d');
-  x.fillStyle='#9a8d6e'; x.fillRect(0,0,256,256);   // v66 : pierre plus sombre
-  let row=0;
-  for(let y=0;y<256;y+=22){ row++;
-    for(let px=(row%2?0:16);px<256+32;px+=32){
-      const w=26+Math.random()*5, h=17+Math.random()*4;
-      x.fillStyle=['#94886a','#a09272','#8a7e62','#9c8f70'][Math.floor(Math.random()*4)];
+/* =====================================================================
+   M3 — TEXTURES PBR PROCÉDURALES POUR LE SOL.
+   3 fabriques (paveTexture, terreTexture, planchesTexture) renvoient
+   { map, roughnessMap } : couleur sRGB + grayscale linéaire.
+   512px, RepeatWrapping, anisotropy 8. Le canal vert du roughnessMap
+   multiplie material.roughness (joints rugueux, plaques d'humidité
+   lisses ~0.25, ornières satinées). Voir buildMainStreet / buildPuddles
+   / buildGroundPatches plus bas pour l'usage.
+   ===================================================================== */
+const PBR_AF = 8;
+function _texColor(canvas){
+  const t=new THREE.CanvasTexture(canvas);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.anisotropy=PBR_AF; return t;
+}
+function _texLinear(canvas){
+  // roughnessMap / dataMaps : on neutralise la conversion sRGB.
+  const t=new THREE.CanvasTexture(canvas);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.anisotropy=PBR_AF;
+  t.colorSpace=THREE.NoColorSpace; return t;
+}
+function _seededRnd(seed){ let s=seed|0; return ()=>{ s=(s*1103515245+12345)&0x7fffffff; return s/0x7fffffff; }; }
+
+/* paveTexture(variant) : pavés en appareil décalé autour de 0x4a4540.
+   variant 0 = sombre / pauvre, 1 = standard, 2 = clair / institutionnel. */
+function paveTexture(variant=1){
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  const rc=document.createElement('canvas'); rc.width=rc.height=512; const r=rc.getContext('2d');
+  const rnd=_seededRnd(0x4a45 + variant*9173);
+  const BASE=[{r:0x42,g:0x3d,b:0x38},{r:0x4a,g:0x45,b:0x40},{r:0x5e,g:0x57,b:0x4d}][variant]||
+             {r:0x4a,g:0x45,b:0x40};
+  // joints sombres + roughness max (joint pierreux/poreux)
+  x.fillStyle=`rgb(${BASE.r-30},${BASE.g-26},${BASE.b-22})`; x.fillRect(0,0,512,512);
+  r.fillStyle='#f0f0f0'; r.fillRect(0,0,512,512);
+  const tones=[
+    `rgb(${BASE.r-14},${BASE.g-11},${BASE.b-9})`,
+    `rgb(${BASE.r},${BASE.g},${BASE.b})`,
+    `rgb(${BASE.r+22},${BASE.g+18},${BASE.b+13})`,
+  ];
+  const ROW=36, COL=58;
+  for(let row=0, y=-6; y<530; y+=ROW, row++){
+    const off=(row%2)?COL/2:0;
+    for(let cx=-off; cx<540; cx+=COL){
+      const w=COL-6+(rnd()-0.5)*7, h=ROW-5+(rnd()-0.5)*4;
+      const px=cx+(rnd()-0.5)*3, py=y+(rnd()-0.5)*3;
+      const tone=tones[(rnd()*3)|0];
+      x.fillStyle=tone;
       x.beginPath();
-      if(x.roundRect) x.roundRect(px-w/2,y+2,w,h,4); else x.rect(px-w/2,y+2,w,h);
+      if(x.roundRect) x.roundRect(px,py,w,h,3); else x.rect(px,py,w,h);
       x.fill();
-      x.strokeStyle='rgba(36,31,23,0.22)'; x.lineWidth=1.4; x.stroke();
-    } }
-  const tex=new THREE.CanvasTexture(c);
-  tex.wrapS=tex.wrapT=THREE.RepeatWrapping; tex.anisotropy=4;
-  return tex;
+      // surface du pavé : roughness ~0.88 (très légèrement variable)
+      const rg=215+Math.floor(rnd()*22);
+      r.fillStyle=`rgb(${rg},${rg},${rg})`;
+      r.beginPath();
+      if(r.roundRect) r.roundRect(px+1,py+1,w-2,h-2,3); else r.rect(px+1,py+1,w-2,h-2);
+      r.fill();
+      // grain
+      if(rnd()<0.55){
+        x.fillStyle=`rgba(0,0,0,${0.04+rnd()*0.08})`;
+        for(let k=0;k<6;k++) x.fillRect(px+rnd()*w, py+rnd()*h, 1+rnd()*2, 1+rnd()*2);
+      }
+      // pierres fendues (5-10%)
+      if(rnd()<0.08){
+        x.strokeStyle='rgba(14,10,8,0.6)'; x.lineWidth=1.1;
+        x.beginPath();
+        const x0=px+rnd()*w*0.3, y0=py+rnd()*h, x1=px+w-rnd()*w*0.3, y1=py+rnd()*h;
+        x.moveTo(x0,y0); x.lineTo(x1,y1); x.stroke();
+      }
+    }
+  }
+  // plaques d'humidité sombres (~30% surface) — roughness basse (~0.25)
+  const PUDDLE_N=14;
+  for(let i=0;i<PUDDLE_N;i++){
+    const px=rnd()*512, py=rnd()*512, rr=22+rnd()*70;
+    const g=x.createRadialGradient(px,py,rr*0.2,px,py,rr);
+    g.addColorStop(0,`rgba(14,18,24,${0.18+rnd()*0.22})`); g.addColorStop(1,'rgba(14,18,24,0)');
+    x.fillStyle=g; x.beginPath(); x.arc(px,py,rr,0,Math.PI*2); x.fill();
+    const gr=r.createRadialGradient(px,py,rr*0.15,px,py,rr);
+    gr.addColorStop(0,'rgba(64,64,64,0.95)'); gr.addColorStop(1,'rgba(64,64,64,0)');
+    r.fillStyle=gr; r.beginPath(); r.arc(px,py,rr,0,Math.PI*2); r.fill();
+  }
+  return { map:_texColor(c), roughnessMap:_texLinear(rc) };
+}
+
+/* terreTexture() : terre tassée dorée 0x9a7a4a, cailloux, ornières, herbe morte. */
+function terreTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  const rc=document.createElement('canvas'); rc.width=rc.height=512; const r=rc.getContext('2d');
+  const rnd=_seededRnd(0x9a7a4a);
+  // base : terre dorée, dégradé subtil
+  const g=x.createRadialGradient(256,256,40,256,256,360);
+  g.addColorStop(0,'#ab8554'); g.addColorStop(0.55,'#9a7a4a'); g.addColorStop(1,'#866840');
+  x.fillStyle=g; x.fillRect(0,0,512,512);
+  r.fillStyle='#ececec'; r.fillRect(0,0,512,512);          // terre mate ~0.92
+  // plaques desséchées (claires) et zones plus humides (sombres)
+  for(let i=0;i<34;i++){
+    const px=rnd()*512, py=rnd()*512, rr=28+rnd()*90;
+    const palette=['200,170,114','170,138,84','118,98,68','220,190,128'];
+    const tone=palette[(rnd()*4)|0];
+    const gr=x.createRadialGradient(px,py,rr*0.2,px,py,rr);
+    gr.addColorStop(0,`rgba(${tone},${0.10+rnd()*0.20})`); gr.addColorStop(1,`rgba(${tone},0)`);
+    x.fillStyle=gr; x.beginPath(); x.arc(px,py,rr,0,Math.PI*2); x.fill();
+  }
+  // cailloux
+  for(let i=0;i<280;i++){
+    const px=rnd()*512, py=rnd()*512, k=30+rnd()*60;
+    x.fillStyle=`rgba(${k+30},${k+22},${k+10},${0.40+rnd()*0.40})`;
+    x.fillRect(px,py,1+rnd()*2.4,1+rnd()*2.0);
+  }
+  // ornières de roues parallèles — 2 couples (deux passages)
+  for(const yy of [188,206,310,328]){
+    const gr=x.createLinearGradient(0,yy-7,0,yy+7);
+    gr.addColorStop(0,'rgba(44,34,20,0)');
+    gr.addColorStop(0.5,'rgba(44,34,20,0.42)');
+    gr.addColorStop(1,'rgba(44,34,20,0)');
+    x.fillStyle=gr; x.fillRect(0,yy-7,512,14);
+    // ornière satinée (un peu d'humidité résiduelle, roughness ~0.55)
+    const rgr=r.createLinearGradient(0,yy-7,0,yy+7);
+    rgr.addColorStop(0,'rgba(140,140,140,0)');
+    rgr.addColorStop(0.5,'rgba(140,140,140,0.55)');
+    rgr.addColorStop(1,'rgba(140,140,140,0)');
+    r.fillStyle=rgr; r.fillRect(0,yy-7,512,14);
+  }
+  // herbe morte éparse en lisière (densité plus forte près des bords)
+  for(let i=0;i<100;i++){
+    const px=rnd()*512, py=rnd()*512;
+    const edge=Math.min(px,512-px,py,512-py);
+    if(edge>96 && rnd()<0.75) continue;
+    x.strokeStyle=`rgba(150,128,84,${0.32+rnd()*0.35})`; x.lineWidth=1;
+    x.beginPath(); x.moveTo(px,py); x.lineTo(px+(rnd()-0.5)*4, py-2-rnd()*3); x.stroke();
+  }
+  // grain global
+  for(let i=0;i<900;i++){
+    const px=rnd()*512, py=rnd()*512;
+    x.fillStyle=rnd()<0.5?`rgba(58,44,26,${0.07+rnd()*0.10})`:`rgba(204,178,128,${0.06+rnd()*0.10})`;
+    x.fillRect(px,py,1+rnd()*1.5,1+rnd()*1.5);
+  }
+  return { map:_texColor(c), roughnessMap:_texLinear(rc) };
+}
+
+/* planchesTexture() : planches de quai, veines, clous, espacement irrégulier.
+   Réutilisée par le port en M6 (le quai courant n'est pas encore branché ici). */
+function planchesTexture(){
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  const rc=document.createElement('canvas'); rc.width=rc.height=512; const r=rc.getContext('2d');
+  const rnd=_seededRnd(0xb19478);
+  x.fillStyle='#7a6648'; x.fillRect(0,0,512,512);
+  r.fillStyle='#dcdcdc'; r.fillRect(0,0,512,512);             // bois ~0.86
+  let y=0;
+  while(y<512){
+    const h=36+(rnd()*22);
+    const tone=90+(rnd()*32);
+    x.fillStyle=`rgb(${tone+30},${tone+12},${(tone-12)|0})`;
+    x.fillRect(0,y,512,h);
+    // veines bois (cubic-bezier ondoyantes)
+    for(let v=0; v<5; v++){
+      x.strokeStyle=`rgba(60,42,22,${0.10+rnd()*0.18})`; x.lineWidth=0.7+rnd()*0.8;
+      x.beginPath();
+      const vy=y+4+rnd()*(h-8);
+      x.moveTo(0,vy);
+      for(let k=0;k<6;k++){
+        x.bezierCurveTo(k*100+30, vy+(rnd()-0.5)*4, k*100+60, vy+(rnd()-0.5)*4, (k+1)*100, vy+(rnd()-0.5)*4);
+      }
+      x.stroke();
+    }
+    // joint sombre (espacement irrégulier)
+    x.fillStyle='#241f17'; x.fillRect(0,y+h-2,512,2);
+    r.fillStyle='#f8f8f8'; r.fillRect(0,y+h-2,512,2);
+    // clous (têtes de fer)
+    for(const cx of [16,496]){
+      x.fillStyle='#2a2620'; x.beginPath(); x.arc(cx,y+h/2,2.2,0,Math.PI*2); x.fill();
+      x.fillStyle='#5a4a35'; x.beginPath(); x.arc(cx-0.5,y+h/2-0.5,1.1,0,Math.PI*2); x.fill();
+    }
+    y+=h;
+  }
+  return { map:_texColor(c), roughnessMap:_texLinear(rc) };
 }
 /* v56 — le littoral est : bande d'eau, lignes de houle à l'encre, bateaux à quai.
    C'est de la géographie (toujours visible), pas du décor d'époque. */
@@ -1131,53 +1293,335 @@ function buildWaterEast(){
   // on ne conduit pas sur l'eau : barrière invisible le long de la berge
   for(let z=-116;z<=116;z+=11) obstacles.push({pos:new THREE.Vector2(111.5,z),radius:6});
 }
+/* =====================================================================
+   M3 — GRAND-RUE PBR.
+   Chaussée pavée (paveTexture variant 1) + caniveau central creusé
+   (paveTexture variant 0, roughness basse) + trottoirs surélevés h=0.18
+   en pierre plus claire (variant 2). Bordures et bornes en InstancedMesh.
+   Sol mat partout (material.roughness=1, modulé par roughnessMap) SAUF
+   le caniveau (humide) et les flaques (cf. buildPuddles).
+   Total : 5 draw calls (1 chaussée + 1 caniveau + 2 trottoirs + 1 bornes).
+   ===================================================================== */
+const M3_Y = {
+  patches:    0.004,  // zone class patches (sous tout)
+  road:       0.015,  // chaussée
+  caniveau:   0.018,  // bande centrale humide
+  puddles:    0.025,  // flaques réfléchissantes
+  paperDebris:0.020,
+  shardDebris:0.025,
+  stoneDebris:0.050,
+};
+const M3_MAT = {};
+const M3_MESHES = [];
+let   M3_PUDDLE_MESH = null;
+let   M3_DEBRIS = [];
 function buildMainStreet(){
   const x0=-112, x1=104, w=15, cx=(x0+x1)/2, L=x1-x0;
-  // — chaussée pavée
-  const tex=createCobbleTexture(); tex.repeat.set(L/13,w/13);
-  const road=new THREE.Mesh(new THREE.PlaneGeometry(L,w),
-    new THREE.MeshStandardMaterial({color:0xa89c80,map:tex,roughness:0.92}));  // v66 : plus sombre, à peine satinée
-  road.rotation.x=-Math.PI/2; road.position.set(cx,0.015,0); road.receiveShadow=true; scene.add(road);
-  const flat=(W,D,xp,zp,color,op,y)=>{ const m=new THREE.Mesh(new THREE.PlaneGeometry(W,D),
-      new THREE.MeshBasicMaterial({color,transparent:true,opacity:op,depthWrite:false}));
-    m.rotation.x=-Math.PI/2; m.position.set(xp,y||0.02,zp); scene.add(m); return m; };
-  // — caniveau central + ornières de roues
-  flat(L,0.5,cx,0,0x241f17,0.30);
-  flat(L,0.9,cx, 2.4,0x241f17,0.14);
-  flat(L,0.9,cx,-2.4,0x241f17,0.14);
-  // — trottoirs surélevés, bordures, joints de dalles
-  // M1c — sandstone sobre (était 0xd4c49c crème : bloomait sous le soleil)
+
+  // — chaussée pavée PBR (variant 1, rue standard) ------------------------
+  const pave=paveTexture(1);
+  pave.map.repeat.set(L/9, w/9);
+  pave.roughnessMap.repeat.set(L/9, w/9);
+  M3_MAT.road=new THREE.MeshStandardMaterial({
+    color:0xa89c80, map:pave.map, roughnessMap:pave.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
+  const road=new THREE.Mesh(new THREE.PlaneGeometry(L,w), M3_MAT.road);
+  road.rotation.x=-Math.PI/2; road.position.set(cx,M3_Y.road,0); road.receiveShadow=true;
+  scene.add(road); M3_MESHES.push(road);
+
+  // — caniveau central légèrement creusé (bande sombre humide) -----------
+  const can=paveTexture(0);
+  can.map.repeat.set(L/8, 1);
+  can.roughnessMap.repeat.set(L/8, 1);
+  M3_MAT.caniveau=new THREE.MeshStandardMaterial({
+    color:0x35302a, map:can.map, roughnessMap:can.roughnessMap,
+    roughness:0.55, metalness:0.0,
+  });
+  const cani=new THREE.Mesh(new THREE.PlaneGeometry(L,1.5), M3_MAT.caniveau);
+  cani.rotation.x=-Math.PI/2; cani.position.set(cx,M3_Y.caniveau,0); cani.receiveShadow=true;
+  scene.add(cani); M3_MESHES.push(cani);
+
+  // — trottoirs surélevés (h=0.18) en pierre plus claire (variant 2) -----
+  const trot=paveTexture(2);
+  trot.map.repeat.set(L/8, 3.0/8);
+  trot.roughnessMap.repeat.set(L/8, 3.0/8);
+  M3_MAT.trottoir=new THREE.MeshStandardMaterial({
+    color:0xb8a878, map:trot.map, roughnessMap:trot.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
   for(const sgn of [-1,1]){
     const tw=3.0, tz=sgn*(w/2+tw/2);
-    const trot=new THREE.Mesh(new THREE.BoxGeometry(L,0.22,tw),
-      new THREE.MeshStandardMaterial({color:0xa89878,roughness:1}));
-    trot.position.set(cx,0.11,tz); trot.receiveShadow=true; scene.add(trot);
-    flat(L,0.4,cx,sgn*w/2,0x241f17,0.55,0.24);
-    flat(L,0.25,cx,sgn*(w/2+tw),0x241f17,0.35,0.24);
-    for(let jx=x0+4;jx<x1;jx+=8) flat(0.18,tw,jx,tz,0x241f17,0.18,0.23);
+    const m=new THREE.Mesh(new THREE.BoxGeometry(L,0.18,tw), M3_MAT.trottoir);
+    m.position.set(cx, 0.10, tz); m.receiveShadow=true; m.castShadow=false;
+    scene.add(m); M3_MESHES.push(m);
   }
-  // — passages pavés clairs vers les institutions (nord) et les parcelles (sud)
-  // M1c — ocre désaturé (était 0xd8c8a0 : trop clair, bloomait)
-  const acces=[[-105,-1],[-72,-1],[-40,-1],[-8,-1],[55,-1],
-               [-60,1],[-15,1],[18,1],[52,1],[86,1],[0,1]];
-  for(const [ax,sgn] of acces){
-    flat(6,9,ax,sgn*(w/2+4.5),0xb09a78,0.55,0.022);
-    for(let i=0;i<4;i++) flat(6,0.14,ax,sgn*(w/2+1.5+i*2.1),0x241f17,0.20,0.024);
+
+  // — bornes de pierre le long des trottoirs (InstancedMesh : 1 draw call)
+  const borneGeo=new THREE.CylinderGeometry(0.34,0.42,0.85,8);
+  const borneMat=new THREE.MeshStandardMaterial({color:0x9a9183, roughness:1, flatShading:true});
+  const bornes=[];
+  for(let bx=x0+8; bx<x1-4; bx+=24){
+    for(const sgn of [-1,1]) bornes.push([bx+(sgn>0?5:0), 0.53, sgn*(w/2+2.6)]);
   }
-  // — bornes de pierre le long des trottoirs
-  for(let bx=x0+8;bx<x1-4;bx+=24){
-    for(const sgn of [-1,1]){
-      const borne=new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.42,0.85,8),
-        new THREE.MeshStandardMaterial({color:0x9a9183,roughness:1,flatShading:true}));
-      borne.position.set(bx+(sgn>0?5:0),0.53,sgn*(w/2+2.6)); borne.castShadow=true; scene.add(borne);
-    } }
-  // — flaques sombres éparses
-  for(let i=0;i<6;i++){
-    const fx=x0+14+Math.random()*(L-28), fz=(Math.random()*2-1)*4.6;
-    const fl=flat(2.2+Math.random()*2.4,1.1+Math.random()*1.1,fx,fz,0x4a4e52,0.16,0.018);
-    fl.rotation.z=Math.random()*3;
+  const borneInst=new THREE.InstancedMesh(borneGeo, borneMat, bornes.length);
+  const Mb=new THREE.Matrix4();
+  bornes.forEach((b,i)=>{ Mb.makeTranslation(b[0],b[1],b[2]); borneInst.setMatrixAt(i,Mb); });
+  borneInst.instanceMatrix.needsUpdate=true;
+  borneInst.castShadow=true; borneInst.receiveShadow=false;
+  scene.add(borneInst); M3_MESHES.push(borneInst);
+}
+
+/* =====================================================================
+   M3 — TRANSITIONS DE CLASSE AU SOL.
+   Devant chaque zone, un patch sol-overlay raconte la classe sociale :
+     banque/bourse/État         → dalles institutionnelles (pavé variant 2)
+     marchés / port / quartier  → pavé disjoint sombre (variant 0) + plaques de terre
+     terres communes            → terre tassée dorée
+     mines                      → terre + voile de poussier noir
+   Géométries fusionnées par type (4 draw calls : dalles, disjoint, terre, mines).
+   ===================================================================== */
+const M3_PATCH_TYPES = {
+  dalles:   { zones:['Banque','Bourse','État · Tribunal'],                                    halfW:9, halfD:9 },
+  disjoint: { zones:['Marché des moyens','Marché du travail','Marché de vente',
+                     'Usine','Entrepôt','Quartier ouvrier','Port · Marché mondial'],          halfW:10, halfD:9 },
+  terre:    { zones:['Terres communes'],                                                     halfW:14, halfD:12 },
+  mines:    { zones:['Mines · Champs'],                                                      halfW:12, halfD:12 },
+};
+function _mergePlaneFan(rects, repeatUnit){
+  // rects: [{cx, cz, hw, hd}]. UV = (worldX/repeatUnit, worldZ/repeatUnit).
+  const pos=[], uv=[], idx=[]; let off=0;
+  for(const r of rects){
+    const x0=r.cx-r.hw, x1=r.cx+r.hw, z0=r.cz-r.hd, z1=r.cz+r.hd;
+    pos.push(x0,0,z0, x1,0,z0, x1,0,z1, x0,0,z1);
+    const u=repeatUnit;
+    uv.push(x0/u,z0/u, x1/u,z0/u, x1/u,z1/u, x0/u,z1/u);
+    // winding inverse pour que la normale calculée pointe vers +Y (face visible du dessus).
+    idx.push(off,off+2,off+1, off,off+3,off+2); off+=4;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('uv',       new THREE.Float32BufferAttribute(uv,2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+function buildGroundPatches(){
+  const zonePos=name=>{ const z=zones.find(zz=>zz.name===name); return z?z.pos:null; };
+  // 1. DALLES (variant 2, plus claires, presque neuves)
+  {
+    const tex=paveTexture(2);
+    M3_MAT.dalles=new THREE.MeshStandardMaterial({
+      color:0xbcaa84, map:tex.map, roughnessMap:tex.roughnessMap,
+      roughness:1.0, metalness:0.0,
+    });
+    const rects=[];
+    for(const n of M3_PATCH_TYPES.dalles.zones){ const p=zonePos(n); if(p) rects.push({cx:p.x,cz:p.z,hw:9,hd:9}); }
+    if(rects.length){
+      const m=new THREE.Mesh(_mergePlaneFan(rects, 9), M3_MAT.dalles);
+      m.position.y=M3_Y.patches; m.receiveShadow=true;
+      scene.add(m); M3_MESHES.push(m);
+    }
+  }
+  // 2. PAVÉ DISJOINT (variant 0, sombre) + plaques de terre éparses
+  {
+    const tex=paveTexture(0);
+    tex.map.repeat.set(1.4,1.4); tex.roughnessMap.repeat.set(1.4,1.4);
+    M3_MAT.disjoint=new THREE.MeshStandardMaterial({
+      color:0x88796a, map:tex.map, roughnessMap:tex.roughnessMap,
+      roughness:1.0, metalness:0.0,
+    });
+    const rects=[];
+    for(const n of M3_PATCH_TYPES.disjoint.zones){
+      const p=zonePos(n); if(!p) continue;
+      const hw=M3_PATCH_TYPES.disjoint.halfW, hd=M3_PATCH_TYPES.disjoint.halfD;
+      rects.push({cx:p.x,cz:p.z,hw,hd});
+    }
+    if(rects.length){
+      const m=new THREE.Mesh(_mergePlaneFan(rects, 7), M3_MAT.disjoint);
+      m.position.y=M3_Y.patches; m.receiveShadow=true;
+      scene.add(m); M3_MESHES.push(m);
+    }
+  }
+  // 3. TERRE (terres communes)
+  {
+    const tex=terreTexture();
+    tex.map.repeat.set(1.2,1.2); tex.roughnessMap.repeat.set(1.2,1.2);
+    M3_MAT.terre=new THREE.MeshStandardMaterial({
+      color:0xb7905a, map:tex.map, roughnessMap:tex.roughnessMap,
+      roughness:1.0, metalness:0.0,
+    });
+    const rects=[];
+    for(const n of M3_PATCH_TYPES.terre.zones){
+      const p=zonePos(n); if(!p) continue;
+      const hw=M3_PATCH_TYPES.terre.halfW, hd=M3_PATCH_TYPES.terre.halfD;
+      rects.push({cx:p.x,cz:p.z,hw,hd});
+    }
+    if(rects.length){
+      const m=new THREE.Mesh(_mergePlaneFan(rects, 8), M3_MAT.terre);
+      m.position.y=M3_Y.patches+0.001; m.receiveShadow=true;
+      scene.add(m); M3_MESHES.push(m);
+    }
+  }
+  // 4. MINES — terre dorée + voile de poussier noir (couleur de base assombrie)
+  {
+    const tex=terreTexture();
+    tex.map.repeat.set(1.4,1.4); tex.roughnessMap.repeat.set(1.4,1.4);
+    M3_MAT.mines=new THREE.MeshStandardMaterial({
+      color:0x4d4030, map:tex.map, roughnessMap:tex.roughnessMap,
+      roughness:1.0, metalness:0.0,
+    });
+    const rects=[];
+    for(const n of M3_PATCH_TYPES.mines.zones){
+      const p=zonePos(n); if(!p) continue;
+      const hw=M3_PATCH_TYPES.mines.halfW, hd=M3_PATCH_TYPES.mines.halfD;
+      rects.push({cx:p.x,cz:p.z,hw,hd});
+    }
+    if(rects.length){
+      const m=new THREE.Mesh(_mergePlaneFan(rects, 8), M3_MAT.mines);
+      m.position.y=M3_Y.patches+0.002; m.receiveShadow=true;
+      scene.add(m); M3_MESHES.push(m);
+    }
   }
 }
+
+/* =====================================================================
+   M3 — FLAQUES RÉFLÉCHISSANTES.
+   Les seules surfaces du sol qui ne sont PAS mates : roughness 0.05,
+   metalness 0.6, couleur 0x1c2230. Avec l'IBL, elles miroitent le ciel
+   doré et serviront d'ancres aux sprites-reflets de lampes en M4.
+   Concentration : devant l'usine + dans le quartier ouvrier (drainage
+   négligé = détail de classe). Géométries fusionnées : 1 draw call.
+   Exporte window.PUDDLES = [{ x, z, r }] pour M4.
+   ===================================================================== */
+const PUDDLES = [];
+function buildPuddles(){
+  PUDDLES.length=0;
+  // 10 sites : devant l'usine/entrepôt, dans le quartier ouvrier,
+  // qq-unes sur la chaussée (où l'eau s'accumule au caniveau).
+  const sites=[
+    // Usine (-15, 30) — drainage industriel négligé
+    {x:-18, z:22, r:2.6}, {x:-10, z:25, r:2.0}, {x:-22, z:38, r:2.8},
+    // Entrepôt (18, 32) — flaque devant la rampe
+    {x:14, z:24, r:2.2}, {x:22, z:40, r:2.4},
+    // Quartier ouvrier (0, 62) — bas-fond, drainage négligé
+    {x:-6, z:58, r:3.2}, {x:6, z:66, r:2.6}, {x:-12, z:70, r:2.4},
+    // Rue : pluie récente — caniveau qui déborde
+    {x:-40, z:3.5, r:1.8}, {x:24, z:-3.2, r:1.6},
+  ];
+  const pos=[], uv=[], idx=[]; let off=0; let seed=13;
+  const SEG=22;
+  for(const s of sites){
+    pos.push(s.x, 0, s.z); uv.push(0.5,0.5);
+    for(let i=0;i<SEG;i++){
+      const a=(i/SEG)*Math.PI*2;
+      const noise=1 + 0.22*Math.sin(a*3+seed) + 0.13*Math.sin(a*5+seed*1.7) + 0.08*Math.sin(a*7+seed*0.3);
+      const r=s.r*noise;
+      pos.push(s.x+Math.cos(a)*r, 0, s.z+Math.sin(a)*r);
+      uv.push(0.5+0.5*Math.cos(a), 0.5+0.5*Math.sin(a));
+    }
+    // winding inverse : normale vers +Y (face visible du dessus, reflète le ciel).
+    for(let i=0;i<SEG;i++) idx.push(off, off+1+((i+1)%SEG), off+1+i);
+    off+=SEG+1;
+    PUDDLES.push({x:s.x, z:s.z, r:s.r});
+    seed+=7;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('uv',       new THREE.Float32BufferAttribute(uv,2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  M3_MAT.puddle=new THREE.MeshStandardMaterial({
+    color:0x1c2230, roughness:0.05, metalness:0.6, envMapIntensity:1.0,
+  });
+  const mesh=new THREE.Mesh(g, M3_MAT.puddle);
+  mesh.position.y=M3_Y.puddles; mesh.receiveShadow=true;
+  scene.add(mesh); M3_MESHES.push(mesh);
+  M3_PUDDLE_MESH=mesh;
+  if(typeof window!=='undefined'){ window.PUDDLES=PUDDLES; window.PUDDLE_MESH=mesh; }
+}
+
+/* =====================================================================
+   M3 — DÉBRIS INSTANCIÉS.
+   ~80 instances réparties par densité : forte côté quartier ouvrier /
+   usine / entrepôt, très faible devant banque/bourse, pierres aux mines.
+   3 InstancedMesh = 3 draw calls. Les counts sont écrêtés par la qualité
+   (cf. _applyM3Quality).
+   ===================================================================== */
+function buildGroundDebris(){
+  const rnd=_seededRnd(0xdeb7);
+  // (cx, cz, rayon dispersion, count, [w_papier, w_éclat, w_pierre])
+  const sites=[
+    {cx:-15, cz:32, r:13, n:22, types:[0.45,0.30,0.25]},   // usine
+    {cx: 18, cz:32, r:11, n:14, types:[0.40,0.30,0.30]},   // entrepôt
+    {cx:  0, cz:62, r:18, n:26, types:[0.55,0.20,0.25]},   // quartier ouvrier
+    {cx:-72, cz:-25, r: 9, n: 2, types:[0.20,0.20,0.60]},  // banque (quasi rien)
+    {cx:-72, cz:-60, r: 9, n: 2, types:[0.20,0.10,0.70]},  // bourse (quasi rien)
+    {cx:-105,cz:-62, r:13, n: 8, types:[0.10,0.10,0.80]},  // mines : pierres
+    {cx:-105,cz:-30, r:12, n: 6, types:[0.20,0.30,0.50]},  // terres communes
+  ];
+  const items=[[],[],[]];
+  for(const s of sites){
+    for(let k=0;k<s.n;k++){
+      const a=rnd()*Math.PI*2, d=Math.sqrt(rnd())*s.r;
+      const x=s.cx+Math.cos(a)*d, z=s.cz+Math.sin(a)*d;
+      const u=rnd();
+      const t=(u<s.types[0])?0:(u<s.types[0]+s.types[1])?1:2;
+      items[t].push({x, z, rot:rnd()*Math.PI*2, scale:0.7+rnd()*0.7});
+    }
+  }
+  const make=(geo, mat, list, y)=>{
+    if(!list.length) return null;
+    const inst=new THREE.InstancedMesh(geo, mat, list.length);
+    const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3();
+    list.forEach((it,i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0), it.rot);
+      P.set(it.x, y, it.z); S.set(it.scale,it.scale,it.scale);
+      M.compose(P,Q,S); inst.setMatrixAt(i,M);
+    });
+    inst.instanceMatrix.needsUpdate=true;
+    inst.castShadow=false; inst.receiveShadow=true;
+    inst.userData.debris=true; inst.userData.maxCount=list.length;
+    scene.add(inst); M3_MESHES.push(inst);
+    return inst;
+  };
+  // Papier : plan horizontal d'un blanc-cassé ; double face (vu de dessus)
+  const paperGeo=new THREE.PlaneGeometry(0.55,0.4); paperGeo.rotateX(-Math.PI/2);
+  const paperMat=new THREE.MeshStandardMaterial({color:0xd8cba8, roughness:0.95, metalness:0, side:THREE.DoubleSide});
+  // Éclat : tétraèdre bas (brique cassée)
+  const shardGeo=new THREE.TetrahedronGeometry(0.18,0);
+  const shardMat=new THREE.MeshStandardMaterial({color:0x7a4530, roughness:0.9, metalness:0, flatShading:true});
+  // Pierre : icosaèdre aplati
+  const stoneGeo=new THREE.IcosahedronGeometry(0.20,0);
+  const stoneMat=new THREE.MeshStandardMaterial({color:0x6e6354, roughness:1, metalness:0, flatShading:true});
+  M3_DEBRIS=[
+    make(paperGeo, paperMat, items[0], M3_Y.paperDebris),
+    make(shardGeo, shardMat, items[1], M3_Y.shardDebris),
+    make(stoneGeo, stoneMat, items[2], M3_Y.stoneDebris),
+  ].filter(Boolean);
+}
+
+function _applyM3Quality(q){
+  // Basse : flaques mates (pas de réflexion), débris réduits (~35%).
+  // Moyenne : débris à 70%. Haute : 100%.
+  if(M3_MAT.puddle){
+    if(q==='low'){
+      M3_MAT.puddle.roughness=1.0; M3_MAT.puddle.metalness=0.0;
+      M3_MAT.puddle.envMapIntensity=0.0;
+    } else {
+      M3_MAT.puddle.roughness=0.05; M3_MAT.puddle.metalness=0.6;
+      M3_MAT.puddle.envMapIntensity=1.0;
+    }
+    M3_MAT.puddle.needsUpdate=true;
+  }
+  const factor = q==='low'?0.35 : q==='medium'?0.7 : 1.0;
+  for(const m of M3_DEBRIS){
+    if(!m) continue;
+    const max=m.userData.maxCount|0;
+    m.count=Math.max(1, Math.floor(max*factor));
+  }
+}
+if(typeof window!=='undefined') window._applyM3Quality=_applyM3Quality;
 /* v61 — drawCircuitLine supprimée : le tube doré permanent encombrait la lecture. */
 
 /* ===================================================================
@@ -5196,6 +5640,9 @@ function applyRenderQuality(q){
     shadowsOn = renderer.shadowMap.enabled;
   }
   const composerState = (composer && !COMPOSER_BYPASS) ? 'on' : (composer ? 'bypass' : 'absent');
+  // M3 — flaques (réfléchissantes ↔ mates) et débris (densité écrêtée)
+  // suivent le sélecteur de qualité.
+  if(typeof _applyM3Quality === 'function') _applyM3Quality(q);
   // M1b — log lisible pour valider que les 3 niveaux produisent des configs
   // distinctes. Une seule ligne par changement, à la console.
   console.info('[M1] render quality =', q,
