@@ -10933,48 +10933,84 @@ function updateSkySmoke(dt){
    ===================================================================== */
 const SkyAtmo = {
   ready:false,
-  sunDisk:null, sunHalo:null,
   clouds:[],
   veil:null,
   godrays:[],
-  moonDisk:null, moonHalo:null,    // M7-soleil : la lune (mêmes sprites, palette froide)
+  // M7-astres — soleil par COUCHES (du loin au près) :
+  //   halo atmosphérique → aigrettes → couronne → cœur
+  sunHalo:null, sunRays:[], sunCorona:null, sunCore:null,
+  // lune : disque texturé (mers + cratères + phase) + halo froid.
+  moonDisk:null, moonHalo:null,
   build(){
     if(this.ready) return; this.ready=true;
-    // ----- soleil : disque émissif + halo additif -----
-    const sunTex=this._sunDiskTex();
-    this.sunDisk=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:sunTex, color:0xffe6b0, transparent:true, opacity:0.95,
-      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
-    }));
-    this.sunDisk.scale.set(22,22,1);
-    this.sunDisk.renderOrder=-1;
-    scene.add(this.sunDisk);
 
+    // 1) HALO ATMOSPHÉRIQUE LARGE (rayon 4-5× le cœur) — donne l'impression
+    //    de chaleur diffuse qui se fond dans le ciel.
     const haloTex=this._sunHaloTex();
     this.sunHalo=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:haloTex, color:0xffd98a, transparent:true, opacity:0.55,
+      map:haloTex, color:0xffd98a, transparent:true, opacity:0.0,
       depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
     }));
-    this.sunHalo.scale.set(95,95,1);
-    this.sunHalo.renderOrder=-1;
+    this.sunHalo.scale.set(140, 140, 1);
+    this.sunHalo.renderOrder=-3;
     scene.add(this.sunHalo);
 
-    // ----- lune : disque pâle + halo froid (M7-soleil) -----
-    const moonTex=this._moonDiskTex();
-    this.moonDisk=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:moonTex, color:0xdfe6f0, transparent:true, opacity:0.0,
+    // 2) AIGRETTES (rais fins) — 6 rais à 60° d'écart. Sprite ancré à
+    //    sa BASE (center.y=0) pour qu'il s'étire VERS L'EXTÉRIEUR depuis
+    //    le centre du soleil. material.rotation oriente chaque rai.
+    const aigTex=this._sunAigretteTex();
+    for(let i=0;i<6;i++){
+      const ray=new THREE.Sprite(new THREE.SpriteMaterial({
+        map:aigTex, color:0xffd9a4, transparent:true, opacity:0.0,
+        depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+      }));
+      ray.center.set(0.5, 0.0);                  // anchored at bottom
+      ray.material.rotation=(i/6)*Math.PI*2;
+      ray.scale.set(10, 60, 1);
+      ray.renderOrder=-2;
+      scene.add(ray);
+      this.sunRays.push(ray);
+    }
+
+    // 3) COURONNE / PHOTOSPHÈRE — anneau de transition cœur → halo.
+    const corTex=this._sunCoronaTex();
+    this.sunCorona=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:corTex, color:0xffc88a, transparent:true, opacity:0.0,
       depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
     }));
-    this.moonDisk.scale.set(14, 14, 1);
-    this.moonDisk.renderOrder=-1;
+    this.sunCorona.scale.set(42, 42, 1);
+    this.sunCorona.renderOrder=-1;
+    scene.add(this.sunCorona);
+
+    // 4) CŒUR — disque vif aux bords irréguliers. Le plus brillant ; peut
+    //    fleurir au bloom, mais les couches en-dessous restent lisibles.
+    const coreTex=this._sunCoreTex();
+    this.sunCore=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:coreTex, color:0xfff2d0, transparent:true, opacity:1.0,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.sunCore.scale.set(22, 22, 1);
+    this.sunCore.renderOrder=0;
+    scene.add(this.sunCore);
+
+    // ----- LUNE : disque texturé (mers + cratères + phase gibbeuse) + halo
+    const moonTex=this._moonDiskTex();
+    this.moonDisk=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:moonTex, color:0xe4eaf2, transparent:true, opacity:0.0,
+      depthWrite:false, fog:false,
+      // PAS d'additive — la lune ne s'additionne pas comme le soleil ; sinon
+      // les détails (mers, cratères, terminateur) sont mangés par le ciel.
+    }));
+    this.moonDisk.scale.set(18, 18, 1);
+    this.moonDisk.renderOrder=0;
     scene.add(this.moonDisk);
     const moonHaloTex=this._moonHaloTex();
     this.moonHalo=new THREE.Sprite(new THREE.SpriteMaterial({
       map:moonHaloTex, color:0xb4c4e0, transparent:true, opacity:0.0,
       depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
     }));
-    this.moonHalo.scale.set(48, 48, 1);
-    this.moonHalo.renderOrder=-1;
+    this.moonHalo.scale.set(58, 58, 1);
+    this.moonHalo.renderOrder=-2;
     scene.add(this.moonHalo);
 
     // ----- voile doré : grand plan additif côté ouest -----
@@ -11029,6 +11065,7 @@ const SkyAtmo = {
     }
   },
   _sunDiskTex(){
+    // (legacy — non utilisé, gardé pour rétro-compat)
     const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
     const g=x.createRadialGradient(64,64,4,64,64,62);
     g.addColorStop(0,   'rgba(255,238,196,1.0)');
@@ -11036,6 +11073,69 @@ const SkyAtmo = {
     g.addColorStop(0.75,'rgba(255,180,90,0.30)');
     g.addColorStop(1,   'rgba(255,170,70,0)');
     x.fillStyle=g; x.fillRect(0,0,128,128);
+    return new THREE.CanvasTexture(c);
+  },
+  /* M7-astres — CŒUR du soleil. Disque vif aux bords subtilement irréguliers
+     (pas un cercle parfait). Couleur appliquée par material.color depuis
+     SunState.sunColor — le canvas garde le bord et le dégradé seulement. */
+  _sunCoreTex(){
+    const c=document.createElement('canvas'); c.width=c.height=256;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,256,256);
+    // bord irrégulier — 64 segments avec micro-bruit
+    const N=64;
+    const pts=[];
+    for(let i=0;i<N;i++){
+      const a=(i/N)*Math.PI*2;
+      const r = 98 + Math.sin(a*7 + 0.3) * 1.6 + Math.sin(a*11 - 0.7) * 0.9 + Math.sin(a*5) * 1.3;
+      pts.push({x:128+Math.cos(a)*r, y:128+Math.sin(a)*r});
+    }
+    // dégradé radial brûlant
+    const g=x.createRadialGradient(128,128,2,128,128,110);
+    g.addColorStop(0,    'rgba(255,255,238,1.0)');
+    g.addColorStop(0.40, 'rgba(255,242,200,1.0)');
+    g.addColorStop(0.80, 'rgba(255,210,150,0.95)');
+    g.addColorStop(1.0,  'rgba(255,180,100,0.0)');
+    x.fillStyle=g;
+    x.beginPath();
+    x.moveTo(pts[0].x, pts[0].y);
+    for(let i=1;i<N;i++) x.lineTo(pts[i].x, pts[i].y);
+    x.closePath();
+    x.fill();
+    return new THREE.CanvasTexture(c);
+  },
+  /* M7-astres — COURONNE solaire (anneau de transition cœur ↔ halo). */
+  _sunCoronaTex(){
+    const c=document.createElement('canvas'); c.width=c.height=256;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,256,256);
+    const g=x.createRadialGradient(128,128,30,128,128,124);
+    g.addColorStop(0.0,  'rgba(255,200,120,0.0)');
+    g.addColorStop(0.35, 'rgba(255,200,130,0.55)');
+    g.addColorStop(0.60, 'rgba(255,180,110,0.60)');
+    g.addColorStop(0.85, 'rgba(255,160,90,0.25)');
+    g.addColorStop(1.0,  'rgba(255,150,80,0)');
+    x.fillStyle=g; x.fillRect(0,0,256,256);
+    return new THREE.CanvasTexture(c);
+  },
+  /* M7-astres — AIGRETTES (rais fins) discrètes, marquées à l'horizon. */
+  _sunAigretteTex(){
+    const c=document.createElement('canvas'); c.width=48; c.height=192;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,48,192);
+    // dégradé linéaire bottom→top (bas = près du soleil)
+    const g=x.createLinearGradient(0,192,0,0);
+    g.addColorStop(0,   'rgba(255,222,170,0.85)');
+    g.addColorStop(0.25,'rgba(255,200,140,0.55)');
+    g.addColorStop(0.65,'rgba(255,180,110,0.25)');
+    g.addColorStop(1,   'rgba(255,170,90,0)');
+    x.fillStyle=g; x.fillRect(16, 0, 16, 192);
+    // adoucir les bords (mask radial)
+    const mask=x.createRadialGradient(24, 96, 4, 24, 96, 16);
+    mask.addColorStop(0, 'rgba(255,255,255,1)');
+    mask.addColorStop(1, 'rgba(255,255,255,0)');
+    x.globalCompositeOperation='destination-in';
+    x.fillStyle=mask; x.fillRect(0,0,48,192);
     return new THREE.CanvasTexture(c);
   },
   _sunHaloTex(){
@@ -11047,21 +11147,90 @@ const SkyAtmo = {
     x.fillStyle=g; x.fillRect(0,0,256,256);
     return new THREE.CanvasTexture(c);
   },
+  /* M7-astres — LUNE détaillée : surface gris-bleu froid + MERS lunaires
+     + CRATÈRES (cercles + ombre) + PHASE gibbeuse (terminateur côté droit)
+     + LUMIÈRE CENDRÉE (earthshine) très subtile côté ombre. */
   _moonDiskTex(){
-    const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
-    const g=x.createRadialGradient(64,64,4,64,64,58);
-    g.addColorStop(0,   'rgba(232,238,248,1.00)');
-    g.addColorStop(0.55,'rgba(208,216,232,0.85)');
-    g.addColorStop(0.85,'rgba(180,196,224,0.25)');
-    g.addColorStop(1,   'rgba(180,196,224,0)');
-    x.fillStyle=g; x.fillRect(0,0,128,128);
-    // mares de la lune — 4 taches subtiles
-    for(const [px, py, r] of [[52, 50, 6], [78, 58, 5], [62, 78, 7], [80, 78, 4]]){
-      const lg=x.createRadialGradient(px, py, 1, px, py, r);
-      lg.addColorStop(0, 'rgba(170,184,206,0.45)');
-      lg.addColorStop(1, 'rgba(170,184,206,0)');
-      x.fillStyle=lg; x.beginPath(); x.arc(px, py, r, 0, Math.PI*2); x.fill();
+    const c=document.createElement('canvas'); c.width=c.height=256;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,256,256);
+    // Clip au disque circulaire
+    x.save();
+    x.beginPath();
+    x.arc(128, 128, 108, 0, Math.PI*2);
+    x.clip();
+    // BASE : gris-bleu froid, plus chaud côté nord-ouest (éclairement)
+    const baseGrad=x.createRadialGradient(95, 95, 8, 128, 128, 132);
+    baseGrad.addColorStop(0,   'rgba(228,232,240,1.0)');
+    baseGrad.addColorStop(0.55,'rgba(196,202,216,1.0)');
+    baseGrad.addColorStop(0.90,'rgba(156,164,184,0.95)');
+    baseGrad.addColorStop(1,   'rgba(120,128,148,0.90)');
+    x.fillStyle=baseGrad; x.fillRect(0,0,256,256);
+    // grain de surface (regolith)
+    for(let i=0;i<400;i++){
+      const px=Math.random()*256, py=Math.random()*256;
+      x.fillStyle=Math.random()<0.5?'rgba(168,174,190,0.25)':'rgba(220,224,232,0.15)';
+      x.fillRect(px, py, 1+Math.random()*1.5, 1+Math.random()*1.2);
     }
+    // MERS lunaires — taches sombres irrégulières (5 mares principales)
+    const mares=[
+      // [cx, cy, rx, ry, opacity]
+      [88, 92, 30, 22, 0.40],     // Mare Imbrium (NW)
+      [120, 110, 24, 20, 0.36],   // Mare Serenitatis (centre N)
+      [142, 132, 22, 18, 0.38],   // Mare Tranquillitatis (centre E)
+      [82, 152, 24, 26, 0.32],    // Mare Humorum (SW)
+      [165, 100, 18, 14, 0.30],   // Mare Crisium (NE)
+      [105, 175, 16, 14, 0.28],   // Mare Nubium (S)
+    ];
+    for(const [cx, cy, rx, ry, op] of mares){
+      const g=x.createRadialGradient(cx, cy, 3, cx, cy, Math.max(rx, ry)*1.15);
+      g.addColorStop(0, 'rgba(98,108,128,'+op+')');
+      g.addColorStop(0.7, 'rgba(108,118,138,'+(op*0.5)+')');
+      g.addColorStop(1, 'rgba(108,118,138,0)');
+      x.fillStyle=g;
+      x.save();
+      x.translate(cx, cy);
+      x.scale(rx/20, ry/20);
+      x.beginPath(); x.arc(0,0,20,0,Math.PI*2); x.fill();
+      x.restore();
+    }
+    // CRATÈRES — 14 cercles avec ombre portée subtile
+    const craters=[
+      [70, 70, 5], [92, 60, 4], [120, 70, 3], [150, 78, 4], [175, 88, 5],
+      [85, 120, 3], [110, 145, 4], [148, 158, 3], [98, 175, 4], [128, 195, 5],
+      [60, 145, 4], [175, 145, 3], [70, 185, 3], [165, 175, 4],
+    ];
+    for(const [cx, cy, r] of craters){
+      // ring d'ombre (rebord du cratère)
+      x.fillStyle='rgba(80,86,102,0.55)';
+      x.beginPath(); x.arc(cx, cy, r+1, 0, Math.PI*2); x.fill();
+      // intérieur clair (regolith exposé)
+      const ig=x.createRadialGradient(cx-r*0.3, cy-r*0.3, 0, cx, cy, r);
+      ig.addColorStop(0, 'rgba(232,236,244,0.85)');
+      ig.addColorStop(1, 'rgba(168,176,192,0.65)');
+      x.fillStyle=ig;
+      x.beginPath(); x.arc(cx, cy, r, 0, Math.PI*2); x.fill();
+      // pointe centrale (petit point blanc — pic central)
+      if(r >= 4){
+        x.fillStyle='rgba(248,250,254,0.55)';
+        x.beginPath(); x.arc(cx, cy, 0.8, 0, Math.PI*2); x.fill();
+      }
+    }
+    // PHASE GIBBEUSE : terminateur côté droit, ~25% en ombre
+    // dégradé linéaire dur du clair au sombre vers la droite
+    const phase=x.createLinearGradient(160, 0, 230, 0);
+    phase.addColorStop(0,    'rgba(20,24,32,0)');
+    phase.addColorStop(0.45, 'rgba(18,22,30,0.55)');
+    phase.addColorStop(0.80, 'rgba(12,16,22,0.85)');
+    phase.addColorStop(1,    'rgba(8,10,16,0.93)');
+    x.fillStyle=phase; x.fillRect(160, 0, 96, 256);
+    // LUMIÈRE CENDRÉE (earthshine) — très faible chaleur sur la zone sombre,
+    // suggère que la Terre éclaire la face cachée
+    const earth=x.createLinearGradient(180, 0, 240, 0);
+    earth.addColorStop(0, 'rgba(80,70,100,0)');
+    earth.addColorStop(1, 'rgba(110,90,120,0.08)');
+    x.fillStyle=earth; x.fillRect(180, 0, 76, 256);
+    x.restore();   // exit clip
     return new THREE.CanvasTexture(c);
   },
   _moonHaloTex(){
@@ -11123,41 +11292,91 @@ const SkyAtmo = {
     const cx = (typeof camera!=='undefined' && camera) ? camera.position.x : 0;
     const cz = (typeof camera!=='undefined' && camera) ? camera.position.z : 0;
 
-    // M7-soleil — astres positionnés depuis SunState.sunDir / moonDir,
-    // ancrés sur la caméra (suit le joueur). Disparaissent quand sous l'horizon.
+    // M7-astres — positions monde depuis SunState (caméra-relative).
     const sx = SunState.sunDir.x * SUN_DISPLAY_R;
     const sy = Math.max(-50, SunState.sunDir.y * SUN_DISPLAY_R);
     const sz = SunState.sunDir.z * SUN_DISPLAY_R;
     const mx = SunState.moonDir.x * SUN_DISPLAY_R;
     const my = Math.max(-50, SunState.moonDir.y * SUN_DISPLAY_R);
     const mz = SunState.moonDir.z * SUN_DISPLAY_R;
-    const sunWorld_y = SunState.sunDir.y;
-    const moonWorld_y = SunState.moonDir.y;
-    if(this.sunDisk){
-      this.sunDisk.position.set(cx + sx, sy, cz + sz);
-      this.sunDisk.visible = SunState.sunVisible;
-      this.sunDisk.material.opacity = SunState.sunVisible
-        ? Math.min(1, 0.20 + Math.max(0, sunWorld_y + 0.05) * 1.3) : 0;
-      this.sunDisk.material.color.copy(SunState.sunColor);
+    const sunY = SunState.sunDir.y;
+    const moonY = SunState.moonDir.y;
+
+    // ==================== SOLEIL — couches superposées ====================
+    // « horizonness » : 0 au zénith, 1 quand soleil bas → pilote la teinte
+    // rougie, le grossissement, l'aplatissement (réfraction), l'apparition
+    // des aigrettes.
+    const horizonness = Math.max(0, 1 - Math.max(0, sunY) * 3.5);
+    const sunsetGrow  = 1.0 + horizonness * 0.55;        // soleil grossit au couchant
+    const flattenY    = 1.0 - horizonness * 0.10;        // s'aplatit (réfraction)
+    // teintes : blanc-chaud au zénith → rouge-orange à l'horizon
+    const _cNoon   = SkyAtmo._cNoon   || (SkyAtmo._cNoon   = new THREE.Color(0xfff2d0));
+    const _cSunset = SkyAtmo._cSunset || (SkyAtmo._cSunset = new THREE.Color(0xff8a3d));
+    if(!SkyAtmo._cTmp) SkyAtmo._cTmp = new THREE.Color();
+    SkyAtmo._cTmp.copy(_cNoon).lerp(_cSunset, horizonness);
+
+    // CŒUR
+    if(this.sunCore){
+      this.sunCore.position.set(cx + sx, sy, cz + sz);
+      this.sunCore.visible = SunState.sunVisible;
+      this.sunCore.material.color.copy(SkyAtmo._cTmp);
+      this.sunCore.scale.set(22 * sunsetGrow, 22 * sunsetGrow * flattenY, 1);
+      this.sunCore.material.opacity = SunState.sunVisible
+        ? Math.min(1, 0.55 + Math.max(0, sunY + 0.05) * 1.4) : 0;
     }
+    // COURONNE
+    if(this.sunCorona){
+      this.sunCorona.position.set(cx + sx, sy, cz + sz);
+      this.sunCorona.visible = SunState.sunVisible;
+      // couleur moitié-chaude
+      this.sunCorona.material.color.copy(_cNoon).lerp(_cSunset, horizonness * 0.85);
+      this.sunCorona.scale.set(46 * sunsetGrow, 46 * sunsetGrow * flattenY, 1);
+      this.sunCorona.material.opacity = SunState.sunVisible
+        ? 0.55 * (0.35 + horizonness * 0.70) : 0;
+    }
+    // HALO atmosphérique large
     if(this.sunHalo){
       this.sunHalo.position.set(cx + sx, sy, cz + sz);
       this.sunHalo.visible = SunState.sunVisible;
-      // halo plus dense quand soleil bas (heure dorée)
-      const haloK = Math.max(0, 1 - Math.max(0, sunWorld_y)*0.7);
-      this.sunHalo.material.opacity = SunState.sunVisible ? 0.40 * haloK : 0;
+      this.sunHalo.material.color.copy(SunState.sunColor);
+      this.sunHalo.scale.set(140 * sunsetGrow * 0.95, 140 * sunsetGrow * 0.95, 1);
+      this.sunHalo.material.opacity = SunState.sunVisible ? (0.30 + horizonness * 0.30) : 0;
     }
+    // AIGRETTES — apparaissent à l'horizon, tournoient très lentement
+    const raysVisible = SunState.sunVisible && horizonness > 0.30;
+    for(let i=0;i<this.sunRays.length;i++){
+      const ray=this.sunRays[i];
+      ray.position.set(cx + sx, sy, cz + sz);
+      ray.visible=raysVisible;
+      ray.material.color.copy(SunState.sunColor);
+      // longueur proportionnelle à l'inclinaison
+      const rayLen = 38 + horizonness * 50;
+      ray.scale.set(9, rayLen, 1);
+      // rotation lente + offset par rai
+      ray.material.rotation = (i / this.sunRays.length) * Math.PI * 2 + t * 0.03;
+      ray.material.opacity = raysVisible ? 0.40 * horizonness * (0.85 + 0.15*Math.sin(t*0.6 + i)) : 0;
+    }
+
+    // ==================== LUNE — disque texturé + halo ====================
     if(this.moonDisk){
       this.moonDisk.position.set(cx + mx, my, cz + mz);
       this.moonDisk.visible = SunState.moonVisible;
-      // lune visible plus fortement la NUIT (kDay petit)
-      this.moonDisk.material.opacity = SunState.moonVisible
-        ? Math.min(1, 0.10 + Math.max(0, moonWorld_y)*1.0) * (1 - SunState.kDay*0.85) : 0;
+      // la lune apparaît surtout la nuit (kDay petit) mais reste subtilement
+      // discernable même en plein jour (ciel pâle).
+      const moonOp = SunState.moonVisible
+        ? Math.min(1, 0.25 + Math.max(0, moonY)*0.85) * (0.15 + (1 - SunState.kDay) * 0.85)
+        : 0;
+      this.moonDisk.material.opacity = moonOp;
+      // taille très subtilement modulée par hauteur (réfraction à l'horizon)
+      const moonHorizonness = Math.max(0, 1 - Math.max(0, moonY) * 3.5);
+      const moonGrow = 1.0 + moonHorizonness * 0.30;
+      this.moonDisk.scale.set(18 * moonGrow, 18 * moonGrow * (1 - moonHorizonness*0.06), 1);
     }
     if(this.moonHalo){
       this.moonHalo.position.set(cx + mx, my, cz + mz);
       this.moonHalo.visible = SunState.moonVisible;
-      this.moonHalo.material.opacity = SunState.moonVisible ? 0.30 * (1 - SunState.kDay) : 0;
+      this.moonHalo.material.opacity = SunState.moonVisible
+        ? 0.35 * (1 - SunState.kDay * 0.90) : 0;
     }
 
     // VOILE doré : grand plan orienté vers la caméra, posé côté soleil (dynamique).
@@ -11165,20 +11384,20 @@ const SkyAtmo = {
     if(this.veil){
       this.veil.position.set(cx + SunState.sunDir.x * 180, 55, cz + SunState.sunDir.z * 180);
       this.veil.lookAt(cx, 30, cz);
-      const veilK = Math.max(0, 1 - Math.max(0, sunWorld_y)*1.2) * Math.max(0, sunWorld_y + 0.05);
+      const veilK = Math.max(0, 1 - Math.max(0, sunY)*1.2) * Math.max(0, sunY + 0.05);
       this.veil.visible = veilK > 0.01;
       this.veil.material.opacity = 0.12 * veilK;
     }
 
     // GODRAYS : du soleil vers le sol, à proximité du disque. Suivent SunState.
-    const godrayBase = SunState.sunVisible && sunWorld_y < 0.55 && sunWorld_y > -0.05;
+    const godrayBase = SunState.sunVisible && sunY < 0.55 && sunY > -0.05;
     for(let i=0;i<this.godrays.length;i++){
       const ray=this.godrays[i];
       ray.position.set(cx + sx + 6 + i*4, sy - 12, cz + sz + (i-1)*6);
       ray.rotation.z = ray.userData.tilt + Math.sin(t*0.25 + i)*0.06;
       ray.rotation.y = Math.PI/2;
       ray.visible = godrayBase;
-      const climaxK = Math.max(0, 1 - Math.abs(sunWorld_y - 0.10)*4);   // pic à hauteur ~10°
+      const climaxK = Math.max(0, 1 - Math.abs(sunY - 0.10)*4);   // pic à hauteur ~10°
       ray.material.opacity = godrayBase
         ? ray.userData.baseOp * climaxK * (0.85 + 0.15*Math.sin(t*0.4 + i*1.7))
         : 0;
@@ -11210,7 +11429,7 @@ function _applyM2Quality(q){
     if(SkyAtmo.veil) SkyAtmo.veil.visible = live;
     for(const r of SkyAtmo.godrays) r.visible = live;
     for(const c of SkyAtmo.clouds) c.visible = live;
-    // sunDisk + sunHalo restent toujours (le soleil fait partie du ciel DA)
+    // Couches du soleil + lune restent toujours (centre de chaque plan).
   }
 }
 if(typeof window !== 'undefined') window._applyM2Quality = _applyM2Quality;
