@@ -844,21 +844,400 @@ function defineZone(name,x,z,color,key,builder){
   obstacles.push({pos:new THREE.Vector2(x,z),radius:5.5});
 }
 
+/* =====================================================================
+   M5 — TEXTURES & HELPERS DES BÂTIMENTS DE POUVOIR.
+   pierreDeTaille + enduit suivent le modèle M3 ({map, roughnessMap}, 512px,
+   anisotropy 8, RepeatWrapping). Helpers archi : fenêtre cintrée (avec
+   pane taggé pour M4), grille de fer, portes/lanternes en bronze,
+   forme rectangle arrondie pour ExtrudeGeometry (biseaux ~3 cm).
+   Toutes les textures sont memoïsées (1 material par texture, partagé
+   entre faces). Voir buildBanque / buildBourse / buildEtat plus bas.
+   ===================================================================== */
+const _M5_tex = {};
+// Object3D.add() retourne le PARENT, pas l'enfant — d'où ce helper qui
+// ajoute le mesh au parent en lui posant sa position et retourne le mesh.
+const _addAt=(parent, mesh, x=0, y=0, z=0)=>{
+  mesh.position.set(x,y,z); parent.add(mesh); return mesh;
+};
+function pierreDeTailleTexture(tone='clair'){
+  const key='pierreDT_'+tone; if(_M5_tex[key]) return _M5_tex[key];
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  const rc=document.createElement('canvas'); rc.width=rc.height=512; const r=rc.getContext('2d');
+  const rnd=_seededRnd(0xb1a98e + (tone==='sombre'?7919:tone==='froid'?9181:0));
+  const PALETTE = tone==='sombre' ? [154,141,118] : tone==='froid' ? [148,156,170] : [188,176,154];
+  const JOINT = tone==='froid' ? '#525766' : '#6b6149';
+  x.fillStyle=JOINT; x.fillRect(0,0,512,512);
+  r.fillStyle='#eaeaea'; r.fillRect(0,0,512,512);
+  // appareil pierre de taille : grandes assises horizontales, blocs décalés
+  const ROW_H=80;
+  for(let row=0, y=2; y<530; y+=ROW_H, row++){
+    const off=(row%2)? -72 : 0;
+    for(let cx=off; cx<540; cx+=144){
+      const w=144-5+(rnd()-0.5)*5;
+      const h=ROW_H-5;
+      const dr=(rnd()-0.5)*18, dg=(rnd()-0.5)*16, db=(rnd()-0.5)*14;
+      x.fillStyle=`rgb(${Math.max(40,PALETTE[0]+dr)},${Math.max(40,PALETTE[1]+dg)},${Math.max(40,PALETTE[2]+db)})`;
+      x.fillRect(cx+3, y, w, h);
+      const rg=212+Math.floor(rnd()*22);
+      r.fillStyle=`rgb(${rg},${rg},${rg})`;
+      r.fillRect(cx+4, y+1, w-2, h-2);
+      // ombre fine en haut/bas (chamfer dessiné — biseaux sous-pixel)
+      x.fillStyle='rgba(0,0,0,0.18)'; x.fillRect(cx+3, y, w, 2);
+      x.fillStyle='rgba(255,255,255,0.06)'; x.fillRect(cx+3, y+2, w, 1);
+      x.fillStyle='rgba(0,0,0,0.10)'; x.fillRect(cx+3, y+h-2, w, 2);
+      // grain & micro-érosion
+      if(rnd()<0.5){
+        x.fillStyle='rgba(0,0,0,0.06)';
+        for(let k=0;k<6;k++) x.fillRect(cx+8+rnd()*(w-12), y+4+rnd()*(h-6), 1+rnd()*2, 1+rnd()*1.5);
+      }
+    }
+  }
+  const tex={ map:_texColor(c), roughnessMap:_texLinear(rc) };
+  _M5_tex[key]=tex; return tex;
+}
+function enduitTexture(){
+  if(_M5_tex.enduit) return _M5_tex.enduit;
+  const c=document.createElement('canvas'); c.width=c.height=512; const x=c.getContext('2d');
+  const rc=document.createElement('canvas'); rc.width=rc.height=512; const r=rc.getContext('2d');
+  const rnd=_seededRnd(0x8c93a4);
+  x.fillStyle='#9aa0ad'; x.fillRect(0,0,512,512);
+  r.fillStyle='#f0f0f0'; r.fillRect(0,0,512,512);
+  // micro-grain pebbledash
+  for(let i=0;i<2600;i++){
+    const px=rnd()*512, py=rnd()*512, dark=rnd()<0.5;
+    x.fillStyle=dark?`rgba(60,68,80,${0.10+rnd()*0.18})`:`rgba(220,228,236,${0.08+rnd()*0.14})`;
+    x.fillRect(px,py, 1+rnd()*1.5, 1+rnd()*1.5);
+  }
+  // larges plaques d'usure subtile
+  for(let i=0;i<10;i++){
+    const px=rnd()*512, py=rnd()*512, rr=60+rnd()*80;
+    const gr=x.createRadialGradient(px,py,rr*0.2,px,py,rr);
+    gr.addColorStop(0,'rgba(50,56,68,0.10)'); gr.addColorStop(1,'rgba(50,56,68,0)');
+    x.fillStyle=gr; x.beginPath(); x.arc(px,py,rr,0,Math.PI*2); x.fill();
+  }
+  const tex={ map:_texColor(c), roughnessMap:_texLinear(rc) };
+  _M5_tex.enduit=tex; return tex;
+}
+// rectangle arrondi (pour ExtrudeGeometry, donne biseaux ~3cm via bevelSize)
+function _roundedRectShape(w, d, r){
+  const W=w/2, D=d/2;
+  const s=new THREE.Shape();
+  s.moveTo(-W+r, -D);
+  s.lineTo(W-r, -D); s.quadraticCurveTo(W, -D, W, -D+r);
+  s.lineTo(W, D-r);   s.quadraticCurveTo(W, D, W-r, D);
+  s.lineTo(-W+r, D);  s.quadraticCurveTo(-W, D, -W, D-r);
+  s.lineTo(-W, -D+r); s.quadraticCurveTo(-W, -D, -W+r, -D);
+  return s;
+}
+/* createArchedWindow — fenêtre cintrée. Le pane est taggé _M4_currentZone et
+   poussé dans windowPanes pour que updateWindowGlow l'allume comme une vitre
+   classique (gold pour banque/bourse, etc.) */
+function createArchedWindow(w=1.0, h=2.4, frameC=0x352a1e){
+  const g=new THREE.Group();
+  const ah=w*0.5;
+  const shp=new THREE.Shape();
+  shp.moveTo(-w/2, 0);
+  shp.lineTo(-w/2, h - ah);
+  shp.absarc(0, h - ah, ah, Math.PI, 0, true);
+  shp.lineTo(w/2, 0);
+  shp.lineTo(-w/2, 0);
+  // vitre (pane M4-taggé)
+  const paneGeo=new THREE.ShapeGeometry(shp);
+  const pane=new THREE.Mesh(paneGeo, new THREE.MeshStandardMaterial({
+    color:0x33414c, emissive:new THREE.Color(0x12202a), emissiveIntensity:0.5,
+    flatShading:true, roughness:0.7,
+  }));
+  pane.position.z=0.0;
+  pane.userData.glowPhase=Math.random();
+  pane.userData.zone=_M4_currentZone;
+  windowPanes.push(pane);
+  g.add(pane);
+  // cadre dormant (outline plus large, plus sombre derrière)
+  const fr=0.10;
+  const outShp=new THREE.Shape();
+  outShp.moveTo(-w/2 - fr, -fr);
+  outShp.lineTo(-w/2 - fr, h - ah);
+  outShp.absarc(0, h - ah, ah + fr, Math.PI, 0, true);
+  outShp.lineTo(w/2 + fr, -fr);
+  outShp.lineTo(-w/2 - fr, -fr);
+  const out=new THREE.Mesh(new THREE.ShapeGeometry(outShp),
+    new THREE.MeshStandardMaterial({color:frameC, roughness:0.9, flatShading:true}));
+  out.position.z=-0.06;
+  g.add(out);
+  // archivolt (demi-torus sur l'arc)
+  const arch=new THREE.Mesh(new THREE.TorusGeometry(ah + fr*0.6, 0.05, 4, 16, Math.PI),
+    new THREE.MeshStandardMaterial({color:frameC, roughness:0.7, flatShading:true}));
+  arch.position.set(0, h - ah, 0.06);
+  g.add(arch);
+  // clé de voûte (saillie centrale)
+  g.add(box(0.20, 0.36, 0.14, 0x86795b, 0, h - 0.06, 0.07, false));
+  return g;
+}
+function createIronGrille(w=1.0, h=1.0, color=0x14181f){
+  const g=new THREE.Group();
+  const matIron=new THREE.MeshStandardMaterial({color, roughness:0.5, metalness:0.7, flatShading:true});
+  const bars=5;
+  for(let i=0;i<bars;i++){
+    const bx=-w/2 + (i+0.5)*(w/bars);
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(0.05, h, 0.05), matIron), bx, h/2, 0);
+  }
+  for(const y of [h*0.18, h*0.82])
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(w+0.08, 0.05, 0.05), matIron), 0, y, 0);
+  for(const sx of [-1,1])
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(0.06, h+0.1, 0.06), matIron), sx*w/2, h/2, 0);
+  return g;
+}
+function createIronFence(len=11, height=1.8){
+  const g=new THREE.Group();
+  const matIron=new THREE.MeshStandardMaterial({color:0x14181f, roughness:0.5, metalness:0.7, flatShading:true});
+  const matStone=new THREE.MeshStandardMaterial({color:0x6b7080, roughness:0.95, metalness:0});
+  const bars=Math.floor(len/0.5);
+  for(let i=0;i<=bars;i++){
+    const bx=-len/2 + i*(len/bars);
+    _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, height, 6), matIron), bx, height/2, 0);
+    _addAt(g, new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.18, 6), matIron), bx, height + 0.09, 0);
+  }
+  for(const y of [0.35, height - 0.12])
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(len, 0.05, 0.07), matIron), 0, y, 0);
+  for(const sx of [-1,1])
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(0.32, height+0.6, 0.32), matStone),
+      sx*(len/2 + 0.15), (height+0.6)/2, 0);
+  return g;
+}
+function createBronzeDoor(w=2.8, h=4.2){
+  const g=new THREE.Group();
+  const matBronze=new THREE.MeshStandardMaterial({color:0x6b5a35, roughness:0.45, metalness:0.75, flatShading:true});
+  const matBronzeDark=new THREE.MeshStandardMaterial({color:0x4a3e22, roughness:0.6, metalness:0.7, flatShading:true});
+  const matFrame=new THREE.MeshStandardMaterial({color:0x9b906f, roughness:0.95, metalness:0});
+  // chambranle de pierre épaisse
+  _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(w+0.6, h+0.4, 0.18), matFrame), 0, h/2 + 0.05, -0.05);
+  // double battant
+  for(const sx of [-1,1]){
+    const lw=w/2 - 0.05;
+    const leaf=new THREE.Mesh(new THREE.BoxGeometry(lw, h, 0.10), matBronze);
+    leaf.position.set(sx*(w/4 + 0.025), h/2, 0.06);
+    leaf.castShadow=true; g.add(leaf);
+    // 3 panneaux moulurés par battant (encastrés)
+    for(let i=0;i<3;i++){
+      const pw=lw - 0.30, ph=(h - 0.9)/3 - 0.15;
+      const py=0.45 + i*((h-0.9)/3) + ph/2;
+      _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(pw, ph, 0.03), matBronzeDark),
+        sx*(w/4 + 0.025), py, 0.115);
+    }
+    // poignée
+    _addAt(g, new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 6), matBronze),
+      sx*(w/3 - 0.1), h*0.42, 0.16);
+  }
+  // linteau au-dessus de la porte (saillant)
+  _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(w+0.8, 0.22, 0.28), matFrame), 0, h + 0.18, 0.05);
+  return g;
+}
+/* createBronzeLantern — PAS de PointLight (M4 budget intact). Faux halo via
+   sprite additif + bulbe émissif goldLight (nourrit le bloom). */
+function createBronzeLantern(){
+  const g=new THREE.Group();
+  const matBronze=new THREE.MeshStandardMaterial({color:0x6b5a35, roughness:0.45, metalness:0.75, flatShading:true});
+  const matBronzeDark=new THREE.MeshStandardMaterial({color:0x4a3e22, roughness:0.6, metalness:0.7, flatShading:true});
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.10, 3.6, 6), matBronze), 0, 1.8, 0);
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 0.25, 8), matBronzeDark), 0, 0.12, 0);
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.15, 8), matBronze), 0, 3.65, 0);
+  for(let i=0;i<4;i++){
+    const a=i*Math.PI/2;
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.55, 0.04), matBronze),
+      Math.cos(a)*0.20, 3.95, Math.sin(a)*0.20);
+  }
+  const top=new THREE.Mesh(new THREE.ConeGeometry(0.32, 0.36, 4), matBronzeDark);
+  top.rotation.y=Math.PI/4; top.position.y=4.35; g.add(top);
+  // bulbe émissif goldLight (nourrit le bloom)
+  _addAt(g, new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 8),
+    new THREE.MeshStandardMaterial({color:0xffe6ad, emissive:new THREE.Color(0xffd98a), emissiveIntensity:1.6, flatShading:true})),
+    0, 3.95, 0);
+  // halo additif (sprite)
+  _gasTextures();
+  const halo=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:_gasHaloTex, color:0xffd98a, transparent:true, opacity:0.55,
+    depthWrite:false, blending:THREE.AdditiveBlending,
+  }));
+  halo.scale.set(2.4, 2.4, 1); halo.position.y=3.95;
+  g.add(halo);
+  return g;
+}
+/* _cotationsTex — bandeau défilant de cotations boursières. Texture animée
+   par offset.x (cf. updateBourseSkin). */
+let _M5_cotationsTex = null;
+function _cotationsTexture(){
+  if(_M5_cotationsTex) return _M5_cotationsTex;
+  const c=document.createElement('canvas'); c.width=1024; c.height=64;
+  const x=c.getContext('2d');
+  x.fillStyle='#15181c'; x.fillRect(0,0,1024,64);
+  x.font='700 32px "IBM Plex Mono", monospace';
+  x.textBaseline='middle';
+  const items=['£INDEX 142.8 ▲','£BANK 89.2 ▼','£RAIL 215.6 ▲','£TEX 68.0 ▼','£STEEL 432.1 ▲','£SUGAR 17.4 ▼','£COTON 41.3 ▲','£EAST 12.0 ▼'];
+  let px=18;
+  for(const it of items){
+    x.fillStyle = it.includes('▲') ? '#9ad17a' : '#d17a7a';
+    x.fillText(it, px, 32);
+    px += x.measureText(it).width + 50;
+  }
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=THREE.RepeatWrapping; t.wrapT=THREE.ClampToEdgeWrapping;
+  _M5_cotationsTex=t; return t;
+}
+
 /* --- silhouettes low-poly par zone --- */
+let _M5_bourseCoin = null;    // pour la rotation lente de la girouette
 function buildBanque(g){
-  g.add(box(13,1,11,0xb8a986,0,0.5,0,false));                       // socle
-  const steps=createSteps(11,3); steps.position.set(0,0.5,1); g.add(steps);
-  const body=box(11,11,9,COL.pierre,0,6.5,-0.5); body.material.map=texBrick(); g.add(body); addOutline(body);
-  for(let i=0;i<4;i++){ const c=createColumn(8,0.5); c.position.set(-4.2+i*2.8,1.4,4.4); g.add(c); }
-  const ped=new THREE.Mesh(new THREE.ConeGeometry(7.4,2.6,3),stdMat(0xc2b186)); // fronton triangulaire
-  ped.position.set(0,11,3.4); ped.rotation.y=Math.PI/2; ped.scale.set(1,1,0.42); g.add(ped);
-  g.add(box(13.6,1,11,COL.or,0,12.6,-0.5,false));                   // corniche dorée
-  const dr=createDoor(2.2,3.6); dr.position.set(0,1,4.7); g.add(dr);
-  for(const x of[-3.6,3.6]){ const w=createWindow(1,1.5); w.position.set(x,6.5,4.05); g.add(w); }
-  const sp=createSign('£'); sp.scale.set(2.6,2.6,1); sp.position.set(0,9.7,4.7); g.add(sp);
+  // — matières partagées (1 material par texture)
+  const pierre=pierreDeTailleTexture('clair');
+  const matStone=new THREE.MeshStandardMaterial({
+    color:0xb8ad98, map:pierre.map, roughnessMap:pierre.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
+  const matStoneDark=new THREE.MeshStandardMaterial({
+    color:0x9b906f, map:pierre.map, roughnessMap:pierre.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
+  const matStain=new THREE.MeshBasicMaterial({
+    color:0x3a2f24, transparent:true, opacity:0.32, depthWrite:false,
+  });
+
+  // helper local : box() crée son propre material — on le SWAP par celui partagé
+  // (sinon chaque box porte son propre MeshStandardMaterial sans map). Object3D.add
+  // retourne le PARENT, donc on ne peut pas chaîner ; on instancie séparément.
+  const swap=(m, mat)=>{ m.material=mat; return m; };
+
+  // ---------- SOUBASSEMENT débordant (M5b — ancrage au sol) ----------
+  // Slab plus large que la plinthe, partiellement enterré : le bâtiment
+  // n'est plus posé en équilibre sur le terrain — il « tient ».
+  const soubShape=_roundedRectShape(13.6, 11.6, 0.12);
+  const soubGeo=new THREE.ExtrudeGeometry(soubShape,{depth:0.55,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  soubGeo.rotateX(-Math.PI/2); soubGeo.translate(0,-0.20,0);
+  const soub=new THREE.Mesh(soubGeo, matStoneDark); soub.receiveShadow=true;
+  g.add(soub);
+
+  // ---------- PARVIS + MARCHES (rapport au sol) ----------
+  g.add(swap(box(15, 0.18, 5.4, 0xc6bb9d, 0, 0.09, 4.6, false), matStoneDark));
+  for(let i=0;i<4;i++){
+    const sw=13 - i*0.7;
+    g.add(swap(box(sw, 0.32, 0.95, 0xb8ad98, 0, 0.16+i*0.32, 2.0 + i*0.95, false), matStone));
+  }
+
+  // ---------- PLINTHE (extrude, biseaux) ----------
+  const plinShape=_roundedRectShape(13, 11, 0.10);
+  const plinGeo=new THREE.ExtrudeGeometry(plinShape,{depth:1.2,bevelEnabled:true,
+    bevelSize:0.06,bevelThickness:0.06,bevelSegments:1,steps:1});
+  plinGeo.rotateX(-Math.PI/2);
+  const plin=new THREE.Mesh(plinGeo, matStoneDark); plin.castShadow=true; plin.receiveShadow=true;
+  g.add(plin);
+
+  // ---------- CORPS pierre de taille claire ----------
+  const bodyShape=_roundedRectShape(11.5, 9.5, 0.08);
+  const bodyGeo=new THREE.ExtrudeGeometry(bodyShape,{depth:9.0,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  bodyGeo.rotateX(-Math.PI/2); bodyGeo.translate(0,1.2,0);
+  const body=new THREE.Mesh(bodyGeo, matStone); body.castShadow=true; body.receiveShadow=true;
+  g.add(body);
+
+  // ---------- FRISE + CORNICHE (large débord) ----------
+  // frise mince à mi-hauteur (rappel des cours d'assises)
+  g.add(swap(box(11.8, 0.30, 9.8, 0xa8957a, 0, 6.8, 0, false), matStoneDark));
+  // corniche en débord, biseautée
+  const corShape=_roundedRectShape(13.4, 11.4, 0.12);
+  const corGeo=new THREE.ExtrudeGeometry(corShape,{depth:0.62,bevelEnabled:true,
+    bevelSize:0.08,bevelThickness:0.08,bevelSegments:1,steps:1});
+  corGeo.rotateX(-Math.PI/2); corGeo.translate(0,10.2,0);
+  const corniche=new THREE.Mesh(corGeo, matStoneDark); corniche.castShadow=true;
+  g.add(corniche);
+  // bande de pluie sous la corniche (usure DISCRÈTE — temple entretenu)
+  const stainBand=new THREE.Mesh(new THREE.PlaneGeometry(11.5, 0.7), matStain);
+  stainBand.position.set(0, 9.7, 4.78); g.add(stainBand);
+
+  // ---------- 6 COLONNES sous le portique ----------
+  for(let i=0;i<6;i++){
+    const c=createColumn(8.8, 0.46);
+    c.position.set(-5 + i*2, 1.2, 4.95);
+    g.add(c);
+  }
+
+  // ---------- FRONTON TRIANGULAIRE + frise ----------
+  const pediShape=new THREE.Shape();
+  pediShape.moveTo(-6.6, 0); pediShape.lineTo(6.6, 0);
+  pediShape.lineTo(0, 2.8); pediShape.lineTo(-6.6, 0);
+  const pediGeo=new THREE.ExtrudeGeometry(pediShape,{depth:1.5,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  pediGeo.translate(0, 10.5, 4.0);
+  const pediment=new THREE.Mesh(pediGeo, matStone); pediment.castShadow=true;
+  g.add(pediment);
+  // « £ » sculpté en relief au tympan
+  const sp=createSign('£'); sp.scale.set(2.4,2.4,1); sp.position.set(0, 11.6, 5.55); g.add(sp);
+
+  // ---------- FENÊTRES CINTRÉES (alignées sur l'émissif goldLight M4) ----------
+  // 4 fenêtres en façade entre les colonnes, à hauteur ~7m
+  for(const fx of [-3.0, -1.0, 1.0, 3.0]){
+    const w=createArchedWindow(1.0, 2.4);
+    w.position.set(fx, 5.0, 4.78);
+    g.add(w);
+    // grille de fer au niveau bas
+    const gr=createIronGrille(1.0, 1.0);
+    gr.position.set(fx, 4.6, 4.85); g.add(gr);
+  }
+  // 2 fenêtres cintrées hautes au-dessus (illuminent depuis l'intérieur)
+  for(const fx of [-2.0, 2.0]){
+    const w=createArchedWindow(0.9, 1.9);
+    w.position.set(fx, 7.3, 4.78); g.add(w);
+  }
+  // côtés : 3 fenêtres cintrées par flanc (le volume n'est plus aveugle)
+  for(const sx of [-1, 1]){
+    for(const fz of [-2.5, 0, 2.5]){
+      const w=createArchedWindow(0.9, 2.1);
+      w.position.set(sx*5.78, 5.2, fz);
+      w.rotation.y=sx>0?-Math.PI/2:Math.PI/2;
+      g.add(w);
+    }
+    // M5b — frise latérale qui reprend le bandeau de façade (continuité du volume)
+    const sideFrize=swap(box(0.30, 0.30, 9.6, 0xa8957a, sx*5.81, 6.8, 0, false), matStoneDark);
+    g.add(sideFrize);
+  }
+  // ---------- FAÇADE ARRIÈRE (M5b — plus sobre que devant, mais TRAITÉE) ----------
+  // 4 fenêtres + frise + corniche déjà courent autour (ExtrudeGeometry)
+  for(const fx of [-3.4, -1.1, 1.1, 3.4]){
+    const w=createArchedWindow(0.85, 2.0);
+    w.position.set(fx, 5.0, -4.78);
+    w.rotation.y=Math.PI;
+    g.add(w);
+  }
+  // 2 lucarnes carrées hautes à l'arrière
+  for(const fx of [-2.2, 2.2]){
+    const w=createWindow(0.7, 0.85);
+    w.position.set(fx, 7.7, -4.80);
+    w.rotation.y=Math.PI; g.add(w);
+  }
+  // petite porte de service au centre arrière
+  const backDoor=swap(box(1.6, 2.4, 0.10, 0x352a1e, 0, 1.2, -4.80, false), matStoneDark);
+  g.add(backDoor);
+
+  // ---------- TOIT FERMÉ : dalle sombre derrière le fronton ----------
+  // Le corps + corniche referment déjà le volume par le haut. On ajoute une
+  // dalle plus sombre légèrement saillante : c'est le toit visible d'en haut.
+  const roof=swap(box(11.4, 0.25, 9.4, 0x55483a, 0, 10.92, 0, false), matStoneDark);
+  roof.material=new THREE.MeshStandardMaterial({color:0x55483a, roughness:0.95, metalness:0});
+  g.add(roof);
+
+  // ---------- PORTE DE BRONZE (double battant) ----------
+  const door=createBronzeDoor(2.6, 4.0);
+  door.position.set(0, 0, 4.80); g.add(door);
+
+  // ---------- 2 LANTERNES DE BRONZE encadrant l'entrée ----------
+  for(const sx of [-1, 1]){
+    const lant=createBronzeLantern();
+    lant.position.set(sx*2.4, 0, 5.6); g.add(lant);
+  }
+
+  // ---------- COFFRE + REGISTRES (clin d'œil, côté coulisses) ----------
   const coffre=box(2.4,2,1.8,0x3a352c,4.4,1.5,-3,false); coffre.material.map=texMetal(); g.add(coffre);
   g.add(box(2.5,0.4,1.9,COL.or,4.4,2.5,-3,false));
-  for(let i=0;i<3;i++) g.add(box(1.7,0.42,1.1,0xcdbd9a,-4.6,0.7+i*0.46,-3,false));   // registres empilés
+  for(let i=0;i<3;i++) g.add(box(1.7,0.42,1.1,0xcdbd9a,-4.6,0.7+i*0.46,-3,false));
 }
 /* ===== v64 — KIT DE FAÇADE : ce qui sépare une boîte d'un bâtiment =====
    soubassement de pierre, corniche sous le toit, fenêtres à volets,
@@ -1037,17 +1416,207 @@ function buildMarcheTravail(g){       // place sociale : bureau d'embauche + fil
   const wk=(x,z,pose)=>{ const w=createWorkerFigure({pose}); w.position.set(x,0,z); w.rotation.y=Math.random()*0.6-0.3; g.add(w); };
   wk(2,1,'idle'); wk(3.3,2.1,'slump'); wk(1.4,3,'idle');
 }
-function buildEtat(g){                // institution froide : fronton, sceau, tampon, décret
-  const body=box(13,9,9,0x8d9183,0,4.5,0); body.material.map=texBrick(); g.add(body); addOutline(body);
-  for(let i=0;i<5;i++){ const c=createColumn(6.5,0.45); c.position.set(-4.8+i*2.4,1,4.4); g.add(c); }
-  const ped=new THREE.Mesh(new THREE.ConeGeometry(8,2.6,3),stdMat(0x76796b));
-  ped.position.set(0,10.6,3); ped.rotation.y=Math.PI/2; ped.scale.set(1,1,0.42); g.add(ped);
-  g.add(box(14,0.9,9.5,0x6f7363,0,9.4,0,false));
-  const seal=cyl(1.1,1.1,0.3,COL.or,16); seal.rotation.x=Math.PI/2; seal.position.set(-2,6,4.7); g.add(seal);
-  g.add(box(1.3,1.3,0.12,COL.rouge,2.5,6,4.7,false));   // tampon rouge
-  g.add(box(0.16,5,0.16,0x2a241d,6,2.5,4,false)); g.add(box(2.2,1.3,0.08,COL.rouge,7.1,4.4,4,false)); // drapeau
-  const fence=createFenceSegment(7); fence.position.set(0,0,7); g.add(fence);
-  const sp=createSign('ÉTAT'); sp.scale.set(3,1.4,1); sp.position.set(0,8.3,4.7); g.add(sp);
+function buildEtat(g){               // « la machine froide » — rigide, administrative
+  const enduit=enduitTexture();
+  const matEnduit=new THREE.MeshStandardMaterial({
+    color:0x8c93a4, map:enduit.map, roughnessMap:enduit.roughnessMap,
+    roughness:0.95, metalness:0.0,
+  });
+  const matEnduitDark=new THREE.MeshStandardMaterial({
+    color:0x6b7080, map:enduit.map, roughnessMap:enduit.roughnessMap,
+    roughness:0.95, metalness:0.0,
+  });
+  const matIron=new THREE.MeshStandardMaterial({color:0x14181f, roughness:0.5, metalness:0.7, flatShading:true});
+
+  // helper local : box() crée son propre material — on le SWAP par celui partagé.
+  const swap=(m, mat)=>{ m.material=mat; return m; };
+
+  // ---------- SOUBASSEMENT débordant (M5b — ancrage au sol) ----------
+  const soubShape=_roundedRectShape(13.6, 9.6, 0.10);
+  const soubGeo=new THREE.ExtrudeGeometry(soubShape,{depth:0.45,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  soubGeo.rotateX(-Math.PI/2); soubGeo.translate(0,-0.18,0);
+  const soub=new THREE.Mesh(soubGeo, matEnduitDark); soub.receiveShadow=true;
+  g.add(soub);
+
+  // ---------- GRILLE EN FAÇADE + MURET BAS + parvis ----------
+  // M5b — la grille est assise sur un muret bas, plus de barreaux flottants
+  const muret=swap(box(11.4, 0.35, 0.32, 0x787f8d, 0, 0.175, 6.0, false), matEnduitDark);
+  g.add(muret);
+  const grille=createIronFence(11, 1.9);
+  grille.position.set(0, 0.35, 6.0); g.add(grille);
+  g.add(swap(box(13, 0.18, 1.6, 0x787f8d, 0, 0.09, 5.2, false), matEnduitDark));
+
+  // ---------- MARCHES (courte volée — austère) ----------
+  for(let i=0;i<3;i++){
+    g.add(swap(box(11 - i*0.4, 0.32, 0.9, 0x8c93a4, 0, 0.16+i*0.32, 4.0+i*0.7, false), matEnduit));
+  }
+
+  // ---------- PLINTHE (extrude) ----------
+  const plinShape=_roundedRectShape(13, 9, 0.08);
+  const plinGeo=new THREE.ExtrudeGeometry(plinShape,{depth:1.0,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  plinGeo.rotateX(-Math.PI/2);
+  const plin=new THREE.Mesh(plinGeo, matEnduitDark);
+  plin.castShadow=true; plin.receiveShadow=true; g.add(plin);
+
+  // ---------- CORPS ----------
+  const bodyShape=_roundedRectShape(12, 8, 0.06);
+  const bodyGeo=new THREE.ExtrudeGeometry(bodyShape,{depth:7.6,bevelEnabled:true,
+    bevelSize:0.04,bevelThickness:0.04,bevelSegments:1,steps:1});
+  bodyGeo.rotateX(-Math.PI/2); bodyGeo.translate(0,1.0,0);
+  const body=new THREE.Mesh(bodyGeo, matEnduit);
+  body.castShadow=true; body.receiveShadow=true; g.add(body);
+
+  // ---------- CORNICHE (débord net) ----------
+  const corShape=_roundedRectShape(13, 9, 0.08);
+  const corGeo=new THREE.ExtrudeGeometry(corShape,{depth:0.48,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  corGeo.rotateX(-Math.PI/2); corGeo.translate(0,8.6,0);
+  const corniche=new THREE.Mesh(corGeo, matEnduitDark); corniche.castShadow=true;
+  g.add(corniche);
+  // bande de pluie discrète sous corniche
+  _addAt(g, new THREE.Mesh(new THREE.PlaneGeometry(11.5, 0.45),
+    new THREE.MeshBasicMaterial({color:0x2f343d, transparent:true, opacity:0.28, depthWrite:false})),
+    0, 8.4, 4.05);
+
+  // ---------- PILASTRES en façade (austère, pas d'ordre ionique) ----------
+  for(let i=0;i<5;i++){
+    g.add(swap(box(0.4, 6.6, 0.28, 0x6b7080, -4.4+i*2.2, 4.3, 4.02, false), matEnduitDark));
+    // chapiteau plat
+    g.add(swap(box(0.55, 0.20, 0.40, 0x6b7080, -4.4+i*2.2, 7.7, 4.04, false), matEnduitDark));
+  }
+
+  // ---------- FENÊTRES RÉGULIÈRES + PARCIMONIEUSES (encadrements en relief) ----------
+  // 2 niveaux × 4 entre-colonnements (3 fenêtres centrées par niveau)
+  const winY=[3.2, 6.0];
+  for(const wy of winY){
+    for(let i=0;i<4;i++){
+      const wx=-3.3 + i*2.2;
+      // encadrement saillant (relief)
+      g.add(swap(box(1.0, 1.8, 0.08, 0x6b7080, wx, wy, 4.06, false), matEnduitDark));
+      const w=createWindow(0.78, 1.5);
+      w.position.set(wx, wy, 4.13); g.add(w);
+      // appui de fenêtre
+      g.add(swap(box(1.1, 0.10, 0.18, 0x6b7080, wx, wy-0.9, 4.10, false), matEnduitDark));
+    }
+  }
+
+  // ---------- FENÊTRES LATÉRALES (M5b — le volume n'est plus aveugle) ----------
+  // 3 fenêtres par flanc, à 2 niveaux. Encadrement saillant rappel de la façade.
+  for(const sx of [-1, 1]){
+    for(const wy of winY){
+      for(const wz of [-2.6, 0, 2.6]){
+        _addAt(g, swap(box(0.08, 1.6, 0.92, 0x6b7080, sx*6.01, wy, wz, false), matEnduitDark));
+        const w=createWindow(0.72, 1.35);
+        w.position.set(sx*6.08, wy, wz);
+        w.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2;
+        g.add(w);
+      }
+    }
+    // appuis de fenêtre côté (alignés sur niveau bas)
+    for(const wz of [-2.6, 0, 2.6])
+      _addAt(g, swap(box(0.18, 0.10, 1.0, 0x6b7080, sx*6.02, winY[0]-0.9, wz, false), matEnduitDark));
+    // pilastres austères sur les flancs aussi
+    for(const wz of [-3.4, -1.0, 1.0, 3.4])
+      _addAt(g, swap(box(0.26, 6.4, 0.36, 0x6b7080, sx*6.01, 4.3, wz, false), matEnduitDark));
+  }
+
+  // ---------- FAÇADE ARRIÈRE (M5b — sobre mais TRAITÉE) ----------
+  // pilastres + 3 fenêtres + porte de service centrée
+  for(const fx of [-4.4, -2.2, 0, 2.2, 4.4])
+    _addAt(g, swap(box(0.4, 6.6, 0.28, 0x6b7080, fx, 4.3, -4.02, false), matEnduitDark));
+  for(const wy of winY){
+    for(const fx of [-2.6, 0, 2.6]){
+      _addAt(g, swap(box(1.0, 1.6, 0.08, 0x6b7080, fx, wy, -4.06, false), matEnduitDark));
+      const w=createWindow(0.72, 1.35);
+      w.position.set(fx, wy, -4.13); w.rotation.y=Math.PI; g.add(w);
+      _addAt(g, swap(box(1.1, 0.10, 0.18, 0x6b7080, fx, wy-0.9, -4.10, false), matEnduitDark));
+    }
+  }
+  // porte de service arrière
+  const backDoor=swap(box(1.6, 2.4, 0.10, 0x14181f, 0, 1.2, -4.10, false), matEnduitDark);
+  g.add(backDoor);
+
+  // ---------- TOIT FERMÉ : dalle légèrement saillante au-dessus de la corniche ----------
+  const roofE=new THREE.Mesh(new THREE.BoxGeometry(12.8, 0.22, 8.8),
+    new THREE.MeshStandardMaterial({color:0x4f5260, roughness:0.95, metalness:0}));
+  roofE.position.set(0, 9.10, 0); roofE.receiveShadow=true; g.add(roofE);
+
+  // ---------- FRONTON triangulaire avec SCEAU ----------
+  const pediShape=new THREE.Shape();
+  pediShape.moveTo(-6.4, 0); pediShape.lineTo(6.4, 0);
+  pediShape.lineTo(0, 2.4); pediShape.lineTo(-6.4, 0);
+  const pediGeo=new THREE.ExtrudeGeometry(pediShape,{depth:1.4,bevelEnabled:true,
+    bevelSize:0.05,bevelThickness:0.05,bevelSegments:1,steps:1});
+  pediGeo.translate(0, 8.85, 3.9);
+  const pediment=new THREE.Mesh(pediGeo, matEnduit); pediment.castShadow=true;
+  g.add(pediment);
+  // SCEAU en relief (cylindre + détail)
+  const seal=new THREE.Mesh(new THREE.CylinderGeometry(0.65, 0.65, 0.18, 24),
+    new THREE.MeshStandardMaterial({color:0x4a5060, roughness:0.5, metalness:0.6, flatShading:true}));
+  seal.rotation.x=Math.PI/2;
+  seal.position.set(0, 9.7, 5.40); g.add(seal);
+  // étoile au centre du sceau
+  for(let i=0;i<5;i++){
+    const a=(i/5)*Math.PI*2 - Math.PI/2;
+    _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.32, 0.04),
+      new THREE.MeshStandardMaterial({color:0x2a2c34, flatShading:true})),
+      Math.cos(a)*0.16, 9.7+Math.sin(a)*0.16, 5.48);
+  }
+
+  // ---------- CAMPANILE D'HORLOGE (centre-arrière) ----------
+  const towerW=2.6, towerH=5.4;
+  const towerCx=-3.2, towerCz=-1.6;
+  const tower=new THREE.Mesh(new THREE.BoxGeometry(towerW, towerH, towerW), matEnduit);
+  tower.position.set(towerCx, 8.6 + towerH/2, towerCz);
+  tower.castShadow=true; g.add(tower);
+  // bandeau du beffroi
+  _addAt(g, new THREE.Mesh(new THREE.BoxGeometry(towerW+0.3, 0.22, towerW+0.3), matEnduitDark),
+    towerCx, 8.6 + towerH - 0.55, towerCz);
+  // CADRAN émissif (cold white) — couplage M4 horloge (intensité = parfaitement stable)
+  const clockMat=new THREE.MeshStandardMaterial({
+    color:0xdfe2eb, emissive:new THREE.Color(0xcfd6e4), emissiveIntensity:1.15,
+    roughness:0.5, metalness:0.1, flatShading:true,
+  });
+  clockMat.userData.m4Role='etat-horloge';
+  const clock=new THREE.Mesh(new THREE.CircleGeometry(0.82, 24), clockMat);
+  clock.position.set(towerCx, 8.6 + towerH*0.55, towerCz + towerW/2 + 0.02);
+  g.add(clock);
+  // anneau (cadran encadré)
+  const ring=new THREE.Mesh(new THREE.TorusGeometry(0.88, 0.06, 4, 24),
+    new THREE.MeshStandardMaterial({color:0x2a2c34, roughness:0.5, metalness:0.6, flatShading:true}));
+  ring.position.copy(clock.position); ring.position.z+=0.01;
+  g.add(ring);
+  // aiguilles
+  const handsMat=new THREE.MeshStandardMaterial({color:0x14181f, flatShading:true});
+  const hourHand=new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.45, 0.03), handsMat);
+  hourHand.position.copy(clock.position); hourHand.position.z+=0.05;
+  hourHand.position.y += 0.18; hourHand.rotation.z=-0.7; g.add(hourHand);
+  const minHand=new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.62, 0.03), handsMat);
+  minHand.position.copy(clock.position); minHand.position.z+=0.06;
+  minHand.position.y += 0.25; minHand.rotation.z=0.5; g.add(minHand);
+  // toit pyramidal du campanile
+  const towerCap=new THREE.Mesh(new THREE.ConeGeometry(towerW*0.78, 1.6, 4), matEnduitDark);
+  towerCap.rotation.y=Math.PI/4;
+  towerCap.position.set(towerCx, 8.6 + towerH + 0.80, towerCz); g.add(towerCap);
+  // mât de drapeau au sommet
+  const mast=new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 2.6, 6), matIron);
+  mast.position.set(towerCx, 8.6 + towerH + 1.6 + 1.3, towerCz); g.add(mast);
+  const flag=new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.95),
+    new THREE.MeshStandardMaterial({color:0x2a2c34, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true}));
+  flag.position.set(towerCx + 0.78, 8.6 + towerH + 1.6 + 1.7, towerCz); g.add(flag);
+
+  // ---------- PORTE BRONZE ----------
+  const door=createBronzeDoor(2.2, 3.4);
+  door.position.set(0, 0, 4.10); g.add(door);
+
+  // ---------- ENSEIGNE ÉTAT ----------
+  const sp=createSign('ÉTAT'); sp.scale.set(3, 1.4, 1);
+  sp.position.set(0, 7.7, 4.18); g.add(sp);
+
+  // ---------- TAMPON ROUGE (clin d'œil bureaucratique, intact) ----------
+  g.add(box(1.0, 1.0, 0.10, COL.rouge, 4.6, 5.2, 4.10, false));
 }
 function buildTerresCommunes(g){      // champs ouverts puis clôturés (enclosure)
   for(let i=-1;i<=1;i++) g.add(box(7,0.3,7,0x77833f + i*0,i*8,0.15,0,false));
@@ -1084,16 +1653,165 @@ function buildPort(g){                // marché mondial : eau, quai, bateau, co
   g.add(box(2.4,2,2.2,COL.rouge,-7,1,-5)); g.add(box(2.4,2,2.2,COL.bleu,-7,3,-5));
   g.add(box(2.4,2,2.2,COL.or,-4,1,-5));
 }
-function buildBourse(g){              // capital fictif : tour abstraite, chiffres, bulles dorées
-  const tower=box(9,13,8,0x4a4a52,0,6.5,0); tower.material.map=texMetal(); g.add(tower); addOutline(tower);
-  for(let i=0;i<3;i++){ const c=createColumn(7,0.4); c.position.set(-3+i*3,0,4); g.add(c); }
-  g.add(box(10,1,9,0x2c2c33,0,13.2,0,false));
-  g.add(box(6,3.2,0.3,0x20242a,0,9,4.2,false));         // panneau de chiffres
-  for(let i=0;i<5;i++) g.add(box(0.5,0.5+i*0.5,0.4,0x9ad17a,-2.2+i,8.2+i*0.25,4.4,false)); // courbe
-  for(let i=0;i<3;i++){ const b=new THREE.Mesh(new THREE.SphereGeometry(0.8+i*0.4,12,12),
-    new THREE.MeshStandardMaterial({color:COL.or,transparent:true,opacity:.7,flatShading:true}));
-    b.position.set(-3+i*3,11+i,3); b.userData.bubble=i; g.add(b); }
-  const sp=createSign('BOURSE'); sp.scale.set(3,1.3,1); sp.position.set(0,12.2,4.3); g.add(sp);
+function buildBourse(g){             // « le phare du capital » — verticale, rayonnante
+  const pierre=pierreDeTailleTexture('clair');
+  const matStone=new THREE.MeshStandardMaterial({
+    color:0xb8ad98, map:pierre.map, roughnessMap:pierre.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
+  const matStoneDark=new THREE.MeshStandardMaterial({
+    color:0x9b906f, map:pierre.map, roughnessMap:pierre.roughnessMap,
+    roughness:1.0, metalness:0.0,
+  });
+  const matGold=new THREE.MeshStandardMaterial({
+    color:0xb89758, roughness:0.35, metalness:0.85, flatShading:true,
+  });
+  const matGoldDark=new THREE.MeshStandardMaterial({
+    color:0x7a6235, roughness:0.55, metalness:0.7, flatShading:true,
+  });
+  // Verrière dorée — material avec emissive + tag M4 (couplage profit/capital
+  // appliqué dans updateBourseSkin)
+  const matVerriere=new THREE.MeshStandardMaterial({
+    color:0xb89758, emissive:new THREE.Color(0xffd98a), emissiveIntensity:1.4,
+    roughness:0.35, metalness:0.5, flatShading:true,
+  });
+  matVerriere.userData.m4Role='bourse-verriere';
+
+  // ---------- SOUBASSEMENT débordant (M5b — ancrage au sol) ----------
+  const soubB=new THREE.Mesh(new THREE.CylinderGeometry(6.2, 6.2, 0.45, 8), matStoneDark);
+  soubB.position.y=-0.15; soubB.receiveShadow=true; g.add(soubB);
+
+  // ---------- PARVIS ROND + perron circulaire ----------
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(7.6, 7.6, 0.22, 16), matStoneDark), 0, 0.11, 0);
+  for(let i=0;i<3;i++){
+    _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(2.8-i*0.35, 2.8-i*0.35, 0.24, 16), matStoneDark),
+      0, 0.12+i*0.24, 5.4);
+  }
+
+  // ---------- PLINTHE octogonale ----------
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(5.6, 5.6, 1.2, 8), matStoneDark), 0, 0.6, 0);
+
+  // ---------- CORPS octogonal (pierre de taille claire) ----------
+  const bodyR=5.0, bodyH=9.0;
+  const body=new THREE.Mesh(new THREE.CylinderGeometry(bodyR, bodyR, bodyH, 8, 1, false), matStone);
+  body.position.y=1.2 + bodyH/2; body.castShadow=true; body.receiveShadow=true;
+  g.add(body);
+
+  // ---------- FRISE inférieure (denticules subtils) + CORNICHE ----------
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(bodyR+0.18, bodyR+0.18, 0.35, 8), matStoneDark),
+    0, 1.2 + 0.18, 0);
+  const cornicheR=bodyR + 0.42;
+  const corniche=new THREE.Mesh(new THREE.CylinderGeometry(cornicheR, cornicheR, 0.58, 8), matStoneDark);
+  corniche.position.y=1.2 + bodyH + 0.29; corniche.castShadow=true;
+  g.add(corniche);
+  // bandeau de pluie SOUS la corniche (usure discrète)
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2 + Math.PI/8;
+    const cx=Math.cos(a)*(bodyR+0.04), cz=Math.sin(a)*(bodyR+0.04);
+    const stain=new THREE.Mesh(new THREE.PlaneGeometry(bodyR*0.92, 0.55),
+      new THREE.MeshBasicMaterial({color:0x3a2f24, transparent:true, opacity:0.30, depthWrite:false}));
+    stain.position.set(cx, 1.2 + bodyH - 0.4, cz); stain.lookAt(0, stain.position.y, 0); stain.rotation.y+=Math.PI;
+    g.add(stain);
+  }
+
+  // ---------- BANDEAU DE COTATIONS défilant (canvas anim via offset) ----------
+  const cotTex=_cotationsTexture();
+  const cotMat=new THREE.MeshStandardMaterial({
+    color:0x20242a, map:cotTex,
+    emissive:new THREE.Color(0x9ad17a), emissiveIntensity:0.40,
+    roughness:0.6, metalness:0.1, flatShading:true,
+  });
+  cotMat.userData.cotations=true;
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2 + Math.PI/8;
+    const cx=Math.cos(a)*(bodyR+0.05), cz=Math.sin(a)*(bodyR+0.05);
+    const band=new THREE.Mesh(new THREE.PlaneGeometry(bodyR*0.82, 0.62), cotMat);
+    band.position.set(cx, 7.6, cz); band.lookAt(0, 7.6, 0); band.rotation.y+=Math.PI;
+    g.add(band);
+  }
+
+  // ---------- FENÊTRES CINTRÉES (1 par face octogonale) ----------
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2 + Math.PI/8;
+    const fx=Math.cos(a)*(bodyR + 0.04), fz=Math.sin(a)*(bodyR + 0.04);
+    const w=createArchedWindow(0.95, 2.4);
+    w.position.set(fx, 3.4, fz);
+    w.lookAt(0, 3.4, 0); w.rotation.y+=Math.PI;
+    g.add(w);
+  }
+
+  // ---------- COLONNADE FINE (8 colonnes plus minces aux angles) ----------
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2;
+    const cx=Math.cos(a)*(bodyR + 0.65);
+    const cz=Math.sin(a)*(bodyR + 0.65);
+    const c=createColumn(bodyH + 0.6, 0.30);
+    c.position.set(cx, 1.2, cz); g.add(c);
+  }
+
+  // ---------- OCULUS ÉMISSIFS sur le pourtour de la corniche ----------
+  const ocuY=1.2 + bodyH + 0.62;
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2 + Math.PI/8;
+    const ox=Math.cos(a)*(cornicheR - 0.08), oz=Math.sin(a)*(cornicheR - 0.08);
+    const oc=new THREE.Mesh(new THREE.CircleGeometry(0.18, 12), matVerriere);
+    oc.position.set(ox, ocuY, oz);
+    oc.rotation.x=-Math.PI/2;
+    g.add(oc);
+  }
+
+  // ---------- ROTONDE / LANTERNE SOMMITALE — verrière dorée ----------
+  const lantR=2.4, lantH=2.6;
+  const lantY0=1.2 + bodyH + 0.58;
+  // tambour
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(lantR, lantR, 0.30, 16), matStoneDark),
+    0, lantY0 + 0.15, 0);
+  // colonnettes (8)
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2;
+    _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, lantH, 6), matStoneDark),
+      Math.cos(a)*lantR, lantY0 + lantH/2 + 0.30, Math.sin(a)*lantR);
+  }
+  // VERRIÈRE — 8 panneaux émissifs goldLight (tag M4)
+  for(let i=0;i<8;i++){
+    const a=(i/8)*Math.PI*2 + Math.PI/8;
+    const cx=Math.cos(a)*(lantR - 0.06), cz=Math.sin(a)*(lantR - 0.06);
+    const panel=new THREE.Mesh(new THREE.PlaneGeometry(lantR*0.74, lantH*0.92), matVerriere);
+    panel.position.set(cx, lantY0 + lantH/2 + 0.30, cz);
+    panel.lookAt(0, panel.position.y, 0); panel.rotation.y+=Math.PI;
+    g.add(panel);
+  }
+  // corniche supérieure de la lanterne
+  _addAt(g, new THREE.Mesh(new THREE.CylinderGeometry(lantR+0.22, lantR+0.22, 0.30, 16), matStoneDark),
+    0, lantY0 + lantH + 0.45, 0);
+  // DÔME doré (demi-sphère)
+  const domeY=lantY0 + lantH + 0.60;
+  _addAt(g, new THREE.Mesh(new THREE.SphereGeometry(lantR, 16, 10, 0, Math.PI*2, 0, Math.PI/2), matGold),
+    0, domeY, 0);
+
+  // ---------- GIROUETTE EN FORME DE PIÈCE (£) ----------
+  const mast=new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.4, 6), matGoldDark);
+  mast.position.y=domeY + lantR*0.78 + 0.7; g.add(mast);
+  const coin=new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 0.08, 24), matGold);
+  coin.rotation.x=Math.PI/2;
+  coin.position.y=domeY + lantR*0.78 + 1.5;
+  coin.userData.weatherVane=true;
+  _M5_bourseCoin=coin;
+  g.add(coin);
+  // petit £ gravé sur la pièce
+  const coinLab=createSign('£'); coinLab.scale.set(0.6, 0.6, 1);
+  coinLab.position.copy(coin.position); coinLab.position.z+=0.06;
+  g.add(coinLab);
+
+  // ---------- PORTE D'ENTRÉE BRONZE (face avant) ----------
+  const door=createBronzeDoor(2.4, 3.6);
+  door.position.set(0, 0, bodyR + 0.05);
+  g.add(door);
+
+  // ---------- ENSEIGNE BOURSE sur le tambour ----------
+  const sp=createSign('BOURSE'); sp.scale.set(3, 1.3, 1);
+  sp.position.set(0, lantY0 + lantH*0.4 + 0.30, lantR + 0.08);
+  g.add(sp);
 }
 
 /* v61 — LA GRAND-RUE DÉTAILLÉE. Elle existe avant le capital, et se lit comme
@@ -5350,6 +6068,31 @@ function updateClassLighting(dt){
       else                              f = 1.00;
     }
     c.light.userData.classFactor = f;
+  }
+
+  // — M5 — peau de la BOURSE : bandeau cotations défile + girouette tourne +
+  //   verrière dorée pulse ∝ capital (intensité émissive de matVerriere).
+  if(_M5_cotationsTex){ _M5_cotationsTex.offset.x = (-t*0.06) % 1; }
+  if(_M5_bourseCoin){ _M5_bourseCoin.rotation.z = t*0.12; }
+  // pousse l'intensité émissive de la verrière dorée — toucher 1 material seulement
+  // (tag m4Role='bourse-verriere' posé en build). On scanne la scène une seule fois.
+  if(!M4._bourseMats){
+    M4._bourseMats=[]; M4._etatMats=[];
+    scene.traverse(o=>{
+      if(o.material && o.material.userData){
+        if(o.material.userData.m4Role==='bourse-verriere'){
+          if(!M4._bourseMats.includes(o.material)) M4._bourseMats.push(o.material);
+        } else if(o.material.userData.m4Role==='etat-horloge'){
+          if(!M4._etatMats.includes(o.material)) M4._etatMats.push(o.material);
+        }
+      }
+    });
+  }
+  for(const m of M4._bourseMats){
+    m.emissiveIntensity = 1.2 + 1.4*M4.s_capital + 0.10*Math.sin(t*0.6);
+  }
+  for(const m of M4._etatMats){
+    m.emissiveIntensity = 1.10 + 0.06*Math.sin(t*0.35);   // stable, presque imperturbable
   }
 
   // — REFLETS DANS LES FLAQUES — opacité suit la nuit + flicker de la lampe associée.
