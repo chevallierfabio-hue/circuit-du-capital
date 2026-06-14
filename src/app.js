@@ -30,6 +30,7 @@ import { UnrealBloomPass }   from 'three/addons/postprocessing/UnrealBloomPass.j
 import { ShaderPass }        from 'three/addons/postprocessing/ShaderPass.js';
 import { CopyShader }        from 'three/addons/shaders/CopyShader.js';
 import { LuminosityHighPassShader } from 'three/addons/shaders/LuminosityHighPassShader.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // Miroir THREE = core + addons. Object.assign copie les références ; les
 // constructeurs (Mesh, Material…) restent ceux du module three.
@@ -3921,46 +3922,56 @@ function _M6_buildHillsBelt(){
   _M6_hillMeshes.push(north, south, west);
 }
 function _M6_buildDistantTrees(){
-  // arbres low-poly sur les flancs des collines (samples du heightmap > 4 m).
-  // 2 InstancedMesh : troncs (cylindre) + feuillage (icosaedron irrégulier).
+  // M7 — arbres lointains alignés sur les 4 gabarits M7 (mêmes silhouettes
+  // que les arbres proches, mais teintes assombries + fog:true pour la
+  // perspective atmosphérique). Mix : chêne (large), pin (sombre conifère).
   let seed=313;
   const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
   const slots=[];
   const tries=900;
   for(let i=0;i<tries && slots.length<80;i++){
-    // tirage uniforme dans la grande couronne hors jouable
     let x, z;
-    const side=Math.floor(rnd()*3);                 // 0 nord, 1 sud, 2 ouest
+    const side=Math.floor(rnd()*3);
     if(side===0){       x=(rnd()*2-1)*240; z=-130 - rnd()*100; }
     else if(side===1){  x=(rnd()*2-1)*240; z= 130 + rnd()*100; }
     else {              x=-130 - rnd()*100; z=(rnd()*2-1)*100; }
-    if(x>105) continue;                              // pas dans la mer
+    if(x>105) continue;
     const y=_M6_hillHeight(x, z);
-    if(y < 3) continue;                              // pas dans les creux
-    slots.push({x, y, z, s:0.85 + rnd()*0.7, r:rnd()*Math.PI*2});
+    if(y < 3) continue;
+    const kind = (rnd() < 0.55) ? 'pin' : 'chene';      // collines = conifères + chênes
+    slots.push({x, y, z, kind, s:0.85 + rnd()*0.7, r:rnd()*Math.PI*2});
   }
   if(!slots.length) return;
-  const matTronc=new THREE.MeshStandardMaterial({color:0x3a2f24, roughness:0.95, metalness:0, flatShading:true, fog:true});
-  const matFeuillage=new THREE.MeshStandardMaterial({color:0x556b3a, roughness:0.95, metalness:0, flatShading:true, fog:true});
-  const trunkGeo=new THREE.CylinderGeometry(0.28, 0.38, 3.0, 5);
-  const folGeo=new THREE.IcosahedronGeometry(1.6, 0);
-  const trunks=new THREE.InstancedMesh(trunkGeo, matTronc, slots.length);
-  const folies=new THREE.InstancedMesh(folGeo, matFeuillage, slots.length);
-  trunks.castShadow=false; folies.castShadow=false;
+  const byKind={chene:[], pin:[]};
+  for(const s of slots) byKind[s.kind].push(s);
+
   const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3();
-  slots.forEach((sl, i)=>{
-    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), sl.r);
-    // tronc — centre y +1.5 (mi-hauteur du cylindre 3m)
-    P.set(sl.x, sl.y + 1.5, sl.z); S.set(sl.s, sl.s, sl.s);
-    M.compose(P, Q, S); trunks.setMatrixAt(i, M);
-    // feuillage — au-dessus du tronc, légèrement aplati
-    P.set(sl.x, sl.y + 3.0 + 1.2*sl.s, sl.z); S.set(sl.s*1.1, sl.s*0.85, sl.s*1.1);
-    M.compose(P, Q, S); folies.setMatrixAt(i, M);
-  });
-  trunks.instanceMatrix.needsUpdate=true;
-  folies.instanceMatrix.needsUpdate=true;
-  scene.add(trunks); scene.add(folies);
-  _M6_distantTreeGroups.push(trunks, folies);
+  for(const kind of ['chene','pin']){
+    const list=byKind[kind]; if(!list.length) continue;
+    const tg=_M7_trunkGeo(kind);
+    const fg=_M7_foliageGeo(kind);
+    // teintes ASSOMBRIES (perspective atmosphérique)
+    const matTronc=new THREE.MeshStandardMaterial({color:0x2a221a, roughness:0.95, metalness:0, flatShading:true, fog:true});
+    const matFol=new THREE.MeshStandardMaterial({
+      color:(kind==='pin' ? 0x2a3a26 : 0x4a5a38),
+      roughness:1.0, metalness:0, flatShading:true, fog:true,
+    });
+    const trunks=new THREE.InstancedMesh(tg, matTronc, list.length);
+    const folies=new THREE.InstancedMesh(fg, matFol, list.length);
+    trunks.castShadow=false; folies.castShadow=false;
+    const foY=_M7_TREE_PARAMS[kind].foliageY;
+    list.forEach((sl, i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0), sl.r);
+      P.set(sl.x, sl.y, sl.z); S.set(sl.s, sl.s, sl.s);
+      M.compose(P, Q, S); trunks.setMatrixAt(i, M);
+      P.set(sl.x, sl.y + (foY + 0.4)*sl.s, sl.z); S.set(sl.s, sl.s, sl.s);
+      M.compose(P, Q, S); folies.setMatrixAt(i, M);
+    });
+    trunks.instanceMatrix.needsUpdate=true;
+    folies.instanceMatrix.needsUpdate=true;
+    scene.add(trunks); scene.add(folies);
+    _M6_distantTreeGroups.push(trunks, folies);
+  }
 }
 function _M6_buildEstran(){
   // bande sableuse humide entre la berge (x≈111) et l'eau (x≈110).
@@ -8582,16 +8593,48 @@ function createLedgerPlaque(text){ return makeLabel(text); }
    sobre et papier : arbres en boules superposées, buissons, rochers à facettes,
    meules de foin — et de grandes TYPOGRAPHIES À L'ENCRE posées au sol, comme
    sur une carte ancienne. Tout reste dans la palette existante. ===== */
-function createTree(h=5,c=0x6f7a45){ const g=new THREE.Group();
-  const tr=cyl(0.32,0.4,h*0.42,0x6b513a,7); tr.position.y=h*0.21; g.add(tr);
-  for(let i=0;i<3;i++){ const r=h*(0.34-i*0.07);
-    const b=new THREE.Mesh(new THREE.SphereGeometry(r,7,6),
-      new THREE.MeshStandardMaterial({color:i%2?c:0x5a6a4a,roughness:1,flatShading:true}));
-    b.position.y=h*0.42+i*r*1.1; b.scale.y=0.82; g.add(b); }
-  return g; }
-function createBush(r=1.1){ const m=new THREE.Mesh(new THREE.SphereGeometry(r,7,6),
-    new THREE.MeshStandardMaterial({color:0x6f7a45,roughness:1,flatShading:true}));
-  m.position.y=r*0.7; m.scale.y=0.75; return m; }
+/* M7 — createTree / createBush remontés aux gabarits irréguliers.
+   Géométries cachées (1 par kind) puis partagées entre les Group individuels.
+   Pas de ConeGeometry. */
+const _M7_geoCache={};
+function _M7_cachedTrunk(kind){
+  if(!_M7_geoCache['trunk_'+kind]) _M7_geoCache['trunk_'+kind]=_M7_trunkGeo(kind);
+  return _M7_geoCache['trunk_'+kind];
+}
+function _M7_cachedFoliage(kind){
+  if(!_M7_geoCache['fol_'+kind]) _M7_geoCache['fol_'+kind]=_M7_foliageGeo(kind);
+  return _M7_geoCache['fol_'+kind];
+}
+function createTree(h=5, c=0x6b7a4a){
+  // sélection pseudo-aléatoire du gabarit (avec un peu de bruit déterministe)
+  const kinds=['chene','chene','trogne','peuplier'];
+  const kind=kinds[Math.floor(Math.random()*kinds.length)];
+  const g=new THREE.Group();
+  const tg=_M7_cachedTrunk(kind);
+  const fg=_M7_cachedFoliage(kind);
+  const tronc=new THREE.Mesh(tg,
+    new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true}));
+  g.add(tronc);
+  const fol=new THREE.Mesh(fg,
+    new THREE.MeshStandardMaterial({color:c, roughness:1.0, metalness:0, flatShading:true}));
+  fol.position.y=_M7_TREE_PARAMS[kind].foliageY + 0.4;
+  g.add(fol);
+  // scale pour correspondre à `h` demandé
+  const baseH=_M7_TREE_PARAMS[kind].trunk[2] + _M7_TREE_PARAMS[kind].foliageY*0.7;
+  const s=h / baseH;
+  g.scale.set(s, s, s);
+  g.rotation.y=Math.random() * Math.PI * 2;
+  return g;
+}
+function createBush(r=1.1){
+  if(!_M7_geoCache['bush']) _M7_geoCache['bush']=_M7_bushGeo(0);
+  const m=new THREE.Mesh(_M7_geoCache['bush'],
+    new THREE.MeshStandardMaterial({color:0x556b3a, roughness:1.0, metalness:0, flatShading:true}));
+  m.rotation.y=Math.random() * Math.PI * 2;
+  const s=r / 0.55;
+  m.scale.set(s*(0.9+Math.random()*0.2), s*(0.8+Math.random()*0.2), s*(0.9+Math.random()*0.2));
+  return m;
+}
 function createRock(r=1.0){ const m=new THREE.Mesh(new THREE.IcosahedronGeometry(r,0),
     new THREE.MeshStandardMaterial({color:0x8a8275,roughness:1,flatShading:true}));
   m.position.y=r*0.6; m.scale.y=0.7; m.rotation.y=Math.random()*3; return m; }
@@ -11035,67 +11078,290 @@ const Atmosphere={
    5 draw calls. Toujours visibles (c'est de la géographie, pas du décor
    d'époque) : la carte n'est jamais nue, même en phase 0. Génération
    déterministe, hors zones / rue / eau / décors de carte. */
+/* =====================================================================
+   M7 — NATURE REFONDUE.
+   4 gabarits d'arbres irréguliers, chaque gabarit = 1 InstancedMesh
+   pour le tronc + 1 InstancedMesh pour le houppier (8 draw calls total).
+   Tous les sommets de houppier déformés par bruit. Tous les troncs
+   noueux (perturbation des sommets cylindriques). Variation per-instance :
+   rotation Y, scale uniforme 0.8-1.3, légère inclinaison.
+   Buissons : sphères déformées éparses (1 InstancedMesh).
+   Herbes hautes : crossed-quads en InstancedMesh près de l'eau et des
+   terres communes (texture alpha procédurale).
+   Suppression de TOUS les cônes verts précédents.
+   ===================================================================== */
+function _M7_deformedSphere(r, segs=10, seed=0, deformity=0.20, sx=1, sy=1, sz=1){
+  const geo=new THREE.SphereGeometry(r, segs, Math.max(5, Math.floor(segs/2)));
+  const pos=geo.attributes.position;
+  for(let i=0; i<pos.count; i++){
+    const x=pos.getX(i), y=pos.getY(i), z=pos.getZ(i);
+    const len=Math.hypot(x, y, z);
+    if(len < 0.01) continue;
+    const noise=(Math.sin(x*3+y*1.7+seed)
+               + Math.sin(y*2.3+z*1.9+seed*1.3)
+               + Math.sin(z*1.5+x*2.1+seed*0.7)) / 3.0;
+    const factor=1 + noise*deformity;
+    pos.setXYZ(i, x*factor*sx, y*factor*sy, z*factor*sz);
+  }
+  pos.needsUpdate=true;
+  geo.computeVertexNormals();
+  return geo;
+}
+const _M7_TREE_PARAMS = {
+  chene:    { trunk:[0.42, 0.34, 2.6, 7], color:0x6b7a4a, hSec:0x5a6b3a, foliageY:2.2 },
+  peuplier: { trunk:[0.30, 0.22, 3.6, 7], color:0x5a6b3a, hSec:0x6b7a4a, foliageY:3.0 },
+  trogne:   { trunk:[0.58, 0.46, 1.4, 8], color:0x6b7a4a, hSec:0x556a3a, foliageY:1.3 },
+  pin:      { trunk:[0.32, 0.24, 2.9, 7], color:0x3a4a2e, hSec:0x2a3a22, foliageY:2.0 },
+};
+function _M7_trunkGeo(kind){
+  const [r1, r2, h, segs]=_M7_TREE_PARAMS[kind].trunk;
+  const geo=new THREE.CylinderGeometry(r1, r2, h, segs);
+  // sommets noueux : noise XZ sur les anneaux
+  const pos=geo.attributes.position;
+  for(let i=0; i<pos.count; i++){
+    const x=pos.getX(i), y=pos.getY(i), z=pos.getZ(i);
+    const r=Math.hypot(x, z);
+    if(r < 0.001) continue;
+    const n=Math.sin(y*5.0 + i*0.7)*0.05 + Math.sin(y*2.3 + x*4.0)*0.04;
+    pos.setX(i, x*(1+n));
+    pos.setZ(i, z*(1+n));
+  }
+  pos.needsUpdate=true;
+  geo.translate(0, h/2, 0);                  // pied à y=0
+  geo.computeVertexNormals();
+  return geo;
+}
+function _M7_foliageGeo(kind){
+  const parts=[];
+  if(kind==='chene'){
+    // 4 lobes déformés, asymétriques
+    let s=_M7_deformedSphere(1.45, 10, 11, 0.22, 1.0, 0.85, 1.0); parts.push(s);
+    s=_M7_deformedSphere(1.10, 9, 23, 0.20); s.translate(0.85, 0.30, -0.25); parts.push(s);
+    s=_M7_deformedSphere(0.95, 9, 41, 0.22); s.translate(-0.65, 0.45, 0.55); parts.push(s);
+    s=_M7_deformedSphere(0.80, 8, 57, 0.25); s.translate(0.30, -0.40, 0.60); parts.push(s);
+  } else if(kind==='peuplier'){
+    // fuselage vertical : 2 lobes empilés très verticaux
+    let s=_M7_deformedSphere(1.0, 9, 13, 0.16, 0.62, 2.20, 0.62); parts.push(s);
+    s=_M7_deformedSphere(0.72, 8, 29, 0.18, 0.55, 1.60, 0.55); s.translate(0.10, 2.0, 0.05); parts.push(s);
+  } else if(kind==='trogne'){
+    // têtard : un gros chapeau et 2 repousses
+    let s=_M7_deformedSphere(1.45, 10, 17, 0.25, 1.35, 0.55, 1.35); parts.push(s);
+    s=_M7_deformedSphere(0.65, 8, 31, 0.30); s.translate(-0.85, 0.35, 0.40); parts.push(s);
+    s=_M7_deformedSphere(0.55, 8, 43, 0.32); s.translate(0.75, 0.40, -0.30); parts.push(s);
+  } else if(kind==='pin'){
+    // 5 étages aplatis, rayons décroissants, décalages latéraux
+    for(let i=0; i<5; i++){
+      const r=1.7 - i*0.25;
+      const y=i*0.85;
+      const dx=(i%2 ? 0.10 : -0.10);
+      const dz=(i%3===0 ? -0.05 : 0.07);
+      const s=_M7_deformedSphere(r, 9, 71+i*7, 0.18, 1.0, 0.32, 1.0);
+      s.translate(dx, y, dz);
+      parts.push(s);
+    }
+  }
+  return mergeGeometries(parts, false);
+}
+function _M7_bushGeo(seed=0){
+  // 1-2 sphères basses
+  const parts=[];
+  parts.push(_M7_deformedSphere(0.55, 8, seed+11, 0.28, 1.0, 0.65, 1.0));
+  if(seed % 3 === 0){
+    const s=_M7_deformedSphere(0.40, 7, seed+23, 0.30, 1.0, 0.70, 1.0);
+    s.translate(0.45, 0.10, -0.15);
+    parts.push(s);
+  }
+  const merged=mergeGeometries(parts, false);
+  merged.translate(0, 0.35, 0);
+  return merged;
+}
+let _M7_grassTexCache=null;
+function _M7_grassTexture(){
+  if(_M7_grassTexCache) return _M7_grassTexCache;
+  const c=document.createElement('canvas'); c.width=64; c.height=96;
+  const x=c.getContext('2d');
+  x.clearRect(0,0,64,96);
+  // 5-7 brins d'herbe verts (formes triangulaires fines + dégradé)
+  for(let i=0; i<7; i++){
+    const bx=4 + (i*9) + ((i*3)%6);
+    const tx=bx + ((i%2 ? 4 : -3));
+    const tone1=`rgba(${66+i*4},${94+i*5},${48+i*3},0.92)`;
+    const tone2=`rgba(${52+i*3},${74+i*4},${36+i*2},0.94)`;
+    const grad=x.createLinearGradient(bx, 96, tx, 12);
+    grad.addColorStop(0, tone2); grad.addColorStop(1, tone1);
+    x.fillStyle=grad;
+    x.beginPath();
+    x.moveTo(bx-1.6, 96); x.lineTo(bx+1.6, 96); x.lineTo(tx, 12);
+    x.closePath(); x.fill();
+  }
+  // jaunis discrets en pointe
+  for(let i=0; i<5; i++){
+    x.fillStyle='rgba(200,180,100,0.20)';
+    x.fillRect(8+i*10, 12+Math.random()*8, 2, 2);
+  }
+  const tex=new THREE.CanvasTexture(c);
+  tex.colorSpace=THREE.SRGBColorSpace;
+  _M7_grassTexCache=tex;
+  return tex;
+}
+function _M7_grassGeo(){
+  // 2 quads croisés. Chaque PlaneGeometry par défaut centré XY, vue +Z.
+  // On veut un quad VERTICAL face caméra et un autre rotation Y 90°.
+  const w=0.6, h=0.8;
+  const g1=new THREE.PlaneGeometry(w, h);
+  g1.translate(0, h/2, 0);
+  const g2=new THREE.PlaneGeometry(w, h);
+  g2.translate(0, h/2, 0);
+  g2.rotateY(Math.PI/2);
+  return mergeGeometries([g1, g2], false);
+}
+
 const Nature={
   built:false,
   build(){
     if(this.built) return; this.built=true;
     let seed=42; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
-    const KEEP_OUT=[[-98,92,16],[58,-100,22],[-86,-78,13],[-62,-86,12],[-112,-44,12],[44,-86,13],[88,72,12]]; // rose, cartouche, champs
+    const KEEP_OUT=[[-98,92,16],[58,-100,22],[-86,-78,13],[-62,-86,12],[-112,-44,12],[44,-86,13],[88,72,12]];
     const ok=(x,z)=>{
       if(Math.abs(x)>116||Math.abs(z)>116) return false;
-      if(x>106) return false;                                   // l'eau
-      if(Math.abs(z)<12 && x>-112 && x<106) return false;       // la rue
+      if(x>106) return false;
+      if(Math.abs(z)<12 && x>-112 && x<106) return false;
       if(zones.some(zz=>((zz.pos.x-x)**2+(zz.pos.z-z)**2)<15*15)) return false;
       if(KEEP_OUT.some(([kx,kz,kr])=>((kx-x)**2+(kz-z)**2)<kr*kr)) return false;
-      return true; };
-    // — positions d'arbres : couronne extérieure dense + clairsemé à l'intérieur
+      return true;
+    };
+
+    // ============ ARBRES — 4 gabarits, distribution régionale ============
+    // - chêne / trogne : zones rurales (W, S), forêts dispersées
+    // - peuplier : alignés près de la rivière et des routes
+    // - pin : couronne extérieure dense (conifères = lisière froide)
+    const TOTAL=150;
     const trees=[];
     let guard=0;
-    while(trees.length<150 && guard++<3000){
+    while(trees.length<TOTAL && guard++<3000){
       const edge=rnd()<0.74;
       const x=(rnd()*2-1)*116, z=(rnd()*2-1)*116;
       const d=Math.max(Math.abs(x),Math.abs(z));
       if(edge ? d<72 : d>=72) continue;
       if(!ok(x,z)) continue;
-      trees.push({x,z,s:0.75+rnd()*0.8,r:rnd()*6.28,alt:rnd()<0.5});
+      // choix du gabarit selon distance + bruit régional
+      const dist=d;
+      let kind;
+      if(dist >= 92 && rnd() < 0.7) kind='pin';
+      else if(x < -60 && Math.abs(z) < 40 && rnd() < 0.55) kind='peuplier';
+      else if(Math.abs(z) > 80 && rnd() < 0.35) kind='trogne';
+      else kind = (rnd() < 0.65) ? 'chene' : 'trogne';
+      const s=0.80 + rnd()*0.50;                          // 0.80 – 1.30
+      trees.push({ x, z, kind, s, r:rnd()*Math.PI*2, tilt:(rnd()-0.5)*0.10 });
     }
+
+    // groupe par gabarit
+    const byKind={chene:[], peuplier:[], trogne:[], pin:[]};
+    for(const t of trees) byKind[t.kind].push(t);
+
+    // pour chaque gabarit : 1 IM tronc + 1 IM houppier
+    const trunkColor=new THREE.Color(0x5a3e2a);
     const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3();
-    const inst=(geo,color,n)=>{ const m=new THREE.InstancedMesh(geo,
-        new THREE.MeshStandardMaterial({color,roughness:1,flatShading:true}), n);
-      m.castShadow=true; scene.add(m); return m; };
-    const trunks=inst(new THREE.CylinderGeometry(0.30,0.42,2.6,7), 0x6b513a, trees.length);
-    const nA=trees.filter(tr=>!tr.alt).length, nB=trees.length-nA;
-    const canA=inst(new THREE.SphereGeometry(1,7,6), 0x6f7a45, nA*2);
-    const canB=inst(new THREE.SphereGeometry(1,7,6), 0x5a6a4a, nB*2);
-    trunks.castShadow=false;
-    let iA=0,iB=0;
-    trees.forEach((tr,i)=>{
-      Q.setFromAxisAngle(new THREE.Vector3(0,1,0),tr.r);
-      P.set(tr.x,1.3*tr.s,tr.z); S.set(tr.s,tr.s,tr.s); M.compose(P,Q,S); trunks.setMatrixAt(i,M);
-      const can=tr.alt?canB:canA; let idx=tr.alt?iB:iA;
-      P.set(tr.x,(2.6+1.0)*tr.s,tr.z); S.set(1.65*tr.s,1.30*tr.s,1.65*tr.s); M.compose(P,Q,S); can.setMatrixAt(idx*2,M);
-      P.set(tr.x+0.3*tr.s,(2.6+2.2)*tr.s,tr.z-0.2*tr.s); S.set(1.15*tr.s,0.95*tr.s,1.15*tr.s); M.compose(P,Q,S); can.setMatrixAt(idx*2+1,M);
-      tr.alt?iB++:iA++;
-    });
-    [trunks,canA,canB].forEach(m=>m.instanceMatrix.needsUpdate=true);
-    // — herbe : 220 touffes coniques
-    const tufts=[]; guard=0;
-    while(tufts.length<220 && guard++<3000){
-      const x=(rnd()*2-1)*114, z=(rnd()*2-1)*114;
-      if(!ok(x,z)) continue; tufts.push({x,z,s:0.7+rnd()*0.9,r:rnd()*6.28});
+    const E=new THREE.Euler(), Q2=new THREE.Quaternion();
+    for(const kind of ['chene','peuplier','trogne','pin']){
+      const list=byKind[kind];
+      if(!list.length) continue;
+      const tg=_M7_trunkGeo(kind);
+      const fg=_M7_foliageGeo(kind);
+      const matTronc=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+      const matFol=new THREE.MeshStandardMaterial({
+        color:_M7_TREE_PARAMS[kind].color, roughness:1.0, metalness:0, flatShading:true,
+      });
+      const trunks=new THREE.InstancedMesh(tg, matTronc, list.length);
+      const folies=new THREE.InstancedMesh(fg, matFol, list.length);
+      trunks.castShadow=false; trunks.receiveShadow=true;
+      folies.castShadow=true; folies.receiveShadow=true;
+      const foY=_M7_TREE_PARAMS[kind].foliageY;
+      const trunkH=_M7_TREE_PARAMS[kind].trunk[2];
+      list.forEach((t, i)=>{
+        // Euler : Y rotation + petit tilt aléatoire X/Z
+        E.set(t.tilt*Math.sin(t.r), t.r, t.tilt*Math.cos(t.r), 'YXZ');
+        Q.setFromEuler(E);
+        // tronc — base à y=0, scaling uniforme
+        P.set(t.x, 0, t.z); S.set(t.s, t.s, t.s);
+        M.compose(P, Q, S); trunks.setMatrixAt(i, M);
+        // houppier — au-dessus du tronc, scale identique
+        P.set(t.x, (foY + 0.4)*t.s, t.z);
+        S.set(t.s, t.s, t.s);
+        M.compose(P, Q, S); folies.setMatrixAt(i, M);
+      });
+      trunks.instanceMatrix.needsUpdate=true;
+      folies.instanceMatrix.needsUpdate=true;
+      scene.add(trunks); scene.add(folies);
     }
-    const grass=new THREE.InstancedMesh(new THREE.ConeGeometry(0.30,0.7,5),
-      new THREE.MeshStandardMaterial({color:0xa3a06e,roughness:1,flatShading:true}), tufts.length);
-    tufts.forEach((tf,i)=>{ Q.setFromAxisAngle(new THREE.Vector3(0,1,0),tf.r);
-      P.set(tf.x,0.35*tf.s,tf.z); S.set(tf.s,tf.s,tf.s); M.compose(P,Q,S); grass.setMatrixAt(i,M); });
-    grass.instanceMatrix.needsUpdate=true; scene.add(grass);
-    // — teintes régionales très douces : la carte gagne de la profondeur
-    const tint=(x,z,w,d,color,op)=>{ const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),
-        new THREE.MeshBasicMaterial({color,transparent:true,opacity:op,depthWrite:false}));
-      m.rotation.x=-Math.PI/2; m.position.set(x,0.008,z); scene.add(m); };
-    tint(-96,0,52,232,0x7a8a55,0.08);    // l'ouest rural, verdâtre
-    tint(14,47,176,38,0x8a7a5f,0.05);    // la ceinture industrielle, chaude
-    tint(96,0,22,232,0xc2a877,0.07);     // la frange portuaire, sable
+
+    // ============ BUISSONS — sphères déformées éparses ============
+    const bushes=[]; guard=0;
+    while(bushes.length<120 && guard++<3000){
+      const x=(rnd()*2-1)*115, z=(rnd()*2-1)*115;
+      if(!ok(x,z)) continue;
+      bushes.push({ x, z, s:0.55+rnd()*0.6, r:rnd()*Math.PI*2, seed:Math.floor(rnd()*100) });
+    }
+    if(bushes.length){
+      // partage 1 geometry pour tous (économique), variation par scale/rotation
+      const bg=_M7_bushGeo(0);
+      const bm=new THREE.MeshStandardMaterial({color:0x556b3a, roughness:1.0, metalness:0, flatShading:true});
+      const bMesh=new THREE.InstancedMesh(bg, bm, bushes.length);
+      bMesh.castShadow=false; bMesh.receiveShadow=true;
+      bushes.forEach((b, i)=>{
+        Q.setFromAxisAngle(new THREE.Vector3(0,1,0), b.r);
+        P.set(b.x, 0, b.z);
+        S.set(b.s*(0.9+Math.sin(b.seed)*0.15), b.s*(0.85+Math.cos(b.seed)*0.1), b.s*(0.9+Math.sin(b.seed*1.3)*0.15));
+        M.compose(P, Q, S); bMesh.setMatrixAt(i, M);
+      });
+      bMesh.instanceMatrix.needsUpdate=true;
+      scene.add(bMesh);
+    }
+
+    // ============ HERBES HAUTES — crossed quads, près de l'eau & terres communes ============
+    const gtex=_M7_grassTexture();
+    const ggeo=_M7_grassGeo();
+    const gmat=new THREE.MeshStandardMaterial({
+      map:gtex, transparent:true, alphaTest:0.45, side:THREE.DoubleSide,
+      roughness:1.0, metalness:0, flatShading:true, depthWrite:true,
+    });
+    // tirage : zones HERBEUSES = lisière W de la rivière (90<x<105) + terres communes (-115..-90, -45..-15)
+    const grasses=[]; guard=0;
+    while(grasses.length<180 && guard++<3000){
+      const region=rnd();
+      let x, z;
+      if(region < 0.6){
+        // bord de rivière
+        x=90 + rnd()*16; z=(rnd()*2-1)*100;
+      } else {
+        // terres communes
+        x=-118 + rnd()*30; z=-50 + rnd()*40;
+      }
+      if(!ok(x,z)) continue;
+      grasses.push({ x, z, s:0.7+rnd()*0.7, r:rnd()*Math.PI*2 });
+    }
+    if(grasses.length){
+      const gMesh=new THREE.InstancedMesh(ggeo, gmat, grasses.length);
+      gMesh.castShadow=false; gMesh.receiveShadow=false;
+      grasses.forEach((g, i)=>{
+        Q.setFromAxisAngle(new THREE.Vector3(0,1,0), g.r);
+        P.set(g.x, 0, g.z);
+        S.set(g.s, g.s*(0.85+Math.random()*0.30), g.s);
+        M.compose(P, Q, S); gMesh.setMatrixAt(i, M);
+      });
+      gMesh.instanceMatrix.needsUpdate=true;
+      scene.add(gMesh);
+    }
+
+    // ============ TEINTES RÉGIONALES (préservées — donnent de la profondeur) ============
+    const tint=(x,z,w,d,color,op)=>{
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(w,d),
+        new THREE.MeshBasicMaterial({color, transparent:true, opacity:op, depthWrite:false}));
+      m.rotation.x=-Math.PI/2; m.position.set(x, 0.008, z); scene.add(m);
+    };
+    tint(-96, 0, 52, 232, 0x7a8a55, 0.08);
+    tint( 14,47,176, 38, 0x8a7a5f, 0.05);
+    tint( 96, 0, 22,232, 0xc2a877, 0.07);
   }
 };
 
