@@ -777,6 +777,12 @@ function buildWorld(){
   // (0x14110c env. après intégration) sans casser le contraste ni nourrir
   // le bloom (couleur très sombre + intensité basse).
   nightAmbient=new THREE.AmbientLight(0x24180e, 0); scene.add(nightAmbient);
+  // M7-soleil — moonLight : seconde directionnelle pour la lune. Couleur
+  // bleu-lune (0xb4c4e0), intensité pilotée par SunState.moonIntensity (0
+  // le jour, max ~0.32 quand la lune est au zénith). Sans ombre — la lune
+  // n'a pas besoin de caster, et ça économise une shadow map.
+  moonLight=new THREE.DirectionalLight(0xb4c4e0, 0);
+  moonLight.position.set(0,1,0); moonLight.castShadow=false; scene.add(moonLight);
   sunLight=new THREE.DirectionalLight(COLORSCRIPT.sunColor, physI(0.85));
   sunLight.position.set(58,72,42); sunLight.castShadow=true;
   sunLight.shadow.mapSize.set(2048,2048); sunLight.shadow.bias=-0.0004;
@@ -3759,12 +3765,18 @@ let _boats=[];
 let _M6_waterMaterial = null;
 function buildWaterEast(){
   // ----- ShaderMaterial -----
+  // M7-soleil : uAstreDir (xz du soleil/lune dominant), uAstreColor, uAstreUp
+  // (élévation 0..1) ; la traînée pointe toujours vers l'astre visible.
   const uniforms={
-    uTime:   { value: 0 },
-    uColor:  { value: new THREE.Color(0x35586b) },
-    uGold:   { value: new THREE.Color(COLORSCRIPT.skyHorizon) },   // 0xd98a3d
-    uFanal0: { value: new THREE.Vector3(114,   1.2, -8) },
-    uFanal1: { value: new THREE.Vector3(114.5, 1.2, 14) },
+    uTime:      { value: 0 },
+    uColor:     { value: new THREE.Color(0x35586b) },
+    uGold:      { value: new THREE.Color(COLORSCRIPT.skyHorizon) },
+    uFanal0:    { value: new THREE.Vector3(114,   1.2, -8) },
+    uFanal1:    { value: new THREE.Vector3(114.5, 1.2, 14) },
+    uAstreDir:  { value: new THREE.Vector2(-1, 0) },     // xz monde, normalisé
+    uAstreColor:{ value: new THREE.Color(COLORSCRIPT.skyHorizon) },
+    uAstreUp:   { value: 0.20 },                           // élévation [0..1]
+    uIsMoon:    { value: 0.0 },                            // 0=jour, 1=nuit
   };
   _M6_waterMaterial=new THREE.ShaderMaterial({
     uniforms, transparent: true, depthWrite: false, fog: false,
@@ -3775,12 +3787,11 @@ function buildWaterEast(){
       void main(){
         vec3 p = position;
         float w1 = sin(p.x*0.40 + uTime*0.65) * 0.10;
-        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.15;          // p.y = world Z avant rotation
+        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.15;
         float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.06;
-        p.z += w1 + w2 + w3;                                    // déplacement avant rotation
+        p.z += w1 + w2 + w3;
         vec4 wp = modelMatrix * vec4(p, 1.0);
         vWorldPos = wp.xyz;
-        // dérivées analytiques pour la normale
         float dx = cos(p.x*0.40 + uTime*0.65)*0.40*0.10
                  + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.06;
         float dz = cos(p.y*0.18 + uTime*0.43)*0.18*0.15
@@ -3794,25 +3805,45 @@ function buildWaterEast(){
       uniform vec3  uGold;
       uniform vec3  uFanal0;
       uniform vec3  uFanal1;
+      uniform vec2  uAstreDir;
+      uniform vec3  uAstreColor;
+      uniform float uAstreUp;
+      uniform float uIsMoon;
       varying vec3  vWorldPos;
       varying vec3  vNrm;
       void main(){
         vec3 col = uColor;
-        // traînée DORÉE côté OUEST (soleil couchant). Le quai est à x~108,
-        // la mer s'étend jusqu'à x~118 ; le bord ouest reçoit la lumière rasante.
-        float westness = clamp((118.0 - vWorldPos.x) / 9.0, 0.0, 1.0);
-        col = mix(col, uGold, westness * 0.45);
-        // bande spéculaire animée près du bord ouest
-        float streakX = vWorldPos.x + sin(vWorldPos.z*0.15 + uTime*0.45)*1.3;
-        float streak = smoothstep(108.5, 110.0, streakX) * (1.0 - smoothstep(110.0, 112.0, streakX));
-        col += uGold * streak * 0.50;
-        // FANAUX — reflets ondulants ponctuels
+        // M7-soleil — TRAÎNÉE SPÉCULAIRE qui pointe vers l'astre dominant.
+        // L'astre est très loin → direction uniforme uAstreDir (xz).
+        // Le « centre » de la spéculaire est près de la berge (x≈110), la
+        // traînée s'étend ensuite VERS l'astre. Bande = perp/along.
+        vec2 wp2 = vWorldPos.xz - vec2(110.0, 0.0);
+        vec2 dir = normalize(uAstreDir);
+        vec2 perpD = vec2(-dir.y, dir.x);
+        float along  = dot(wp2, dir);
+        float across = dot(wp2, perpD);
+        // bande étroite, peak à along proche de 0 (près de la berge), s'évase loin
+        float bandW = 4.0 + abs(along)*0.18;
+        float streak = exp(-pow(across/bandW, 2.0)) * smoothstep(-3.0, 4.0, along);
+        // animation ondulante (faite tanguer la bande)
+        float wave = sin(across*0.20 + uTime*0.45)*0.05 + sin(along*0.07 + uTime*0.30)*0.08;
+        streak *= (0.85 + wave*0.6);
+        // intensité globale : pic à l'horizon (heure dorée / lune basse)
+        float horizonK = exp(-pow((uAstreUp - 0.12)*4.0, 2.0));
+        // tinte chaude le jour, froide pâle la nuit (uIsMoon contrôle)
+        float strength = 0.50 + 0.30*(1.0 - uIsMoon);
+        col += uAstreColor * streak * strength * (0.4 + 0.6*horizonK);
+        // teinte globale plus chaude côté astre (le jour) — atténuée la nuit
+        float warmth = clamp(dot(normalize(wp2 + vec2(0.001,0.0)), dir), 0.0, 1.0);
+        col = mix(col, uAstreColor, warmth * (0.35 - uIsMoon*0.25));
+
+        // FANAUX — reflets ondulants ponctuels (préservés, surtout visibles la nuit)
         float d0 = length(vWorldPos.xz - uFanal0.xz);
         float r0 = exp(-d0*0.55) * (0.85 + 0.15*sin(uTime*2.2 + d0*0.6));
-        col += vec3(1.0, 0.78, 0.42) * r0 * 0.70;
+        col += vec3(1.0, 0.78, 0.42) * r0 * 0.70 * (0.30 + uIsMoon*0.70);
         float d1 = length(vWorldPos.xz - uFanal1.xz);
         float r1 = exp(-d1*0.55) * (0.85 + 0.15*sin(uTime*2.5 + d1*0.6));
-        col += vec3(1.0, 0.78, 0.42) * r1 * 0.70;
+        col += vec3(1.0, 0.78, 0.42) * r1 * 0.70 * (0.30 + uIsMoon*0.70);
         // écume sur les crêtes (normales fortement inclinées)
         float foam = smoothstep(0.35, 0.85, (1.0 - vNrm.y) * 5.0);
         col += vec3(0.42) * foam * 0.35;
@@ -3843,7 +3874,16 @@ function buildWaterEast(){
   for(let z=-116; z<=116; z+=11) obstacles.push({pos:new THREE.Vector2(111.5, z), radius:6});
 }
 function _M6_updateWater(){
-  if(_M6_waterMaterial) _M6_waterMaterial.uniforms.uTime.value = t;
+  if(!_M6_waterMaterial) return;
+  const u = _M6_waterMaterial.uniforms;
+  u.uTime.value = t;
+  // M7-soleil : traînée pointe vers l'astre dominant.
+  u.uAstreDir.value.copy(SunState.dominantDir2D);
+  u.uAstreColor.value.copy(SunState.dominantColor);
+  // élévation 0..1 (clamp positif — seul l'astre VISIBLE pilote)
+  const upY = SunState.dominantIsMoon ? SunState.moonDir.y : SunState.sunDir.y;
+  u.uAstreUp.value = Math.max(0, upY);
+  u.uIsMoon.value = SunState.dominantIsMoon ? 1.0 : 0.0;
 }
 
 /* =====================================================================
@@ -4648,6 +4688,12 @@ addEventListener('keydown',e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=true;e.pr
   if(e.code==='KeyB'){ AmbientSound.start(); AmbientSound.toggle(); }
   if(e.code==='KeyE'){ e.preventDefault(); if(currentZone) interactZone(currentZone); }
   if(e.code==='Backquote'){ e.preventDefault(); setQA(!QA_MODE); }
+  // M7-soleil — accélération du temps : ',' ralentit, '.' accélère, '/' = 1.0,
+  // ';' (Semicolon) pour avancer instantanément +5% du cycle (rapide pour tester).
+  if(e.code==='Comma'){ TIME_SPEED = Math.max(0.5, TIME_SPEED * 0.5); pushLog('Cycle','×'+TIME_SPEED.toFixed(2)+' temps.','plain'); }
+  if(e.code==='Period'){ TIME_SPEED = Math.min(64, TIME_SPEED * 2.0); pushLog('Cycle','×'+TIME_SPEED.toFixed(2)+' temps.','plain'); }
+  if(e.code==='Slash'){ TIME_SPEED = 1.0; pushLog('Cycle','×1 temps.','plain'); }
+  if(e.code==='Semicolon'){ timeOfDay = (timeOfDay + 0.05) % 1; pushLog('Cycle','heure '+(timeOfDay*24).toFixed(1)+'h.','plain'); }
   // M1b — F3 : toggle du panneau #qa (fps / calls / triangles). Même état
   // que Backquote (legacy) ; l'état persiste pendant la session.
   if(e.code==='F3'){ e.preventDefault(); setQA(!QA_MODE); }
@@ -8890,6 +8936,7 @@ function createConeMarker(){ const g=new THREE.Group();
 let envGroup=null, envProps=[], kickProps=[], envLamps=[], envGears=[], envReady=false;
 let sunLight=null, hemiLight=null;   // v57 : poignées du cycle de lumière
 let nightAmbient=null;               // M7 : floor warm nocturne (sol lisible la nuit)
+let moonLight=null;                  // M7-soleil : directionnelle de la lune (bleu froid)
 let composer=null, bloomPass=null, gradePass=null;   // v66/M1 : bloom + GradePass (null si bypass)
 
 /* M1 — GradeShader : ShaderPass terminal, trois effets dans un seul shader.
@@ -10890,8 +10937,7 @@ const SkyAtmo = {
   clouds:[],
   veil:null,
   godrays:[],
-  // direction "ouest" en monde : -X (cohérent avec uWestDir du dôme)
-  // hauteur soleil bas-horizon
+  moonDisk:null, moonHalo:null,    // M7-soleil : la lune (mêmes sprites, palette froide)
   build(){
     if(this.ready) return; this.ready=true;
     // ----- soleil : disque émissif + halo additif -----
@@ -10912,6 +10958,24 @@ const SkyAtmo = {
     this.sunHalo.scale.set(95,95,1);
     this.sunHalo.renderOrder=-1;
     scene.add(this.sunHalo);
+
+    // ----- lune : disque pâle + halo froid (M7-soleil) -----
+    const moonTex=this._moonDiskTex();
+    this.moonDisk=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:moonTex, color:0xdfe6f0, transparent:true, opacity:0.0,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.moonDisk.scale.set(14, 14, 1);
+    this.moonDisk.renderOrder=-1;
+    scene.add(this.moonDisk);
+    const moonHaloTex=this._moonHaloTex();
+    this.moonHalo=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:moonHaloTex, color:0xb4c4e0, transparent:true, opacity:0.0,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.moonHalo.scale.set(48, 48, 1);
+    this.moonHalo.renderOrder=-1;
+    scene.add(this.moonHalo);
 
     // ----- voile doré : grand plan additif côté ouest -----
     // Quad ancré sur le dôme — rotation Y suit la position du soleil.
@@ -10983,6 +11047,32 @@ const SkyAtmo = {
     x.fillStyle=g; x.fillRect(0,0,256,256);
     return new THREE.CanvasTexture(c);
   },
+  _moonDiskTex(){
+    const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
+    const g=x.createRadialGradient(64,64,4,64,64,58);
+    g.addColorStop(0,   'rgba(232,238,248,1.00)');
+    g.addColorStop(0.55,'rgba(208,216,232,0.85)');
+    g.addColorStop(0.85,'rgba(180,196,224,0.25)');
+    g.addColorStop(1,   'rgba(180,196,224,0)');
+    x.fillStyle=g; x.fillRect(0,0,128,128);
+    // mares de la lune — 4 taches subtiles
+    for(const [px, py, r] of [[52, 50, 6], [78, 58, 5], [62, 78, 7], [80, 78, 4]]){
+      const lg=x.createRadialGradient(px, py, 1, px, py, r);
+      lg.addColorStop(0, 'rgba(170,184,206,0.45)');
+      lg.addColorStop(1, 'rgba(170,184,206,0)');
+      x.fillStyle=lg; x.beginPath(); x.arc(px, py, r, 0, Math.PI*2); x.fill();
+    }
+    return new THREE.CanvasTexture(c);
+  },
+  _moonHaloTex(){
+    const c=document.createElement('canvas'); c.width=c.height=256; const x=c.getContext('2d');
+    const g=x.createRadialGradient(128,128,8,128,128,128);
+    g.addColorStop(0,   'rgba(180,196,224,0.40)');
+    g.addColorStop(0.5, 'rgba(148,170,210,0.08)');
+    g.addColorStop(1,   'rgba(148,170,210,0)');
+    x.fillStyle=g; x.fillRect(0,0,256,256);
+    return new THREE.CanvasTexture(c);
+  },
   _veilTex(){
     const c=document.createElement('canvas'); c.width=512; c.height=256; const x=c.getContext('2d');
     const g=x.createRadialGradient(256,170,40,256,170,260);
@@ -11033,24 +11123,65 @@ const SkyAtmo = {
     const cx = (typeof camera!=='undefined' && camera) ? camera.position.x : 0;
     const cz = (typeof camera!=='undefined' && camera) ? camera.position.z : 0;
 
-    // soleil bas horizon OUEST (monde -X)
-    const sunX = cx - 240, sunY = 38, sunZ = cz + 0;
-    if(this.sunDisk) this.sunDisk.position.set(sunX, sunY, sunZ);
-    if(this.sunHalo) this.sunHalo.position.set(sunX, sunY, sunZ);
-
-    // voile : grand plan orienté vers la caméra, posé côté ouest
-    if(this.veil){
-      this.veil.position.set(cx - 180, 55, cz);
-      this.veil.lookAt(cx, 30, cz);
+    // M7-soleil — astres positionnés depuis SunState.sunDir / moonDir,
+    // ancrés sur la caméra (suit le joueur). Disparaissent quand sous l'horizon.
+    const sx = SunState.sunDir.x * SUN_DISPLAY_R;
+    const sy = Math.max(-50, SunState.sunDir.y * SUN_DISPLAY_R);
+    const sz = SunState.sunDir.z * SUN_DISPLAY_R;
+    const mx = SunState.moonDir.x * SUN_DISPLAY_R;
+    const my = Math.max(-50, SunState.moonDir.y * SUN_DISPLAY_R);
+    const mz = SunState.moonDir.z * SUN_DISPLAY_R;
+    const sunWorld_y = SunState.sunDir.y;
+    const moonWorld_y = SunState.moonDir.y;
+    if(this.sunDisk){
+      this.sunDisk.position.set(cx + sx, sy, cz + sz);
+      this.sunDisk.visible = SunState.sunVisible;
+      this.sunDisk.material.opacity = SunState.sunVisible
+        ? Math.min(1, 0.20 + Math.max(0, sunWorld_y + 0.05) * 1.3) : 0;
+      this.sunDisk.material.color.copy(SunState.sunColor);
+    }
+    if(this.sunHalo){
+      this.sunHalo.position.set(cx + sx, sy, cz + sz);
+      this.sunHalo.visible = SunState.sunVisible;
+      // halo plus dense quand soleil bas (heure dorée)
+      const haloK = Math.max(0, 1 - Math.max(0, sunWorld_y)*0.7);
+      this.sunHalo.material.opacity = SunState.sunVisible ? 0.40 * haloK : 0;
+    }
+    if(this.moonDisk){
+      this.moonDisk.position.set(cx + mx, my, cz + mz);
+      this.moonDisk.visible = SunState.moonVisible;
+      // lune visible plus fortement la NUIT (kDay petit)
+      this.moonDisk.material.opacity = SunState.moonVisible
+        ? Math.min(1, 0.10 + Math.max(0, moonWorld_y)*1.0) * (1 - SunState.kDay*0.85) : 0;
+    }
+    if(this.moonHalo){
+      this.moonHalo.position.set(cx + mx, my, cz + mz);
+      this.moonHalo.visible = SunState.moonVisible;
+      this.moonHalo.material.opacity = SunState.moonVisible ? 0.30 * (1 - SunState.kDay) : 0;
     }
 
-    // godrays : du soleil vers le sol, oscillation
+    // VOILE doré : grand plan orienté vers la caméra, posé côté soleil (dynamique).
+    // Suit l'azimut du soleil sur le plan XZ ; n'apparaît qu'aux heures basses.
+    if(this.veil){
+      this.veil.position.set(cx + SunState.sunDir.x * 180, 55, cz + SunState.sunDir.z * 180);
+      this.veil.lookAt(cx, 30, cz);
+      const veilK = Math.max(0, 1 - Math.max(0, sunWorld_y)*1.2) * Math.max(0, sunWorld_y + 0.05);
+      this.veil.visible = veilK > 0.01;
+      this.veil.material.opacity = 0.12 * veilK;
+    }
+
+    // GODRAYS : du soleil vers le sol, à proximité du disque. Suivent SunState.
+    const godrayBase = SunState.sunVisible && sunWorld_y < 0.55 && sunWorld_y > -0.05;
     for(let i=0;i<this.godrays.length;i++){
       const ray=this.godrays[i];
-      ray.position.set(sunX + 6 + i*4, sunY - 12, sunZ + (i-1)*6);
+      ray.position.set(cx + sx + 6 + i*4, sy - 12, cz + sz + (i-1)*6);
       ray.rotation.z = ray.userData.tilt + Math.sin(t*0.25 + i)*0.06;
-      ray.rotation.y = Math.PI/2;                  // face caméra (placée à l'est du soleil)
-      ray.material.opacity = ray.userData.baseOp * (0.85 + 0.15*Math.sin(t*0.4 + i*1.7));
+      ray.rotation.y = Math.PI/2;
+      ray.visible = godrayBase;
+      const climaxK = Math.max(0, 1 - Math.abs(sunWorld_y - 0.10)*4);   // pic à hauteur ~10°
+      ray.material.opacity = godrayBase
+        ? ray.userData.baseOp * climaxK * (0.85 + 0.15*Math.sin(t*0.4 + i*1.7))
+        : 0;
     }
 
     // nuages : dérive est, garder l'altitude
@@ -11225,14 +11356,11 @@ const Atmosphere={
       if(m.position.x>m.userData.home+12) m.position.x=m.userData.home-12;
       m.material.opacity=mistK*(0.7+0.3*Math.sin(t*0.4+m.userData.home));
     }
-    if(sunLight){
-      const dir=sunLight.position.clone().normalize().multiplyScalar(235);
-      if(this.sun){ this.sun.position.copy(dir); this.sun.material.opacity=Math.max(0,k*1.1-0.08); }
-      // la lune occupe la direction de la lumière la NUIT (le directionnel joue alors la lune)
-      if(this.moon){ this.moon.position.copy(dir);
-        const elOK=Math.min(1,Math.max(0,((DayCycle._el||0)-0.25)*5));   // pas de lune collée à l'horizon
-        this.moon.material.opacity=Math.max(0,(1-k*1.8))*elOK; }
-    }
+    // M7-soleil — le sprite Atmosphere.sun reste masqué (cf. init.js) et
+    // Atmosphere.moon est désormais maîtrisé par SkyAtmo. On désactive ici
+    // pour éviter le double-rendu/désalignement.
+    if(this.sun) this.sun.visible=false;
+    if(this.moon) this.moon.visible=false;
   }
 };
 
@@ -11659,6 +11787,103 @@ const AmbientSound={
   }
 };
 
+/* =====================================================================
+   M7 — SOURCE DE VÉRITÉ UNIQUE POUR LE SOLEIL ET LA LUNE.
+   timeOfDay 0..1 boucle en DAY_PERIOD secondes (réglable).
+     0.00 = minuit (sun nadir, lune zénith)
+     0.25 = aube (sun lève à l'EST, lune se couche à l'OUEST)
+     0.50 = midi (sun zénith)
+     0.72 = HEURE DORÉE — spawn par défaut (identité DA)
+     0.75 = crépuscule (sun se couche à l'ouest)
+     1.00 = minuit (loop)
+   SunState.sunDir / moonDir : vecteurs unitaires dans le repère MONDE,
+   utilisés par ABSOLUMENT TOUT (sunLight, moonLight, sun/moon disks,
+   godrays, voile, traînée mer). Pas d'autre source de calcul.
+   ===================================================================== */
+const SunState = {
+  sunDir:    new THREE.Vector3(0, 1, 0),   // direction de l'origine vers le soleil
+  moonDir:   new THREE.Vector3(0, -1, 0),  // direction vers la lune
+  sunVisible:  true,
+  moonVisible: false,
+  sunIntensity:  1.0,
+  moonIntensity: 0.0,
+  kDay: 1.0,                                // 0 = nuit profonde, 1 = plein soleil
+  timeOfDay: 0.72,                          // démarre à l'heure dorée
+  // dominante (pour la traînée spéculaire de la mer & godrays)
+  dominantDir2D: new THREE.Vector2(),       // xz normalisé de l'astre visible
+  dominantColor: new THREE.Color(0xffd9a4),
+  dominantIsMoon: false,
+  sunColor:  new THREE.Color(0xffd9a4),
+  moonColor: new THREE.Color(0xb4c4e0),
+};
+const DAY_PERIOD = 240;                     // 4 min par cycle complet
+const SUN_DISPLAY_R = 235;                  // distance pour les sprites célestes
+let timeOfDay = 0.72;
+let TIME_SPEED = 1.0;                       // ajustable via touches `,` `.` `]` (cf. input)
+
+// teinte du soleil en fonction de la hauteur (chaud bas → blanc midi)
+function _M7_sunColorFromHeight(out, sy){
+  const cRouge = 0xff7d4a, cAmbre = 0xffb27a, cDore = 0xffd9a4, cBlanc = 0xfff1d4;
+  const _ca=new THREE.Color(), _cb=new THREE.Color();
+  if(sy < 0.10){
+    // crépuscule rouge → ambre (sy in [-0.05 .. 0.10])
+    const u = Math.min(1, Math.max(0, (sy + 0.05) / 0.15));
+    _ca.setHex(cRouge); _cb.setHex(cAmbre);
+    out.copy(_ca).lerp(_cb, u);
+  } else if(sy < 0.40){
+    // ambre → doré
+    const u = (sy - 0.10) / 0.30;
+    _ca.setHex(cAmbre); _cb.setHex(cDore);
+    out.copy(_ca).lerp(_cb, u);
+  } else {
+    // doré → blanc midi
+    const u = Math.min(1, (sy - 0.40) / 0.50);
+    _ca.setHex(cDore); _cb.setHex(cBlanc);
+    out.copy(_ca).lerp(_cb, u);
+  }
+}
+
+function updateSun(t01){
+  const tau = t01 * Math.PI * 2;
+  // soleil : un grand cercle est-zénith-ouest-nadir dans le plan XY (z=0 mid-meridian).
+  //   timeOfDay = 0.25 → sun = ( +1, 0, 0)  (lever à l'EST)
+  //   timeOfDay = 0.50 → sun = (  0,+1, 0)  (zénith)
+  //   timeOfDay = 0.75 → sun = ( -1, 0, 0)  (couchant à l'OUEST)
+  //   timeOfDay = 0.00 → sun = (  0,-1, 0)  (nadir / minuit)
+  SunState.sunDir.set(Math.sin(tau), -Math.cos(tau), 0);
+  SunState.moonDir.set(-Math.sin(tau), Math.cos(tau), 0);
+  const sy = SunState.sunDir.y, my = SunState.moonDir.y;
+
+  // kDay : smoothstep large autour de l'horizon
+  const k = Math.min(1, Math.max(0, (sy + 0.15) / 0.30));
+  SunState.kDay = k*k*(3 - 2*k);
+
+  // intensités physiques
+  SunState.sunIntensity  = Math.max(0, sy * 1.15);
+  SunState.moonIntensity = Math.max(0, my * 0.32);
+
+  // visibilités (le mesh disparaît quand l'astre est trop bas)
+  SunState.sunVisible  = sy > -0.04;
+  SunState.moonVisible = my > -0.04;
+
+  // couleurs
+  _M7_sunColorFromHeight(SunState.sunColor, sy);
+
+  // dominante pour reflet eau + godrays
+  if(sy >= my){
+    SunState.dominantDir2D.set(SunState.sunDir.x, SunState.sunDir.z);
+    SunState.dominantColor.copy(SunState.sunColor);
+    SunState.dominantIsMoon = false;
+  } else {
+    SunState.dominantDir2D.set(SunState.moonDir.x, SunState.moonDir.z);
+    SunState.dominantColor.copy(SunState.moonColor);
+    SunState.dominantIsMoon = true;
+  }
+  // normalise (au cas où)
+  if(SunState.dominantDir2D.lengthSq() > 0.0001) SunState.dominantDir2D.normalize();
+  SunState.timeOfDay = t01;
+}
+
 /* v57 — LE JOUR RESPIRE. Jamais de nuit (la lisibilité d'abord) : la lumière
    oscille lentement (~4 min) entre un matin doré, un midi clair et une fin
    d'après-midi ambrée aux ombres longues. Les réverbères se rallument quand
@@ -11683,29 +11908,50 @@ const DayCycle={
     {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // boucle (M7)
   ],
   _cA:null,_cB:null,
-  phase(){ return ((t/this.PERIOD)+0.22)%1; },          // la partie commence en fin de matinée
+  // M7 — phase() = timeOfDay continue (alignée sur la position physique du
+  // soleil). Le décalage 0.72 historique est porté par la valeur INITIALE
+  // de timeOfDay (spawn = heure dorée).
+  phase(){ return timeOfDay; },
   _mixColor(target,h1,h2,u){
     if(!this._cA){ this._cA=new THREE.Color(); this._cB=new THREE.Color(); }
     this._cA.setHex(h1); this._cB.setHex(h2); target.copy(this._cA).lerp(this._cB,u); },
-  update(){
+  update(dt){
     if(!sunLight) return;
+    // M7 — avance timeOfDay puis recompute SunState (source de vérité).
+    if(typeof dt==='number' && dt>0){
+      timeOfDay += dt * TIME_SPEED / DAY_PERIOD;
+      timeOfDay = ((timeOfDay % 1) + 1) % 1;
+    }
+    updateSun(timeOfDay);
+
+    // Couleurs interpolées via la table STOPS (phase ≡ timeOfDay) — le mapping
+    // est légèrement décalé par rapport à la position physique (STOPS p=0.40
+    // pour midi, le sun est à zénith à timeOfDay=0.50) mais reste cohérent
+    // dans la grande forme du cycle.
     const ph=this.phase(), S=this.STOPS;
-    let a=S[0],b=S[1];
+    let a=S[0], b=S[1];
     for(let i=0;i<S.length-1;i++){ if(ph>=S[i].p&&ph<=S[i+1].p){ a=S[i]; b=S[i+1]; break; } }
-    const u0=(ph-a.p)/Math.max(1e-6,b.p-a.p), u=u0*u0*(3-2*u0);     // smoothstep
-    const el=a.el+(b.el-a.el)*u, az=a.az+(b.az-a.az)*u, R=110;
-    sunLight.position.set(Math.cos(el)*Math.sin(az)*R, Math.max(8,Math.sin(el)*R), Math.cos(el)*Math.cos(az)*R);
-    sunLight.intensity=physI(a.sunI+(b.sunI-a.sunI)*u);
-    this._mixColor(sunLight.color, a.sunC, b.sunC, u);
+    const u0=(ph-a.p)/Math.max(1e-6,b.p-a.p), u=u0*u0*(3-2*u0);
+
+    // sunLight : position et intensité depuis SunState. Couleur depuis
+    // SunState.sunColor (calculée par hauteur, plus précis que les STOPS).
+    sunLight.position.copy(SunState.sunDir).multiplyScalar(SUN_DISPLAY_R*0.47);   // ~110
+    sunLight.intensity = physI(SunState.sunIntensity);
+    sunLight.color.copy(SunState.sunColor);
+
+    // moonLight : ajouté en init, on l'alimente si présent.
+    if(moonLight){
+      moonLight.position.copy(SunState.moonDir).multiplyScalar(SUN_DISPLAY_R*0.47);
+      moonLight.intensity = physI(SunState.moonIntensity);
+      moonLight.color.copy(SunState.moonColor);
+    }
+
     if(hemiLight){ hemiLight.intensity=physI(a.hemI+(b.hemI-a.hemI)*u);
       this._mixColor(hemiLight.color, a.hemC, b.hemC, u); }
-    // M7 — moonAmbient : intensité ∝ (1 - kDay), pic à 0.16 la nuit, 0 le jour.
-    // Le sol M3 reste lisible sans casser le contraste ni nourrir le bloom
-    // (couleur très sombre 0x24180e, ne dépasse JAMAIS le seuil émissif 0.82).
-    const kDay = a.k+(b.k-a.k)*u;
-    if(nightAmbient) nightAmbient.intensity = physI(0.16) * Math.max(0, 1 - kDay);
+    // M7 — moonAmbient : intensité dérivée de SunState.kDay
+    if(nightAmbient) nightAmbient.intensity = physI(0.16) * Math.max(0, 1 - SunState.kDay);
     if(scene.fog) this._mixColor(scene.fog.color, a.fog, b.fog, u);
-    this.kDay=a.k+(b.k-a.k)*u;            // calculé AVANT le ciel : les étoiles lisent la bonne valeur
+    this.kDay=SunState.kDay;            // source de vérité unique consommée par tout le reste
     if(skyDome){
       // M2 — DayCycle ne touche QUE le zénith (alias topColor → uZenith).
       // L'horizon doré (COLORSCRIPT.skyHorizon) reste fixe : c'est l'inflexion
@@ -11720,7 +11966,11 @@ const DayCycle={
         skyStars.material.opacity=Math.pow(Math.max(0,1-this.kDay*1.6),1.5)*0.9;   // étoiles la nuit
     }
     this.lampBoost=a.lamp+(b.lamp-a.lamp)*u;
-    this._el=el;
+    // _el : élévation de l'astre dominant (sun ou lune) — encore lu par
+    // Atmosphere pour gater la visibilité de la lune sprite (héritage).
+    this._el = SunState.dominantIsMoon
+      ? Math.asin(Math.max(-1, Math.min(1, SunState.moonDir.y)))
+      : Math.asin(Math.max(-1, Math.min(1, SunState.sunDir.y)));
   }
 };
 
@@ -12269,7 +12519,7 @@ function loop(){
   CompetitorWorld.updateCommuters(dt);// v53 : navetteurs quartier ouvrier -> chaque usine
   CityGrowth.updateRails(dt);         // v54 : wagon navette usines -> port
   WorldBeauty.update(dt);             // v56 : nuages, oiseaux, tangage des bateaux
-  DayCycle.update();                  // v57 : la lumière du jour respire
+  DayCycle.update(dt);                // v57/M7 : avance timeOfDay + sun/moon via SunState
   updateClassLighting(dt);            // M4 : sim → facteurs lissés (avant le rendu des vitres)
   updateWindowGlow();                 // v62 + M4 : fenêtres + lampes + cônes
   Atmosphere.update(dt);              // v58 : brume + position du soleil
