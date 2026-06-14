@@ -1919,14 +1919,185 @@ function refreshPlayerPlant(){
   PLANT_BUILDERS[st](g,put);
   g._plantStage=st;
 }
-function buildMarche(g){
-  g.add(box(15,0.5,15,0xb6a982,0,0.25,0,false));                  // place pavée
-  const stall=(x,z,c)=>{ const s=createMarketStall(c); s.position.set(x,0,z); g.add(s); };
-  stall(-4,-2,COL.rouge); stall(4,-2,COL.bleu); stall(0,4,COL.vert);
-  const pb1=createPriceBoard('£'); pb1.position.set(-6,0,4.5); g.add(pb1);
-  const pb2=createPriceBoard('£'); pb2.position.set(6,0,4.5); pb2.rotation.y=0.3; g.add(pb2);
-  for(let i=0;i<3;i++){ const c=createCrate(1.1,i%2?0x8a6b49:0x9a7a55); c.position.set(-5+i*1.4,0,-5); g.add(c); }
-  const sp=createSign("A'"); sp.scale.set(2.6,1.7,1); sp.position.set(0,5.6,0); g.add(sp);
+function buildMarche(g){              // MARCHÉ DE VENTE A' — place marchande chaleureuse, sortie du circuit
+  // matières partagées
+  const brique=briqueTexture('std');
+  const matBrique=new THREE.MeshStandardMaterial({
+    color:0x5a3026, map:brique.map, roughnessMap:brique.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const pierre=pierreDeTailleTexture('sombre');
+  const matPierre=new THREE.MeshStandardMaterial({
+    color:0x6b6055, map:pierre.map, roughnessMap:pierre.roughnessMap, roughness:1.0, metalness:0,
+  });
+  const planches=planchesTexture();
+  const matPlanches=new THREE.MeshStandardMaterial({
+    color:0x7a6648, map:planches.map, roughnessMap:planches.roughnessMap,
+    roughness:0.95, metalness:0,
+  });
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matBoisClair=new THREE.MeshStandardMaterial({color:0x8a6940, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  const matToit=new THREE.MeshStandardMaterial({color:0x6b3328, roughness:0.95, metalness:0, flatShading:true});
+  // TOILE OCRE des étals (chaleureuse — clé de l'ambiance « sortie du circuit »)
+  const matToileA=new THREE.MeshStandardMaterial({
+    color:0xc6843c, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true,
+  });
+  const matToileB=new THREE.MeshStandardMaterial({
+    color:0xa66232, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true,
+  });
+  const matToileC=new THREE.MeshStandardMaterial({
+    color:0xd49a52, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true,
+  });
+
+  // SOUBASSEMENT débordant (ancrage)
+  g.add(_M5_box(16.0, 0.30, 16.0, matPierre, 0, -0.05, 0));
+
+  // PLACE PAVÉE (paveTexture variant 2, claire — la place est entretenue, c'est là que l'argent circule)
+  const pave=paveTexture(2);
+  pave.map.repeat.set(3.2, 3.2); pave.roughnessMap.repeat.set(3.2, 3.2);
+  const sol=new THREE.Mesh(new THREE.PlaneGeometry(15.0, 15.0),
+    new THREE.MeshStandardMaterial({color:0xa89878, map:pave.map, roughnessMap:pave.roughnessMap, roughness:1.0, metalness:0}));
+  sol.rotation.x=-Math.PI/2; sol.position.set(0, 0.15, 0); sol.receiveShadow=true;
+  g.add(sol);
+
+  // MUR BAS périphérique sur 3 côtés (encadre la place, ouvert au sud côté rue)
+  const matMuret=new THREE.MeshStandardMaterial({color:0x8a7f6a, map:pierre.map, roughnessMap:pierre.roughnessMap, roughness:1.0, metalness:0});
+  // mur nord
+  g.add(_M5_box(15.4, 1.0, 0.35, matMuret, 0, 0.60, -7.55));
+  // muret est + ouest (avec ouverture au centre)
+  for(const sx of [-1, 1]){
+    g.add(_M5_box(0.35, 1.0, 5.0, matMuret, sx*7.55, 0.60, -3.5));
+    g.add(_M5_box(0.35, 1.0, 5.0, matMuret, sx*7.55, 0.60,  3.5));
+  }
+  // couronnement (chapeau pierre du muret)
+  g.add(_M5_box(15.6, 0.10, 0.50, matPierre, 0, 1.15, -7.55, false));
+  for(const sx of [-1, 1]){
+    g.add(_M5_box(0.50, 0.10, 5.2, matPierre, sx*7.55, 1.15, -3.5, false));
+    g.add(_M5_box(0.50, 0.10, 5.2, matPierre, sx*7.55, 1.15,  3.5, false));
+  }
+  // bornes pierre aux ouvertures sud (entrée principale)
+  for(const sx of [-1, 1]){
+    const borne=new THREE.Mesh(new THREE.CylinderGeometry(0.30, 0.36, 1.10, 8), matPierre);
+    borne.position.set(sx*6.0, 0.55, 7.55); g.add(borne);
+  }
+
+  // BUREAU DE PERCEPTION (volume CLOS — petit bâtiment central nord)
+  // empreinte 4×3, soubassement + plinthe + corps brique + corniche + toit pitched fermé
+  const bcx=0, bcz=-5.5;
+  g.add(_M5_box(4.6, 0.30, 3.6, matPierre, bcx, 0.15, bcz));        // soubassement
+  g.add(_M5_box(4.2, 0.40, 3.2, matPierre, bcx, 0.50, bcz));        // plinthe
+  g.add(_M5_box(4.0, 3.0, 3.0, matBrique, bcx, 2.20, bcz));         // corps brique
+  g.add(_M5_box(4.3, 0.20, 3.3, matPierre, bcx, 3.80, bcz, false)); // corniche
+  // toit pitched FERMÉ (pignons inclus)
+  const bRoof=_M6_pitchedClosed(4.4, 3.4, 1.0, matToit, matBrique);
+  bRoof.position.set(bcx, 3.90, bcz); g.add(bRoof);
+  // cheminée
+  g.add(_M5_box(0.40, 0.95, 0.40, matBrique, bcx + 1.4, 4.45, bcz - 0.7));
+  g.add(_M5_box(0.50, 0.10, 0.50, matPierre, bcx + 1.4, 4.97, bcz - 0.7, false));
+  // GUICHET saillant côté sud (face à la place — c'est là qu'on encaisse)
+  g.add(_M5_box(1.8, 1.6, 0.50, matBois, bcx, 1.30, bcz + 1.65));
+  g.add(_M5_box(2.0, 0.10, 0.60, matPierre, bcx, 2.10, bcz + 1.65));
+  // grille du guichet (5 barreaux fins)
+  for(let i=0; i<5; i++){
+    g.add(_M5_box(0.03, 0.5, 0.03, matFer, bcx - 0.6 + i*0.3, 2.45, bcz + 1.68));
+  }
+  // FENÊTRES (1 par face — taggées zone via createWindow → M4 vert pâle / cold pour A')
+  const wFront=createWindow(0.7, 0.95); wFront.position.set(bcx, 2.85, bcz + 1.54); g.add(wFront);
+  for(const sx of [-1, 1]){
+    const w=createWindow(0.55, 0.85); w.position.set(bcx + sx*2.04, 2.50, bcz);
+    w.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2; g.add(w);
+  }
+  const wBack=createWindow(0.55, 0.85); wBack.position.set(bcx, 2.50, bcz - 1.54); wBack.rotation.y=Math.PI; g.add(wBack);
+  // enseigne £ sur le bureau (la VALEUR se réalise ici)
+  const sLab=createSign('£'); sLab.scale.set(1.4, 1.4, 1); sLab.position.set(bcx, 3.40, bcz + 1.55); g.add(sLab);
+
+  // ÉTALS COUVERTS (6 étals organisés en deux rangées, sous toiles ocre)
+  // chaque étal : table en planches + 4 poteaux + toile inclinée + bandeau festonné
+  const stallLayouts=[
+    {x:-5, z:-1.5, color:matToileA, goods:'caisses'},
+    {x: 0, z:-1.5, color:matToileC, goods:'sacs'},
+    {x: 5, z:-1.5, color:matToileB, goods:'tonneaux'},
+    {x:-5, z: 3.5, color:matToileC, goods:'sacs'},
+    {x: 0, z: 3.5, color:matToileA, goods:'caisses'},
+    {x: 5, z: 3.5, color:matToileB, goods:'tonneaux'},
+  ];
+  for(const sl of stallLayouts){
+    const stallG=new THREE.Group();
+    stallG.position.set(sl.x, 0.15, sl.z);
+    // 4 poteaux
+    for(const [px, pz] of [[-1.3, -0.9], [1.3, -0.9], [-1.3, 0.9], [1.3, 0.9]]){
+      const post=_M5_box(0.10, 2.0, 0.10, matBois, px, 1.00, pz);
+      stallG.add(post);
+    }
+    // table en planches
+    stallG.add(_M5_box(2.8, 0.22, 1.8, matPlanches, 0, 1.10, 0));
+    // toile inclinée (BoxGeometry mince inclinée)
+    const toile=_M5_box(3.0, 0.04, 2.0, sl.color, 0, 2.10, 0, false);
+    toile.rotation.x=0.18;
+    stallG.add(toile);
+    // bandeau festonné (sous le bord avant)
+    const festoon=_M5_box(3.0, 0.18, 0.04, sl.color, 0, 1.92, 1.0, false);
+    stallG.add(festoon);
+    // marchandises sur la table
+    if(sl.goods === 'caisses'){
+      for(let i=0; i<3; i++){
+        const cw=0.55, ch=0.40;
+        stallG.add(_M5_box(cw, ch, cw, matBoisClair, -0.8 + i*0.8, 1.42, 0, false));
+      }
+    } else if(sl.goods === 'sacs'){
+      for(let i=0; i<4; i++){
+        const sack=new THREE.Mesh(new THREE.SphereGeometry(0.30, 8, 6),
+          new THREE.MeshStandardMaterial({color:0xc9b78c, roughness:0.95, flatShading:true}));
+        sack.scale.set(1.0, 0.85, 1.0);
+        sack.position.set(-0.9 + i*0.6, 1.45, 0); stallG.add(sack);
+      }
+    } else { // tonneaux
+      for(let i=0; i<3; i++){
+        const barrel=new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.55, 10),
+          new THREE.MeshStandardMaterial({color:0x6b4a2c, roughness:0.95, flatShading:true}));
+        barrel.position.set(-0.7 + i*0.7, 1.50, 0); stallG.add(barrel);
+        // cerclage
+        for(const by of [-0.18, 0.18]){
+          const band=new THREE.Mesh(new THREE.CylinderGeometry(0.275, 0.275, 0.06, 10),
+            new THREE.MeshStandardMaterial({color:0x2c2113, roughness:0.95, flatShading:true}));
+          band.position.set(-0.7 + i*0.7, 1.50 + by, 0); stallG.add(band);
+        }
+      }
+    }
+    g.add(stallG);
+  }
+
+  // 4 LANTERNES À GAZ aux coins de la place (ambiance dorée chaleureuse, sortie du circuit)
+  // Réutilise createBronzeLantern (faux halos M4, sans PointLight neuve).
+  for(const [lx, lz] of [[-6.5, -6.5], [6.5, -6.5], [-6.5, 6.5], [6.5, 6.5]]){
+    const lant=createBronzeLantern();
+    lant.position.set(lx, 0.15, lz);
+    lant.scale.setScalar(0.78);
+    g.add(lant);
+  }
+
+  // MARCHANDISES EMPILÉES sur la place (tonneaux + caisses + balle)
+  // empilement nord-est
+  for(let i=0; i<3; i++){
+    const c=createCrate(1.1, i%2?0x8a6b49:0x9a7a55);
+    c.position.set(6.5, 0.15, -2 + i*0.3);
+    g.add(c);
+  }
+  // tas de sacs nord-ouest
+  for(let i=0; i<3; i++){
+    const s=createSack(i%2 ? 0xc9b78c : 0xbfa97e);
+    s.position.set(-6.5, 0.15, -2 + i*0.7); g.add(s);
+  }
+  // tonneaux empilés sud-ouest
+  const barrelA=createBarrel(0x6b4a2c); barrelA.position.set(-6.2, 0.15, 6.0); g.add(barrelA);
+  const barrelB=createBarrel(0x6b4a2c); barrelB.position.set(-5.0, 0.15, 6.0); g.add(barrelB);
+  // panneau de prix £
+  const pb1=createPriceBoard('£'); pb1.position.set(-6.0, 0.15, 6.8); g.add(pb1);
+  const pb2=createPriceBoard('£'); pb2.position.set(6.0, 0.15, 6.8); pb2.rotation.y=0.3; g.add(pb2);
+
+  // ENSEIGNE A' au-dessus du bureau (le moment où la valeur se réalise)
+  const sp=createSign("A'"); sp.scale.set(2.6, 1.7, 1); sp.position.set(0, 6.2, -5.5); g.add(sp);
 }
 function buildEntrepot(g){            // ENTREPÔT — longue halle à arches numérotées, quai de chargement
   const brique=briqueTexture('std');
