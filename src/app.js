@@ -5045,12 +5045,16 @@ const Vehicle = {
    la profondeur et l'écrasement du soleil rasant.
    ===================================================================== */
 const CAM_PRESETS = {
-  map:       { fov:55, back:22, up:13.2, dynBack:5.5, dynUp:2.0, lookFwd:6,  lookY:5.2, posLerp:0.07, lookLerp:1.00 },
-  shoulder:  { fov:58, back:14, up:6.5,  dynBack:3.0, dynUp:1.0, lookFwd:10, lookY:3.2, posLerp:0.09, lookLerp:0.18 },
-  immersion: { fov:62, back:7.5,up:2.2,  dynBack:1.4, dynUp:0.4, lookFwd:16, lookY:2.6, posLerp:0.11, lookLerp:0.15 },
+  map:       { fov:55, back:22,  up:13.2, dynBack:5.5, dynUp:2.0, lookFwd:6,  lookY:5.2, posLerp:0.07, lookLerp:1.00 },
+  // « Épaule » — DÉFAUT : médian entre l'ancienne épaule et l'immersion.
+  // Caméra mi-basse, regard projeté plus loin, FOV plus large que la carte.
+  shoulder:  { fov:60, back:10.5,up:4.5,  dynBack:2.2, dynUp:0.7, lookFwd:13, lookY:2.9, posLerp:0.10, lookLerp:0.17 },
+  immersion: { fov:62, back:7.5, up:2.2,  dynBack:1.4, dynUp:0.4, lookFwd:16, lookY:2.6, posLerp:0.11, lookLerp:0.15 },
 };
 const _CAM_ORDER = ['map', 'shoulder', 'immersion'];
-let CAM_MODE = 'map';
+// Démarre sur le nouveau « entre-deux » (shoulder). C cycle vers immersion,
+// puis carte, puis revient à shoulder.
+let CAM_MODE = 'shoulder';
 const CameraController = {
   _smoothLook: new THREE.Vector3(),
   _initLook: false,
