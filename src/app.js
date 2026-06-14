@@ -5034,19 +5034,146 @@ const Vehicle = {
 /* ===================================================================
    CameraController  —  caméra de poursuite
    =================================================================== */
+/* =====================================================================
+   M-POV — CAMÉRA IMMERSIVE RÉGLABLE.
+   3 presets commutables (touche C) — la lisibilité reste défaut.
+     map       : haute, lisible (vue actuelle, défaut).
+     shoulder  : mi-hauteur, plongée modérée — compromis.
+     immersion : basse hauteur d'essieu, le monde pèse.
+   Transitions douces (lerp position + lookAt smooth) — pas de saut.
+   FOV s'ajuste à chaque preset ; en Immersion, plus large pour accentuer
+   la profondeur et l'écrasement du soleil rasant.
+   ===================================================================== */
+const CAM_PRESETS = {
+  map:       { fov:55, back:22, up:13.2, dynBack:5.5, dynUp:2.0, lookFwd:6,  lookY:5.2, posLerp:0.07, lookLerp:1.00 },
+  shoulder:  { fov:58, back:14, up:6.5,  dynBack:3.0, dynUp:1.0, lookFwd:10, lookY:3.2, posLerp:0.09, lookLerp:0.18 },
+  immersion: { fov:62, back:7.5,up:2.2,  dynBack:1.4, dynUp:0.4, lookFwd:16, lookY:2.6, posLerp:0.11, lookLerp:0.15 },
+};
+const _CAM_ORDER = ['map', 'shoulder', 'immersion'];
+let CAM_MODE = 'map';
 const CameraController = {
+  _smoothLook: new THREE.Vector3(),
+  _initLook: false,
+  _desired: new THREE.Vector3(),
+  _target: new THREE.Vector3(),
+  setMode(mode){
+    if(!CAM_PRESETS[mode]) return;
+    CAM_MODE = mode;
+    pushLog('Caméra', 'Vue : '+(mode==='map'?'Carte':mode==='shoulder'?'Épaule':'Immersion')+'.', 'plain');
+  },
+  cycleMode(){
+    const idx=_CAM_ORDER.indexOf(CAM_MODE);
+    this.setMode(_CAM_ORDER[(idx+1)%_CAM_ORDER.length]);
+  },
   update(){
     if(typeof IntroCinematic!=='undefined' && IntroCinematic.active){ IntroCinematic.update(); return; }
     if(typeof CycleCinematic!=='undefined' && CycleCinematic.active){ CycleCinematic.update(); return; }
     const v=Vehicle;
-    const sp=Math.min(1,Math.abs(v.speed)/26);
-    const back=22+sp*5.5, up=13.2+sp*2.0;   // v59c : ~11° de ciel à l'écran
+    const cfg=CAM_PRESETS[CAM_MODE];
+    const sp=Math.min(1, Math.abs(v.speed)/26);
+    const back=cfg.back + sp*cfg.dynBack, up=cfg.up + sp*cfg.dynUp;
     const dx=Math.sin(v.heading), dz=Math.cos(v.heading);
-    const desired=new THREE.Vector3(v.pos.x-dx*back, up, v.pos.z-dz*back);
-    camera.position.lerp(desired,0.07);
-    camera.lookAt(v.pos.x+dx*6, 5.2, v.pos.z+dz*6);
+    this._desired.set(v.pos.x - dx*back, up, v.pos.z - dz*back);
+    camera.position.lerp(this._desired, cfg.posLerp);
+    // Garde-fou : ne descend jamais sous le niveau du sol.
+    if(camera.position.y < 0.8) camera.position.y = 0.8;
+
+    // LookAt avec lissage (vraie inertie en mode bas, instantané en mode carte).
+    this._target.set(v.pos.x + dx*cfg.lookFwd, cfg.lookY, v.pos.z + dz*cfg.lookFwd);
+    if(!this._initLook){ this._smoothLook.copy(this._target); this._initLook=true; }
+    if(cfg.lookLerp >= 1){
+      this._smoothLook.copy(this._target);
+    } else {
+      this._smoothLook.lerp(this._target, cfg.lookLerp);
+    }
+    camera.lookAt(this._smoothLook);
+
+    // FOV transition continue.
+    if(Math.abs(camera.fov - cfg.fov) > 0.05){
+      camera.fov += (cfg.fov - camera.fov) * 0.08;
+      camera.updateProjectionMatrix();
+    }
+
+    // Indicateur de bord d'écran (garde-fou lisibilité en POV bas) :
+    // pointe vers la cible si elle est hors champ ou cachée par un mur.
+    _M_POV_updateTargetIndicator();
   }
 };
+
+/* M-POV — INDICATEUR DE BORD D'ÉCRAN pour l'objectif.
+   Visible uniquement en mode 'shoulder' ou 'immersion' (la vue Carte
+   garde la balise visible naturellement). Apparaît si la cible est
+   hors champ de la caméra. Pointe DOM (CSS) — pas de fragment shader,
+   compatible avec le HUD existant. */
+let _M_POV_indicatorEl=null, _M_POV_indicatorTri=null;
+function _M_POV_ensureIndicator(){
+  if(_M_POV_indicatorEl) return;
+  const wrap=document.createElement('div');
+  wrap.id='pov-target-indicator';
+  wrap.style.cssText='position:fixed;left:0;top:0;width:42px;height:42px;'
+    +'pointer-events:none;z-index:60;transform:translate(-50%,-50%) rotate(0deg);'
+    +'display:none;will-change:transform,left,top;';
+  const tri=document.createElement('div');
+  // Triangle rouge papier avec léger halo.
+  tri.style.cssText='width:0;height:0;'
+    +'border-left:14px solid transparent;border-right:14px solid transparent;'
+    +'border-bottom:24px solid #b94a3a;'
+    +'filter:drop-shadow(0 0 6px rgba(185,74,58,0.65));'
+    +'margin:0 auto;';
+  wrap.appendChild(tri);
+  document.body.appendChild(wrap);
+  _M_POV_indicatorEl=wrap; _M_POV_indicatorTri=tri;
+}
+const _M_POV_tmpVec=new THREE.Vector3();
+function _M_POV_updateTargetIndicator(){
+  if(CAM_MODE === 'map'){
+    if(_M_POV_indicatorEl) _M_POV_indicatorEl.style.display='none';
+    return;
+  }
+  if(typeof targetMarker==='undefined' || !targetMarker || !targetMarker.visible){
+    if(_M_POV_indicatorEl) _M_POV_indicatorEl.style.display='none';
+    return;
+  }
+  _M_POV_ensureIndicator();
+  // Projette la position monde de la cible (un peu en l'air pour viser
+  // au-dessus du sol) en coordonnées NDC.
+  _M_POV_tmpVec.set(targetMarker.position.x, 6, targetMarker.position.z);
+  _M_POV_tmpVec.project(camera);
+  // Si NDC dans [-0.92, 0.92] X et Y, ET z<1 (devant), la cible est à
+  // l'écran : on cache l'indicateur.
+  const onScreen = _M_POV_tmpVec.z < 1
+                && Math.abs(_M_POV_tmpVec.x) < 0.92
+                && Math.abs(_M_POV_tmpVec.y) < 0.92;
+  if(onScreen){
+    _M_POV_indicatorEl.style.display='none';
+    return;
+  }
+  // Sinon : positionne l'indicateur sur le bord d'écran, dans la
+  // direction de la projection (clamp aux bords).
+  // Si la cible est DERRIÈRE la caméra (z >= 1), on inverse le vecteur.
+  let nx=_M_POV_tmpVec.x, ny=_M_POV_tmpVec.y;
+  if(_M_POV_tmpVec.z >= 1){ nx=-nx; ny=-ny; }
+  // Clamp au cercle inscrit dans le rectangle de l'écran (marge 28px).
+  const W=innerWidth, H=innerHeight;
+  const margin=32;
+  const cx=W/2, cy=H/2;
+  const hx=W/2 - margin, hy=H/2 - margin;
+  // Inverse Y NDC car écran +Y bas.
+  const vx=nx, vy=-ny;
+  const len=Math.hypot(vx, vy) || 1;
+  const ux=vx/len, uy=vy/len;
+  // Trouve t tel qu'on touche le bord (rectangle [hx,hy]).
+  const tX=hx/Math.max(1e-3, Math.abs(ux));
+  const tY=hy/Math.max(1e-3, Math.abs(uy));
+  const t=Math.min(tX, tY);
+  const px=cx + ux*t, py=cy + uy*t;
+  // Rotation du triangle : pointe dans la direction (vx,vy).
+  const ang=Math.atan2(vy, vx) + Math.PI/2;
+  _M_POV_indicatorEl.style.display='block';
+  _M_POV_indicatorEl.style.left=px+'px';
+  _M_POV_indicatorEl.style.top=py+'px';
+  _M_POV_indicatorEl.style.transform='translate(-50%,-50%) rotate('+ang.toFixed(3)+'rad)';
+}
 
 /* ===================================================================
    Input  —  clavier (flèches + ZQSD/WASD)
@@ -5060,6 +5187,7 @@ const KEYMAP={
 };
 addEventListener('keydown',e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=true;e.preventDefault();}
   if(e.code==='KeyR'){Vehicle.reset();}
+  if(e.code==='KeyC'){ e.preventDefault(); CameraController.cycleMode(); }
   if(e.code==='KeyV'){ if(voileUnlocked) toggleMarx(); }
   if(e.code==='KeyL'){ VISUAL_LIFE=!VISUAL_LIFE; pushLog('Affichage','Vie visuelle : '+(VISUAL_LIFE?'complète':'réduite (performance)')+'.','plain'); }
   if(e.code==='KeyK'){ GRAPHICS_QUALITY=(GRAPHICS_QUALITY==='low'?'medium':GRAPHICS_QUALITY==='medium'?'high':'low');
