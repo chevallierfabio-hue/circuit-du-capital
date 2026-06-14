@@ -811,8 +811,9 @@ function buildWorld(){
   buildGroundPatches();// M3 — transitions de classe au sol (4 matières distinctes)
   buildPuddles();      // M3 — flaques réfléchissantes : seules surfaces non mates du sol
   buildGroundDebris(); // M3 — papiers / éclats / pierres en InstancedMesh
-  buildWaterEast();    // v56 : le littoral — le port donne sur l'eau, la rue débouche sur le monde
+  buildWaterEast();    // v56/M6 : littoral — eau étendue jusqu'à l'horizon (M6-bord)
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
+  buildClosingHorizon();// M6-bord : ferme le monde par géographie naturelle (collines, estran, voiliers distants)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
   // passe par la barre du circuit (UI), la balise, la flèche au sol et la ligne
   // TEMPORAIRE du tutoriel (circuitLine), qui s'éteint après le premier circuit.
@@ -3638,13 +3639,18 @@ function buildWaterEast(){
         gl_FragColor = vec4(col, 0.92);
       }`,
   });
-  const waterGeo=new THREE.PlaneGeometry(10, 240, 5, 80);
+  // M6-bord : plan d'eau étendu très largement vers l'est/sud — couvre tout
+  // l'horizon côté mer pour rejoindre la brume dorée. Empêche toute arête
+  // visible au-delà du jouable.
+  //   plane 110 × 400  (x ∈ [110, 220], z ∈ [-200, 200])
+  //   segments 22 × 80 → ~1800 verts, suffisant pour les vagues à grande échelle
+  const waterGeo=new THREE.PlaneGeometry(110, 400, 22, 80);
   const water=new THREE.Mesh(waterGeo, _M6_waterMaterial);
   water.rotation.x=-Math.PI/2;
-  water.position.set(115.5, 0.012, 0);
+  water.position.set(165, 0.012, 0);
   water.receiveShadow=false;
   scene.add(water);
-  // berge : liseré sombre
+  // berge : liseré sombre côté terre (la limite playable reste à x ≈ 110.7)
   const berge=new THREE.Mesh(new THREE.PlaneGeometry(0.7, 240),
     new THREE.MeshBasicMaterial({color:0x241f17, transparent:true, opacity:0.55, depthWrite:false}));
   berge.rotation.x=-Math.PI/2; berge.position.set(110.7, 0.02, 0); scene.add(berge);
@@ -3659,6 +3665,257 @@ function buildWaterEast(){
 function _M6_updateWater(){
   if(_M6_waterMaterial) _M6_waterMaterial.uniforms.uTime.value = t;
 }
+
+/* =====================================================================
+   M6-BORD — FERMETURE DE L'HORIZON.
+   La carte jouable s'arrêtait net (bord à ±120, falaise visible dans le
+   vide). On la referme par GÉOGRAPHIE NATURELLE :
+   - 3 strip-meshes de COLLINES (nord, sud, ouest) — terrain ondulé qui
+     monte depuis le bord jouable jusqu'à ~18 m à R≈170, irrégulier par
+     bruit sinusoïdal, couleurs par vertex (vert proche → bleu-brume
+     loin pour la perspective atmosphérique), fog:true.
+   - ARBRES LOINTAINS instanciés (2 InstancedMesh : troncs + feuillage)
+     éparpillés sur les flancs.
+   - ESTRAN sablonneux étroit entre la berge et l'eau (transition côte
+     naturelle, roughness basse pour accrocher la lumière dorée).
+   - VOILIERS / PHARE distants en sprites brumeux côté mer.
+   Le côté EST est laissé à la mer étendue (buildWaterEast).
+   Budget : ~6 draw calls (3 collines + 2 trees instanced + 1 estran +
+   N sprites distants).
+   ===================================================================== */
+let _M6_hillMeshes=[], _M6_distantTreeGroups=[], _M6_distantSails=[];
+function _M6_noise2D(x, z, seed=0){
+  return (Math.sin(x*0.043 + z*0.029 + seed)
+        + Math.sin(x*0.071 - z*0.053 + seed*1.7)*0.7
+        + Math.sin(x*0.13 + z*0.11 + seed*0.3)*0.4) / 2.1;
+}
+function _M6_hillHeight(x, z){
+  // distance depuis le bord jouable (max(|x|,|z|) - 118). 0 si dans la zone.
+  // Pas de collines côté est (x > 105) — c'est la mer.
+  if(x > 105) return 0;
+  const edge = Math.max(0, Math.max(Math.abs(x), Math.abs(z)) - 118);
+  if(edge <= 0) return 0;
+  // ramp doux jusqu'à 70 m, puis plateau qui redescend très lentement
+  const ramp = Math.min(1, edge/60);
+  const PEAK = 18;
+  const noise = (_M6_noise2D(x, z, 0)*0.55 + _M6_noise2D(x*2.1, z*1.7, 11)*0.30 + _M6_noise2D(x*4.3, z*3.1, 23)*0.15) * 0.5 + 0.5;
+  return PEAK * ramp * (0.55 + noise*0.70);
+}
+function _M6_hillStrip(xMin, xMax, zMin, zMax, segX, segZ){
+  const verts=[], idx=[], cols=[];
+  const c=new THREE.Color();
+  const cNear=new THREE.Color(0x6b7a4a);   // vert éteint (proche)
+  const cFar=new THREE.Color(0x4a5568);    // bleu-brume (loin)
+  for(let iz=0; iz<=segZ; iz++){
+    for(let ix=0; ix<=segX; ix++){
+      const x=xMin + (ix/segX)*(xMax-xMin);
+      const z=zMin + (iz/segZ)*(zMax-zMin);
+      const y=_M6_hillHeight(x, z);
+      verts.push(x, y, z);
+      // perspective atmosphérique : couleur lerp selon distance origine
+      const r=Math.hypot(x, z);
+      const t=Math.min(1, Math.max(0, (r - 130) / 90));
+      c.copy(cNear).lerp(cFar, t);
+      cols.push(c.r, c.g, c.b);
+    }
+  }
+  for(let iz=0; iz<segZ; iz++){
+    for(let ix=0; ix<segX; ix++){
+      const a=iz*(segX+1)+ix;
+      const b=iz*(segX+1)+ix+1;
+      const cc=(iz+1)*(segX+1)+ix;
+      const d=(iz+1)*(segX+1)+ix+1;
+      idx.push(a, cc, b, b, cc, d);
+    }
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('color',    new THREE.Float32BufferAttribute(cols, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  const mat=new THREE.MeshStandardMaterial({
+    vertexColors:true, roughness:1.0, metalness:0, flatShading:false, fog:true,
+  });
+  const m=new THREE.Mesh(geo, mat);
+  m.receiveShadow=true; m.castShadow=false;
+  return m;
+}
+function _M6_buildHillsBelt(){
+  // 3 strips : NORD (z<-118), SUD (z>118), OUEST (x<-118). Pas de strip est (mer).
+  // NORD couvre toute la largeur ; les coins NE/SE sont couverts par l'eau étendue.
+  const north=_M6_hillStrip(-260, 260, -260, -118, 26, 16);
+  const south=_M6_hillStrip(-260, 260,  118,  260, 26, 16);
+  const west =_M6_hillStrip(-260, -118, -118, 118, 16, 14);
+  scene.add(north); scene.add(south); scene.add(west);
+  _M6_hillMeshes.push(north, south, west);
+}
+function _M6_buildDistantTrees(){
+  // arbres low-poly sur les flancs des collines (samples du heightmap > 4 m).
+  // 2 InstancedMesh : troncs (cylindre) + feuillage (icosaedron irrégulier).
+  let seed=313;
+  const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
+  const slots=[];
+  const tries=900;
+  for(let i=0;i<tries && slots.length<80;i++){
+    // tirage uniforme dans la grande couronne hors jouable
+    let x, z;
+    const side=Math.floor(rnd()*3);                 // 0 nord, 1 sud, 2 ouest
+    if(side===0){       x=(rnd()*2-1)*240; z=-130 - rnd()*100; }
+    else if(side===1){  x=(rnd()*2-1)*240; z= 130 + rnd()*100; }
+    else {              x=-130 - rnd()*100; z=(rnd()*2-1)*100; }
+    if(x>105) continue;                              // pas dans la mer
+    const y=_M6_hillHeight(x, z);
+    if(y < 3) continue;                              // pas dans les creux
+    slots.push({x, y, z, s:0.85 + rnd()*0.7, r:rnd()*Math.PI*2});
+  }
+  if(!slots.length) return;
+  const matTronc=new THREE.MeshStandardMaterial({color:0x3a2f24, roughness:0.95, metalness:0, flatShading:true, fog:true});
+  const matFeuillage=new THREE.MeshStandardMaterial({color:0x556b3a, roughness:0.95, metalness:0, flatShading:true, fog:true});
+  const trunkGeo=new THREE.CylinderGeometry(0.28, 0.38, 3.0, 5);
+  const folGeo=new THREE.IcosahedronGeometry(1.6, 0);
+  const trunks=new THREE.InstancedMesh(trunkGeo, matTronc, slots.length);
+  const folies=new THREE.InstancedMesh(folGeo, matFeuillage, slots.length);
+  trunks.castShadow=false; folies.castShadow=false;
+  const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3();
+  slots.forEach((sl, i)=>{
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), sl.r);
+    // tronc — centre y +1.5 (mi-hauteur du cylindre 3m)
+    P.set(sl.x, sl.y + 1.5, sl.z); S.set(sl.s, sl.s, sl.s);
+    M.compose(P, Q, S); trunks.setMatrixAt(i, M);
+    // feuillage — au-dessus du tronc, légèrement aplati
+    P.set(sl.x, sl.y + 3.0 + 1.2*sl.s, sl.z); S.set(sl.s*1.1, sl.s*0.85, sl.s*1.1);
+    M.compose(P, Q, S); folies.setMatrixAt(i, M);
+  });
+  trunks.instanceMatrix.needsUpdate=true;
+  folies.instanceMatrix.needsUpdate=true;
+  scene.add(trunks); scene.add(folies);
+  _M6_distantTreeGroups.push(trunks, folies);
+}
+function _M6_buildEstran(){
+  // bande sableuse humide entre la berge (x≈111) et l'eau (x≈110).
+  // Plage qui PLONGE dans l'eau (légère pente Y négative à l'est) pour
+  // éliminer toute cassure.
+  const w=4.0, d=240;
+  const segX=8, segZ=40;
+  const verts=[], idx=[], uvs=[];
+  for(let iz=0; iz<=segZ; iz++){
+    for(let ix=0; ix<=segX; ix++){
+      const x=109 + (ix/segX)*w;                     // de x=109 (terre) à x=113 (entre dans l'eau)
+      const z=-d/2 + (iz/segZ)*d;
+      // pente : y descend de 0.03 (terre) à -0.05 (plonge sous la mer à y=0.012)
+      const tt=ix/segX;
+      const y=0.030 - tt*0.080;
+      verts.push(x, y, z);
+      uvs.push(ix/segX*1.5, iz/segZ*16);
+    }
+  }
+  for(let iz=0; iz<segZ; iz++){
+    for(let ix=0; ix<segX; ix++){
+      const a=iz*(segX+1)+ix, b=iz*(segX+1)+ix+1;
+      const cc=(iz+1)*(segX+1)+ix, dd=(iz+1)*(segX+1)+ix+1;
+      idx.push(a, cc, b, b, cc, dd);
+    }
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(idx); geo.computeVertexNormals();
+  // texture sable foncé humide : on prend terreTexture mais on assombrit la teinte
+  const t=terreTexture();
+  const mat=new THREE.MeshStandardMaterial({
+    color:0x6a5a44, map:t.map, roughnessMap:t.roughnessMap,
+    roughness:0.55, metalness:0.05,                    // bas roughness → réflexion dorée
+  });
+  const m=new THREE.Mesh(geo, mat);
+  m.receiveShadow=true; scene.add(m);
+}
+function _M6_buildDistantSails(){
+  // 3 sprites brumeux côté mer : 2 voiliers + 1 phare (très loin, fondus dans le fog).
+  const mkSailTex=()=>{
+    const c=document.createElement('canvas'); c.width=128; c.height=96;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,128,96);
+    // coque (forme aplatie)
+    x.fillStyle='rgba(40,32,22,0.85)';
+    x.beginPath();
+    x.moveTo(20, 70); x.lineTo(108, 70); x.lineTo(96, 80); x.lineTo(32, 80);
+    x.closePath(); x.fill();
+    // voile 1 (grande triangle)
+    x.fillStyle='rgba(232,220,196,0.85)';
+    x.beginPath();
+    x.moveTo(64, 12); x.lineTo(96, 70); x.lineTo(64, 70); x.closePath(); x.fill();
+    // voile 2 (petit triangle à l'avant)
+    x.beginPath();
+    x.moveTo(64, 24); x.lineTo(40, 70); x.lineTo(64, 70); x.closePath(); x.fill();
+    // mât
+    x.fillStyle='rgba(40,32,22,0.85)';
+    x.fillRect(63, 10, 2, 60);
+    return new THREE.CanvasTexture(c);
+  };
+  const mkLighthouseTex=()=>{
+    const c=document.createElement('canvas'); c.width=64; c.height=128;
+    const x=c.getContext('2d');
+    x.clearRect(0,0,64,128);
+    // base
+    x.fillStyle='rgba(60,52,42,0.85)';
+    x.fillRect(22, 100, 20, 18);
+    // tour
+    x.fillStyle='rgba(200,190,170,0.85)';
+    x.beginPath();
+    x.moveTo(28, 100); x.lineTo(36, 100); x.lineTo(38, 30); x.lineTo(26, 30); x.closePath(); x.fill();
+    // bande
+    x.fillStyle='rgba(180,40,28,0.85)'; x.fillRect(26, 60, 12, 14);
+    // lanterne (émissive)
+    x.fillStyle='rgba(255,220,170,1.0)';
+    x.fillRect(24, 18, 16, 12);
+    // toit
+    x.fillStyle='rgba(40,32,22,0.85)';
+    x.beginPath(); x.moveTo(22, 18); x.lineTo(42, 18); x.lineTo(32, 6); x.closePath(); x.fill();
+    return new THREE.CanvasTexture(c);
+  };
+  const sailTex=mkSailTex();
+  const lhTex=mkLighthouseTex();
+  // 2 voiliers, distance 220 et 250, hauteur ~6m
+  const sail1=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:sailTex, color:0xffffff, transparent:true, opacity:0.75,
+    depthWrite:false, fog:true,
+  }));
+  sail1.scale.set(14, 10, 1);
+  sail1.position.set(195, 6, -45);
+  scene.add(sail1);
+  const sail2=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:sailTex, color:0xffffff, transparent:true, opacity:0.65,
+    depthWrite:false, fog:true,
+  }));
+  sail2.scale.set(11, 8, 1);
+  sail2.position.set(210, 5, 60);
+  scene.add(sail2);
+  // phare lointain
+  const lh=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:lhTex, color:0xffffff, transparent:true, opacity:0.85,
+    depthWrite:false, fog:true,
+  }));
+  lh.scale.set(8, 16, 1);
+  lh.position.set(218, 8, 130);
+  scene.add(lh);
+  _M6_distantSails.push(sail1, sail2, lh);
+}
+function buildClosingHorizon(){
+  _M6_buildHillsBelt();
+  _M6_buildDistantTrees();
+  _M6_buildEstran();
+  _M6_buildDistantSails();
+}
+function _applyM6BordQuality(q){
+  // Basse : moins d'arbres lointains, sprites distants masqués.
+  const low = (q === 'low');
+  for(const tr of _M6_distantTreeGroups){
+    if(!tr.userData.maxCount) tr.userData.maxCount = tr.count;
+    tr.count = low ? Math.floor(tr.userData.maxCount * 0.35) : tr.userData.maxCount;
+  }
+  for(const s of _M6_distantSails) s.visible = !low;
+}
+if(typeof window!=='undefined') window._applyM6BordQuality = _applyM6BordQuality;
 /* =====================================================================
    M3 — GRAND-RUE PBR.
    Chaussée pavée (paveTexture variant 1) + caniveau central creusé
@@ -8366,6 +8623,8 @@ function applyRenderQuality(q){
   if(typeof _applyM2Quality === 'function') _applyM2Quality(q);
   // M4 — cônes, reflets, flicker : OFF en Basse. PointLights réduites à 4.
   if(typeof _applyM4Quality === 'function') _applyM4Quality(q);
+  // M6-bord — collines simplifiées, voiliers distants masqués en Basse.
+  if(typeof _applyM6BordQuality === 'function') _applyM6BordQuality(q);
   // M1b — log lisible pour valider que les 3 niveaux produisent des configs
   // distinctes. Une seule ligne par changement, à la console.
   console.info('[M1] render quality =', q,
