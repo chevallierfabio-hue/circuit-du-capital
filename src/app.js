@@ -10996,28 +10996,38 @@ const SkyAtmo = {
     this.sunCore.renderOrder=0;
     scene.add(this.sunCore);
 
-    // ----- LUNE : disque texturé qui BRILLE en blanc-argent.
-    // M7-astres-bis : la lune est une vraie source lumineuse, MeshBasicMaterial
-    // lumineux + AdditiveBlending → peut fleurir au bloom (voulu). La texture
-    // (mers, cratères, phase) reste lisible PAR-DESSUS le blanc parce qu'elle
-    // module la luminosité ajoutée : zones claires = brillant, mers = moins
-    // brillant mais toujours visibles, terminateur = ombre quasi-noire.
+    // ----- LUNE : disque texturé qui BRILLE FRANCHEMENT en blanc-argent.
+    // M7-astres-bis : la lune est une vraie source. Couches :
+    //   halo extérieur large (×4) → halo intérieur dense (×2) → disque texturé
+    //   couleur 0xffffff pure. Toutes additives — le bloom fait le reste.
+    // La texture (mers, cratères, phase) module la luminosité ajoutée :
+    //   bright = brillant qui fleurit, mers = nuances perceptibles,
+    //   terminateur = ombre quasi-noire.
     const moonTex=this._moonDiskTex();
     this.moonDisk=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:moonTex, color:0xf0f4ff, transparent:true, opacity:0.0,
+      map:moonTex, color:0xffffff, transparent:true, opacity:0.0,
       depthWrite:false, fog:false,
       blending:THREE.AdditiveBlending,
     }));
-    this.moonDisk.scale.set(20, 20, 1);
+    this.moonDisk.scale.set(22, 22, 1);
     this.moonDisk.renderOrder=0;
     scene.add(this.moonDisk);
-    // Halo lunaire BLANC-BLEU froid plus présent qu'avant.
+    // Halo INTÉRIEUR — dense, blanc-bleu lumineux (nouveau pour M7-astres-ter).
+    const moonInnerHaloTex=this._moonHaloTex();
+    this.moonInnerHalo=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:moonInnerHaloTex, color:0xe8efff, transparent:true, opacity:0.0,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.moonInnerHalo.scale.set(46, 46, 1);
+    this.moonInnerHalo.renderOrder=-1;
+    scene.add(this.moonInnerHalo);
+    // Halo EXTÉRIEUR — large, plus diffus, blanc-bleu froid.
     const moonHaloTex=this._moonHaloTex();
     this.moonHalo=new THREE.Sprite(new THREE.SpriteMaterial({
       map:moonHaloTex, color:0xd0dcff, transparent:true, opacity:0.0,
       depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
     }));
-    this.moonHalo.scale.set(72, 72, 1);
+    this.moonHalo.scale.set(105, 105, 1);
     this.moonHalo.renderOrder=-2;
     scene.add(this.moonHalo);
 
@@ -11369,27 +11379,35 @@ const SkyAtmo = {
       ray.material.opacity = raysVisible ? 0.40 * horizonness * (0.85 + 0.15*Math.sin(t*0.6 + i)) : 0;
     }
 
-    // ==================== LUNE — disque BRILLANT + halo blanc-bleu ===========
-    // M7-astres-bis : la lune est une SOURCE — additive blending + couleur
-    // 0xf0f4ff. Opacité plus haute la nuit pour qu'elle puisse fleurir
-    // doucement au bloom (voulu — la lune brille).
+    // ==================== LUNE — SOURCE LUMINEUSE BLANC-ARGENT ==============
+    // M7-astres-ter : trois couches additives — disque + halo intérieur +
+    // halo extérieur — donnent à la lune la présence d'une vraie source.
+    const moonNightK = (1 - SunState.kDay * 0.85);
     if(this.moonDisk){
       this.moonDisk.position.set(cx + mx, my, cz + mz);
       this.moonDisk.visible = SunState.moonVisible;
+      // Opacité TRÈS PRÉSENTE la nuit, dégradée la jour.
       const moonOp = SunState.moonVisible
-        ? Math.min(1, 0.45 + Math.max(0, moonY)*0.95) * (0.10 + (1 - SunState.kDay) * 0.90)
+        ? Math.min(1, 0.75 + Math.max(0, moonY)*0.50) * moonNightK
         : 0;
       this.moonDisk.material.opacity = moonOp;
       const moonHorizonness = Math.max(0, 1 - Math.max(0, moonY) * 3.5);
-      const moonGrow = 1.0 + moonHorizonness * 0.28;
-      this.moonDisk.scale.set(20 * moonGrow, 20 * moonGrow * (1 - moonHorizonness*0.05), 1);
+      const moonGrow = 1.0 + moonHorizonness * 0.25;
+      this.moonDisk.scale.set(22 * moonGrow, 22 * moonGrow * (1 - moonHorizonness*0.04), 1);
+    }
+    if(this.moonInnerHalo){
+      this.moonInnerHalo.position.set(cx + mx, my, cz + mz);
+      this.moonInnerHalo.visible = SunState.moonVisible;
+      // Halo intérieur dense — fait briller le disque.
+      this.moonInnerHalo.material.opacity = SunState.moonVisible
+        ? 0.80 * moonNightK : 0;
     }
     if(this.moonHalo){
       this.moonHalo.position.set(cx + mx, my, cz + mz);
       this.moonHalo.visible = SunState.moonVisible;
-      // Halo NETTEMENT plus présent qu'avant (sans rivaliser avec le soleil).
+      // Halo extérieur large et net.
       this.moonHalo.material.opacity = SunState.moonVisible
-        ? 0.55 * (1 - SunState.kDay * 0.85) : 0;
+        ? 0.70 * moonNightK : 0;
     }
 
     // VOILE doré : grand plan orienté vers la caméra, posé côté soleil (dynamique).
@@ -12046,9 +12064,10 @@ const SunState = {
   dominantColor: new THREE.Color(0xffd9a4),
   dominantIsMoon: false,
   sunColor:  new THREE.Color(0xffd9a4),
-  // M7-astres-bis : lune en source BLANC-ARGENT franc — contraste assumé
-  // avec le soleil rouge-sang du couchant.
-  moonColor: new THREE.Color(0xd8dee8),
+  // M7-astres-ter : lune en source BLANC-ARGENT FRANCHE (e8eef8 →
+  // poussée vers un blanc presque pur pour qu'elle BRILLE sur la mer
+  // et éclaire la scène). Contraste assumé avec le soleil rouge-sang.
+  moonColor: new THREE.Color(0xeaf0fa),
 };
 const DAY_PERIOD = 240;                     // 4 min par cycle complet
 const SUN_DISPLAY_R = 235;                  // distance pour les sprites célestes
@@ -12099,9 +12118,9 @@ function updateSun(t01){
 
   // intensités physiques
   SunState.sunIntensity  = Math.max(0, sy * 1.15);
-  // M7-astres-bis : lune un peu plus présente (la nuit est éclairée par
-  // cette lune blanche). 0.32 → 0.46.
-  SunState.moonIntensity = Math.max(0, my * 0.46);
+  // M7-astres-ter : lune nettement plus présente — vraie source.
+  // ×0.46 → ×0.70 (sans dépasser le soleil zénith ×1.15).
+  SunState.moonIntensity = Math.max(0, my * 0.70);
 
   // visibilités (le mesh disparaît quand l'astre est trop bas)
   SunState.sunVisible  = sy > -0.04;
