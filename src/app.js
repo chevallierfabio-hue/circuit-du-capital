@@ -3828,14 +3828,17 @@ function buildWaterEast(){
         // animation ondulante (faite tanguer la bande)
         float wave = sin(across*0.20 + uTime*0.45)*0.05 + sin(along*0.07 + uTime*0.30)*0.08;
         streak *= (0.85 + wave*0.6);
-        // intensité globale : pic à l'horizon (heure dorée / lune basse)
+        // intensité globale : pic à l'horizon (heure dorée / lune basse).
+        // M7-astres-bis : la traînée LUNAIRE est blanche-argent FRANCHE, bien
+        // visible — la lune brille et imprime sur l'eau.
         float horizonK = exp(-pow((uAstreUp - 0.12)*4.0, 2.0));
-        // tinte chaude le jour, froide pâle la nuit (uIsMoon contrôle)
-        float strength = 0.50 + 0.30*(1.0 - uIsMoon);
-        col += uAstreColor * streak * strength * (0.4 + 0.6*horizonK);
-        // teinte globale plus chaude côté astre (le jour) — atténuée la nuit
+        float strength = 0.55 + 0.30*uIsMoon;   // 0.55 jour, 0.85 nuit
+        // Pour la lune, on PUSHe vers le blanc-argent pur.
+        vec3 streakCol = mix(uAstreColor, vec3(0.92, 0.94, 1.00), uIsMoon * 0.55);
+        col += streakCol * streak * strength * (0.45 + 0.55*horizonK);
+        // teinte globale plus chaude côté astre (le jour) — froide la nuit
         float warmth = clamp(dot(normalize(wp2 + vec2(0.001,0.0)), dir), 0.0, 1.0);
-        col = mix(col, uAstreColor, warmth * (0.35 - uIsMoon*0.25));
+        col = mix(col, streakCol, warmth * (0.35 - uIsMoon*0.10));
 
         // FANAUX — reflets ondulants ponctuels (préservés, surtout visibles la nuit)
         float d0 = length(vWorldPos.xz - uFanal0.xz);
@@ -10993,23 +10996,28 @@ const SkyAtmo = {
     this.sunCore.renderOrder=0;
     scene.add(this.sunCore);
 
-    // ----- LUNE : disque texturé (mers + cratères + phase gibbeuse) + halo
+    // ----- LUNE : disque texturé qui BRILLE en blanc-argent.
+    // M7-astres-bis : la lune est une vraie source lumineuse, MeshBasicMaterial
+    // lumineux + AdditiveBlending → peut fleurir au bloom (voulu). La texture
+    // (mers, cratères, phase) reste lisible PAR-DESSUS le blanc parce qu'elle
+    // module la luminosité ajoutée : zones claires = brillant, mers = moins
+    // brillant mais toujours visibles, terminateur = ombre quasi-noire.
     const moonTex=this._moonDiskTex();
     this.moonDisk=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:moonTex, color:0xe4eaf2, transparent:true, opacity:0.0,
+      map:moonTex, color:0xf0f4ff, transparent:true, opacity:0.0,
       depthWrite:false, fog:false,
-      // PAS d'additive — la lune ne s'additionne pas comme le soleil ; sinon
-      // les détails (mers, cratères, terminateur) sont mangés par le ciel.
+      blending:THREE.AdditiveBlending,
     }));
-    this.moonDisk.scale.set(18, 18, 1);
+    this.moonDisk.scale.set(20, 20, 1);
     this.moonDisk.renderOrder=0;
     scene.add(this.moonDisk);
+    // Halo lunaire BLANC-BLEU froid plus présent qu'avant.
     const moonHaloTex=this._moonHaloTex();
     this.moonHalo=new THREE.Sprite(new THREE.SpriteMaterial({
-      map:moonHaloTex, color:0xb4c4e0, transparent:true, opacity:0.0,
+      map:moonHaloTex, color:0xd0dcff, transparent:true, opacity:0.0,
       depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
     }));
-    this.moonHalo.scale.set(58, 58, 1);
+    this.moonHalo.scale.set(72, 72, 1);
     this.moonHalo.renderOrder=-2;
     scene.add(this.moonHalo);
 
@@ -11309,9 +11317,12 @@ const SkyAtmo = {
     const horizonness = Math.max(0, 1 - Math.max(0, sunY) * 3.5);
     const sunsetGrow  = 1.0 + horizonness * 0.55;        // soleil grossit au couchant
     const flattenY    = 1.0 - horizonness * 0.10;        // s'aplatit (réfraction)
-    // teintes : blanc-chaud au zénith → rouge-orange à l'horizon
-    const _cNoon   = SkyAtmo._cNoon   || (SkyAtmo._cNoon   = new THREE.Color(0xfff2d0));
-    const _cSunset = SkyAtmo._cSunset || (SkyAtmo._cSunset = new THREE.Color(0xff8a3d));
+    // teintes : blanc-chaud au zénith → ROUGE-SANG profond à l'horizon
+    // (M7-astres-bis : soleil de crépuscule industriel chargé de fumée)
+    const _cNoon       = SkyAtmo._cNoon       || (SkyAtmo._cNoon       = new THREE.Color(0xfff2d0));
+    const _cSunset     = SkyAtmo._cSunset     || (SkyAtmo._cSunset     = new THREE.Color(0xd83a1a));   // rouge sang
+    const _cCorSunset  = SkyAtmo._cCorSunset  || (SkyAtmo._cCorSunset  = new THREE.Color(0xc83520));   // corona rouge
+    const _cHaloSunset = SkyAtmo._cHaloSunset || (SkyAtmo._cHaloSunset = new THREE.Color(0x7a2f28));   // halo pourpre-rouge
     if(!SkyAtmo._cTmp) SkyAtmo._cTmp = new THREE.Color();
     SkyAtmo._cTmp.copy(_cNoon).lerp(_cSunset, horizonness);
 
@@ -11324,23 +11335,24 @@ const SkyAtmo = {
       this.sunCore.material.opacity = SunState.sunVisible
         ? Math.min(1, 0.55 + Math.max(0, sunY + 0.05) * 1.4) : 0;
     }
-    // COURONNE
+    // COURONNE — bascule vers le rouge profond plus tôt que le cœur (le pourtour
+    // s'enflamme avant le centre)
     if(this.sunCorona){
       this.sunCorona.position.set(cx + sx, sy, cz + sz);
       this.sunCorona.visible = SunState.sunVisible;
-      // couleur moitié-chaude
-      this.sunCorona.material.color.copy(_cNoon).lerp(_cSunset, horizonness * 0.85);
+      this.sunCorona.material.color.copy(_cNoon).lerp(_cCorSunset, horizonness);
       this.sunCorona.scale.set(46 * sunsetGrow, 46 * sunsetGrow * flattenY, 1);
       this.sunCorona.material.opacity = SunState.sunVisible
-        ? 0.55 * (0.35 + horizonness * 0.70) : 0;
+        ? 0.60 * (0.35 + horizonness * 0.75) : 0;
     }
-    // HALO atmosphérique large
+    // HALO atmosphérique large — vire FRANCHEMENT au rouge-pourpre à l'horizon
+    // (c'est lui qui teinte le ciel autour du soleil dramatique).
     if(this.sunHalo){
       this.sunHalo.position.set(cx + sx, sy, cz + sz);
       this.sunHalo.visible = SunState.sunVisible;
-      this.sunHalo.material.color.copy(SunState.sunColor);
-      this.sunHalo.scale.set(140 * sunsetGrow * 0.95, 140 * sunsetGrow * 0.95, 1);
-      this.sunHalo.material.opacity = SunState.sunVisible ? (0.30 + horizonness * 0.30) : 0;
+      this.sunHalo.material.color.copy(SunState.sunColor).lerp(_cHaloSunset, horizonness * 0.85);
+      this.sunHalo.scale.set(140 * sunsetGrow * 1.05, 140 * sunsetGrow * 1.05, 1);
+      this.sunHalo.material.opacity = SunState.sunVisible ? (0.30 + horizonness * 0.40) : 0;
     }
     // AIGRETTES — apparaissent à l'horizon, tournoient très lentement
     const raysVisible = SunState.sunVisible && horizonness > 0.30;
@@ -11357,26 +11369,27 @@ const SkyAtmo = {
       ray.material.opacity = raysVisible ? 0.40 * horizonness * (0.85 + 0.15*Math.sin(t*0.6 + i)) : 0;
     }
 
-    // ==================== LUNE — disque texturé + halo ====================
+    // ==================== LUNE — disque BRILLANT + halo blanc-bleu ===========
+    // M7-astres-bis : la lune est une SOURCE — additive blending + couleur
+    // 0xf0f4ff. Opacité plus haute la nuit pour qu'elle puisse fleurir
+    // doucement au bloom (voulu — la lune brille).
     if(this.moonDisk){
       this.moonDisk.position.set(cx + mx, my, cz + mz);
       this.moonDisk.visible = SunState.moonVisible;
-      // la lune apparaît surtout la nuit (kDay petit) mais reste subtilement
-      // discernable même en plein jour (ciel pâle).
       const moonOp = SunState.moonVisible
-        ? Math.min(1, 0.25 + Math.max(0, moonY)*0.85) * (0.15 + (1 - SunState.kDay) * 0.85)
+        ? Math.min(1, 0.45 + Math.max(0, moonY)*0.95) * (0.10 + (1 - SunState.kDay) * 0.90)
         : 0;
       this.moonDisk.material.opacity = moonOp;
-      // taille très subtilement modulée par hauteur (réfraction à l'horizon)
       const moonHorizonness = Math.max(0, 1 - Math.max(0, moonY) * 3.5);
-      const moonGrow = 1.0 + moonHorizonness * 0.30;
-      this.moonDisk.scale.set(18 * moonGrow, 18 * moonGrow * (1 - moonHorizonness*0.06), 1);
+      const moonGrow = 1.0 + moonHorizonness * 0.28;
+      this.moonDisk.scale.set(20 * moonGrow, 20 * moonGrow * (1 - moonHorizonness*0.05), 1);
     }
     if(this.moonHalo){
       this.moonHalo.position.set(cx + mx, my, cz + mz);
       this.moonHalo.visible = SunState.moonVisible;
+      // Halo NETTEMENT plus présent qu'avant (sans rivaliser avec le soleil).
       this.moonHalo.material.opacity = SunState.moonVisible
-        ? 0.35 * (1 - SunState.kDay * 0.90) : 0;
+        ? 0.55 * (1 - SunState.kDay * 0.85) : 0;
     }
 
     // VOILE doré : grand plan orienté vers la caméra, posé côté soleil (dynamique).
@@ -12033,24 +12046,31 @@ const SunState = {
   dominantColor: new THREE.Color(0xffd9a4),
   dominantIsMoon: false,
   sunColor:  new THREE.Color(0xffd9a4),
-  moonColor: new THREE.Color(0xb4c4e0),
+  // M7-astres-bis : lune en source BLANC-ARGENT franc — contraste assumé
+  // avec le soleil rouge-sang du couchant.
+  moonColor: new THREE.Color(0xd8dee8),
 };
 const DAY_PERIOD = 240;                     // 4 min par cycle complet
 const SUN_DISPLAY_R = 235;                  // distance pour les sprites célestes
 let timeOfDay = 0.72;
 let TIME_SPEED = 1.0;                       // ajustable via touches `,` `.` `]` (cf. input)
 
-// teinte du soleil en fonction de la hauteur (chaud bas → blanc midi)
+// teinte du soleil en fonction de la hauteur
+// M7-astres-bis : rougi vers le rouge SANG à l'horizon (soleil de
+// crépuscule industriel chargé de fumée).
 function _M7_sunColorFromHeight(out, sy){
-  const cRouge = 0xff7d4a, cAmbre = 0xffb27a, cDore = 0xffd9a4, cBlanc = 0xfff1d4;
+  const cSang  = 0xd83a1a;     // rouge sang (horizon profond)
+  const cAmbre = 0xff8a3d;     // ambre rouge
+  const cDore  = 0xffc878;     // doré chaud
+  const cBlanc = 0xfff1d4;     // blanc-chaud (zénith)
   const _ca=new THREE.Color(), _cb=new THREE.Color();
   if(sy < 0.10){
-    // crépuscule rouge → ambre (sy in [-0.05 .. 0.10])
+    // sang → ambre rouge — pic à l'horizon
     const u = Math.min(1, Math.max(0, (sy + 0.05) / 0.15));
-    _ca.setHex(cRouge); _cb.setHex(cAmbre);
+    _ca.setHex(cSang); _cb.setHex(cAmbre);
     out.copy(_ca).lerp(_cb, u);
   } else if(sy < 0.40){
-    // ambre → doré
+    // ambre rouge → doré
     const u = (sy - 0.10) / 0.30;
     _ca.setHex(cAmbre); _cb.setHex(cDore);
     out.copy(_ca).lerp(_cb, u);
@@ -12079,7 +12099,9 @@ function updateSun(t01){
 
   // intensités physiques
   SunState.sunIntensity  = Math.max(0, sy * 1.15);
-  SunState.moonIntensity = Math.max(0, my * 0.32);
+  // M7-astres-bis : lune un peu plus présente (la nuit est éclairée par
+  // cette lune blanche). 0.32 → 0.46.
+  SunState.moonIntensity = Math.max(0, my * 0.46);
 
   // visibilités (le mesh disparaît quand l'astre est trop bas)
   SunState.sunVisible  = sy > -0.04;
@@ -12170,6 +12192,16 @@ const DayCycle={
     // M7 — moonAmbient : intensité dérivée de SunState.kDay
     if(nightAmbient) nightAmbient.intensity = physI(0.16) * Math.max(0, 1 - SunState.kDay);
     if(scene.fog) this._mixColor(scene.fog.color, a.fog, b.fog, u);
+    // M7-astres-bis : RÉCHAUFFEMENT ROUGE du fog près du soleil couchant.
+    // Si le soleil est visible et bas, on biaise la brume vers le rouge-pourpre
+    // du halo (0x7a2f28) — la fumée industrielle s'embrase au crépuscule.
+    if(scene.fog && SunState.sunVisible){
+      const sH = Math.max(0, 1 - Math.max(0, SunState.sunDir.y) * 3.5);
+      if(sH > 0.05){
+        if(!this._cSunsetFog) this._cSunsetFog = new THREE.Color(0x7a2f28);
+        scene.fog.color.lerp(this._cSunsetFog, sH * 0.22);
+      }
+    }
     this.kDay=SunState.kDay;            // source de vérité unique consommée par tout le reste
     if(skyDome){
       // M2 — DayCycle ne touche QUE le zénith (alias topColor → uZenith).
