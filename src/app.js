@@ -818,9 +818,12 @@ function buildWorld(){
   // TEMPORAIRE du tutoriel (circuitLine), qui s'éteint après le premier circuit.
 }
 
+let _M4_currentZone=null;            // M4 : tag de zone propagé à createWindow
 function defineZone(name,x,z,color,key,builder){
   const group=new THREE.Group(); group.position.set(x,0,z);
+  _M4_currentZone=name;
   builder(group,color);
+  _M4_currentZone=null;
   group.children.forEach(m=>{ if(m.userData) m.userData.base=true; });  // structure de base (masquable)
   const label=makeLabel(key?`${key} — ${name}`:name); label.position.set(0,8,0); group.add(label);
   // halo au sol
@@ -4896,6 +4899,8 @@ export function init(opts={}){
   // l'ancien sprite-soleil de Atmosphere pour éviter le double-soleil.
   if(Atmosphere.sun){ Atmosphere.sun.visible=false; }
   PuffTrains.init();       // v63 : bouffées de cheminées
+  // M4 — groupage des vitres par zone, liaison flaques↔lampes (lit PUDDLES de M3).
+  M4.init(); M4.afterWorld();
   // le son démarre au premier geste (politique d'autoplay des navigateurs)
   const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
   addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
@@ -5101,6 +5106,9 @@ function createWindow(w=0.8,h=1.0,frame=THEME.ink){ const g=new THREE.Group();
   const pane=box(w,h,0.06,0x33414c,0,0,0.05,false);
   pane.material.emissive=new THREE.Color(0x12202a); pane.material.emissiveIntensity=.5;
   pane.userData.glowPhase=Math.random();
+  // M4 : on rattache la vitre à la zone en cours de construction (lecture par
+  // updateClassLighting pour appliquer la température + densité de classe).
+  pane.userData.zone=_M4_currentZone;
   windowPanes.push(pane);
   if(windowPanes.length>520){                                        // purge exacte des vitres démolies
     const vivantes=windowPanes.filter(p=>p.parent);
@@ -5114,19 +5122,270 @@ function updateWindowGlow(){
   if(Vehicle.lampGlass){ Vehicle.lampGlass.material.emissiveIntensity=night*1.2;  // M1c — lampe chariot calibrée
     if(Vehicle.lampPool) Vehicle.lampPool.material.opacity=night*0.5; }
   for(const m of distantGlows) m.emissiveIntensity=night*1.6;  // v66 : les villes lointaines veillent
-  for(const L of nightLights) L.intensity=physI(night*1.35);
-  for(const L of gasLamps){                                   // v65 : halos et flaques de gaz
-    const fl=0.9+0.1*Math.sin(t*6+L.ph);                      // souffle de la flamme
-    L.halo.material.opacity=night*0.6*fl;
-    L.pool.material.opacity=night*0.42*fl;
+  // M4 — baseline night : chaque PointLight reprend SON propre baseI (forge/gold/gas
+  // ont des poids différents). updateClassLighting peut ensuite multiplier par
+  // un facteur dérivé de la simulation.
+  for(const L of nightLights){
+    const baseI = (L.userData && L.userData.baseI) || 1.0;
+    const classF= (L.userData && L.userData.classFactor!=null) ? L.userData.classFactor : 1.0;
+    L.intensity = physI(night * baseI * classF);
   }
+  for(const L of gasLamps){                                   // v65 : halos et flaques de gaz
+    // M4 — flicker : sinus bruité ±8% (sauf en qualité Basse, où _flickerOff=true)
+    let fl = 1.0;
+    if(!M4.flickerOff){
+      const s = Math.sin(t*6.4 + L.ph) * 0.08
+              + Math.sin(t*11.3 + L.flickerSeed) * 0.04;
+      fl = 1.0 + s;
+    }
+    L.halo.material.opacity = night*0.60*fl;
+    L.pool.material.opacity = night*0.42*fl;
+    if(L.flame && L.flame.material){
+      L.flame.material.emissiveIntensity = 0.55 + night*1.20*fl;
+    }
+    if(L.cone){
+      L.cone.material.opacity = night*0.16*fl;
+      L.cone.visible = night > 0.02 && !M4.conesOff;
+    }
+  }
+  // M4 — vitres : consulte M4.zoneFx[zone] pour la TEMPÉRATURE (gold/forge/gas/
+  // froid) et la DENSITÉ (fraction allumées) propres à chaque classe sociale.
+  // Cas non taggé → ancien comportement gas-light.
+  const _M4z = M4.zoneFx;
   for(const p of windowPanes){
     if(!p.parent||!p.material) continue;
-    const on=night*(p.userData.glowPhase<0.85?1:0.25);    // ~15 % de foyers restent éteints
-    p.material.emissive.copy(_glowCold).lerp(_glowWarm,on);
-    p.material.emissiveIntensity=0.5+on*(1.6+0.5*Math.sin(t*0.8+p.userData.glowPhase*9));
+    const ph = p.userData.glowPhase || 0;
+    const zone = p.userData.zone;
+    const fx = (zone && _M4z[zone]) ? _M4z[zone] : null;
+    if(fx){
+      // densité : proportion des fenêtres allumées (decision par phase, déterministe)
+      const isOn = (ph < fx.density);
+      const on = isOn ? night : 0;
+      // pulsation : taux propre à la zone (forge pulse plus vite quand Q monte)
+      const puls = fx.pulsAmp ? (1 + fx.pulsAmp*Math.sin(t*fx.pulsHz + ph*9)) : 1;
+      p.material.emissive.copy(_glowCold).lerp(fx.color, on);
+      p.material.emissiveIntensity = 0.45 + on * fx.intensity * puls;
+    } else {
+      const on = night*(ph<0.85?1:0.25);                  // legacy : ~15% éteint
+      p.material.emissive.copy(_glowCold).lerp(_glowWarm, on);
+      p.material.emissiveIntensity = 0.5 + on*(1.6 + 0.5*Math.sin(t*0.8 + ph*9));
+    }
   }
 }
+
+/* =====================================================================
+   M4 — LE COUPLAGE LUMIÈRE/SIMULATION.
+   Lecture SEULE de l'état (état + dérivés du dernier cycle). Calcule des
+   facteurs lissés exponentiellement (alpha ~ 0.03/frame, ~3 s pour 95%),
+   les écrit dans :
+     • M4.zoneFx[zone] = { color, density, intensity, pulsHz, pulsAmp }
+       (consommé par updateWindowGlow)
+     • L.userData.classFactor pour chaque PointLight (multiplie baseI)
+   ZÉRO allocation par frame : tous les Color/Vec sont préalloués.
+   ===================================================================== */
+const M4 = {
+  ready:false, conesOff:false, flickerOff:false,
+  // États lissés (initialisés en build)
+  s_capital: 0.0,     // 0..1 : profit cumulé / SEUIL_CAPITAL
+  s_chomage: 0.1,     // 0..1
+  s_usineQ:  0.0,     // 0..1 : production normalisée
+  s_enclosure: 0.0,   // 0..1 : niveauVille/7
+  s_crise: 0.0,       // 0..1 : risqueCrise
+  // Pré-alloc : ZÉRO allocation par frame (cf. spec « ZÉRO allocation »).
+  _col: {
+    gold:  new THREE.Color(0xffd98a),
+    forge: new THREE.Color(0xff5a28),
+    gas:   new THREE.Color(0xffb45e),
+    cold:  new THREE.Color(0xcfd6e4),
+  },
+  // Pour chaque zone, l'objet fx réutilisé (color, density, intensity, pulsHz, pulsAmp)
+  zoneFx: {
+    'Banque':           { color:null, density:0.95, intensity:1.9, pulsHz:0.3, pulsAmp:0.10 },
+    'Bourse':           { color:null, density:0.95, intensity:1.9, pulsHz:0.3, pulsAmp:0.10 },
+    'Usine':            { color:null, density:0.70, intensity:1.6, pulsHz:1.4, pulsAmp:0.45 },
+    'Quartier ouvrier': { color:null, density:0.25, intensity:1.4, pulsHz:0.4, pulsAmp:0.15 },
+    'État · Tribunal':  { color:null, density:0.30, intensity:1.2, pulsHz:0.2, pulsAmp:0.05 },
+    'Terres communes':  { color:null, density:0.00, intensity:1.0, pulsHz:0.2, pulsAmp:0.05 },
+    'Mines · Champs':   { color:null, density:0.10, intensity:1.4, pulsHz:0.9, pulsAmp:0.25 },
+  },
+  zoneWindows: {},                                // groupage des vitres par zone
+  puddleReflectors: [],                           // { sprite, lamp }
+  init(){
+    if(this.ready) return; this.ready=true;
+    // initialiser fx.color sur les références préallouées
+    this.zoneFx['Banque'].color           = this._col.gold;
+    this.zoneFx['Bourse'].color           = this._col.gold;
+    this.zoneFx['Usine'].color            = this._col.forge;
+    this.zoneFx['Quartier ouvrier'].color = this._col.gas;
+    this.zoneFx['État · Tribunal'].color  = this._col.cold;
+    this.zoneFx['Terres communes'].color  = this._col.gas;
+    this.zoneFx['Mines · Champs'].color   = this._col.forge;
+  },
+  afterWorld(){
+    // groupage des vitres par zone (pour le debug + couplages éventuels)
+    for(const p of windowPanes){
+      const z = p.userData && p.userData.zone;
+      if(!z) continue;
+      if(!this.zoneWindows[z]) this.zoneWindows[z]=[];
+      this.zoneWindows[z].push(p);
+    }
+    // reflets dans les flaques : pour chaque flaque, on cherche la lampe à gaz
+    // la plus proche (distance < 11 m) et on pose un sprite émissif allongé,
+    // additif, opacité 0.30 — pseudo-reflet inversé (façon Stray/Dmitriev).
+    const puddles = (typeof window!=='undefined' && window.PUDDLES) || (typeof PUDDLES!=='undefined' ? PUDDLES : []);
+    const wp = new THREE.Vector3();
+    for(const L of gasLamps){
+      L.group.updateWorldMatrix(true,false);
+      // on récupère la pos monde du verre (offset (0.68, 3.7, 0) en local)
+      const pos = new THREE.Vector3(0.68, 3.7, 0);
+      pos.applyMatrix4(L.group.matrixWorld);
+      L.worldPos = pos;
+    }
+    const refTex = this._reflectionTex();
+    for(const pu of puddles){
+      let best=null, bestD=11*11;
+      for(const L of gasLamps){
+        if(!L.worldPos) continue;
+        const dx=L.worldPos.x-pu.x, dz=L.worldPos.z-pu.z;
+        const d2=dx*dx+dz*dz;
+        if(d2 < bestD){ bestD=d2; best=L; }
+      }
+      if(!best) continue;
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: refTex, color: 0xffb45e, transparent:true, opacity:0.0,
+        depthWrite:false, blending:THREE.AdditiveBlending, fog:false,
+      }));
+      // reflet allongé verticalement (inversé sous la lampe), légèrement décalé
+      const dxs = best.worldPos.x - pu.x;
+      const dzs = best.worldPos.z - pu.z;
+      sp.scale.set(Math.max(1.0, pu.r*0.6), Math.max(2.2, pu.r*1.6), 1);
+      sp.position.set(pu.x + dxs*0.3, 0.035, pu.z + dzs*0.3);
+      sp.renderOrder = 1;
+      scene.add(sp);
+      this.puddleReflectors.push({ sprite:sp, lamp:best });
+    }
+  },
+  _reflectionTex(){
+    if(this._refTex) return this._refTex;
+    const c=document.createElement('canvas'); c.width=64; c.height=128;
+    const x=c.getContext('2d');
+    const g=x.createLinearGradient(32, 0, 32, 128);
+    g.addColorStop(0,   'rgba(255,200,120,0.85)');
+    g.addColorStop(0.4, 'rgba(255,170,90,0.40)');
+    g.addColorStop(1,   'rgba(255,150,70,0)');
+    x.fillStyle=g; x.fillRect(0,0,64,128);
+    // bord latéral atténué
+    const gh=x.createRadialGradient(32,64,4,32,64,40);
+    gh.addColorStop(0,'rgba(255,255,255,0)'); gh.addColorStop(1,'rgba(0,0,0,0.55)');
+    x.globalCompositeOperation='destination-out'; x.fillStyle=gh; x.fillRect(0,0,64,128);
+    x.globalCompositeOperation='source-over';
+    return this._refTex = new THREE.CanvasTexture(c);
+  },
+};
+function updateClassLighting(dt){
+  if(!M4.ready) M4.init();
+  if(typeof state==='undefined' || !state) return;
+  const night = Math.max(0, 1 - DayCycle.kDay*1.7);          // 0 jour, 1 nuit
+  // alpha de lissage : ~3 s pour 95% à 60 fps (alpha 0.02/frame ≈ 1.2 par s)
+  const a = Math.min(1, dt*0.4);
+
+  // — entrées simulation (lecture seule, valeurs nulles tolérées) —
+  const profit = state.profitCumule || 0;
+  const SEUIL  = 8000;                                       // calibrage : argent généreux
+  const capitalRaw = Math.max(0, Math.min(1.4, profit/SEUIL));
+  const chomageRaw = Math.max(0, Math.min(1, state.chomage||0));
+  const niveauV    = state.niveauVille || 0;
+  const enclosureRaw = Math.max(0, Math.min(1, niveauV/7));
+  const Q         = (state.d && state.d.Q) || 0;
+  const usineQRaw = Math.max(0, Math.min(1, Q/200));        // ~200 = pleine production
+  const crise     = (state.d && state.d.risqueCrise) || 0;
+
+  // — lissages exponentiels —
+  M4.s_capital   += (capitalRaw   - M4.s_capital)   * a;
+  M4.s_chomage   += (chomageRaw   - M4.s_chomage)   * a;
+  M4.s_enclosure += (enclosureRaw - M4.s_enclosure) * a;
+  M4.s_usineQ    += (usineQRaw    - M4.s_usineQ)    * a;
+  M4.s_crise     += (crise        - M4.s_crise)     * a;
+
+  // a) BOURSE — intensité ∝ capital accumulé (x1 → x2.2). Halo idem.
+  if(M4.zoneFx['Bourse']){ M4.zoneFx['Bourse'].intensity = 1.0 + 1.2 * M4.s_capital; }
+  if(M4.zoneFx['Banque']){ M4.zoneFx['Banque'].intensity = 0.9 + 1.0 * M4.s_capital; }
+
+  // b) QUARTIER OUVRIER — densité décroît avec le chômage (25% → 8%)
+  if(M4.zoneFx['Quartier ouvrier']){
+    M4.zoneFx['Quartier ouvrier'].density = 0.25 - 0.17 * M4.s_chomage;
+    // colère/crise → flicker plus marqué (l'angoisse vacille)
+    M4.zoneFx['Quartier ouvrier'].pulsAmp = 0.10 + 0.20*M4.s_crise;
+  }
+
+  // c) USINE — verrières pulsent + rouges quand la production tourne, presque
+  //    éteintes à l'arrêt.
+  if(M4.zoneFx['Usine']){
+    const fx = M4.zoneFx['Usine'];
+    fx.density   = 0.10 + 0.65 * M4.s_usineQ;                // de 10% à 75% allumées
+    fx.intensity = 0.6 + 1.2 * M4.s_usineQ;
+    fx.pulsHz    = 0.7 + 2.0 * M4.s_usineQ;                  // pulse plus vite à plein régime
+    fx.pulsAmp   = 0.15 + 0.40 * M4.s_usineQ;
+  }
+
+  // d) TERRES COMMUNES — lueur résiduelle s'éteint avec l'enclosure
+  if(M4.zoneFx['Terres communes']){
+    M4.zoneFx['Terres communes'].density = Math.max(0, 0.18 * (1 - M4.s_enclosure));
+  }
+
+  // — PointLights : classFactor multiplie baseI selon le rôle —
+  for(const c of classLights){
+    let f = 1.0;
+    if(c.role === 'gold'){
+      f = 0.85 + 1.10 * M4.s_capital;                        // x0.85 → x1.95
+    } else if(c.role === 'forge'){
+      // usine : pleine production = forge éclatante. mines : plus stable.
+      if(c.zone === 'Usine')      f = 0.30 + 1.40 * M4.s_usineQ;
+      else                        f = 0.85 + 0.30 * M4.s_usineQ;
+    } else if(c.role === 'gas'){
+      f = 1.00;
+    } else if(c.role === 'gas-reserve'){
+      // réserve : Quartier vacille avec colère, Port stable
+      if(c.zone === 'Quartier ouvrier') f = 0.70 - 0.30*M4.s_chomage + 0.20*Math.sin(t*1.4);
+      else                              f = 1.00;
+    }
+    c.light.userData.classFactor = f;
+  }
+
+  // — REFLETS DANS LES FLAQUES — opacité suit la nuit + flicker de la lampe associée.
+  if(!M4.conesOff){
+    for(const r of M4.puddleReflectors){
+      // re-use la phase de flicker de la lampe (même que dans updateWindowGlow)
+      const L = r.lamp;
+      let fl = 1.0;
+      if(!M4.flickerOff){
+        fl = 1 + Math.sin(t*6.4 + L.ph)*0.08 + Math.sin(t*11.3 + L.flickerSeed)*0.04;
+      }
+      r.sprite.material.opacity = night * 0.30 * fl;
+      r.sprite.visible = night > 0.02;
+    }
+  } else {
+    for(const r of M4.puddleReflectors){ r.sprite.visible=false; }
+  }
+}
+
+/* M4 — sélecteur qualité : Basse coupe les cônes, reflets, flicker.
+   PointLights réduites à 4 prioritaires (banque, usine, 2 rues clés). */
+function _applyM4Quality(q){
+  const low = (q === 'low');
+  M4.conesOff = low;
+  M4.flickerOff = low;
+  // coupe les sprites-reflets
+  for(const r of M4.puddleReflectors){ if(low) r.sprite.visible=false; }
+  // PointLights : conserve seulement 4 essentielles en Basse.
+  const KEEP_LOW = new Set(['Bourse', 'Usine', 'rue-centre-ouest', 'rue-centre-est']);
+  for(const c of classLights){
+    if(low) c.light.visible = KEEP_LOW.has(c.zone);
+    else    c.light.visible = true;
+  }
+  // cônes : la visibilité est aussi gérée par updateWindowGlow (M4.conesOff).
+}
+if(typeof window!=='undefined') window._applyM4Quality=_applyM4Quality;
 
 /* M1c — AUDIT ÉMISSIFS. Parcourt la scène, recense les matériaux émissifs
    ou très clairs, calcule une luminance approximative (Rec.709 * intensité)
@@ -5359,31 +5618,99 @@ function _gasTextures(){
   _gasPoolTex=mk([[0,'rgba(255,190,104,0.50)'],[1,'rgba(255,190,104,0)']]);
 }
 const gasLamps=[];
-/* v66 — six VRAIES lumières ponctuelles aux lieux clés, allumées la nuit
-   (distance bornée, decay 2 : coût contenu). Avec le bloom et les émissifs,
-   ce sont elles qui peignent les murs comme dans Stray. */
+/* =====================================================================
+   M4 — LA LUMIÈRE DE CLASSE.
+   Allocation STRICTE de 10 PointLights, 3 températures fixes :
+     • goldLight  0xffd98a (finance)   — Banque, Bourse
+     • forgeLight 0xff5a28 (industrie) — Usine, Mines
+     • gasLight   0xffb45e (rue/commun)— 4 lampadaires clés + 2 réserve scénique
+   Distance bornée, decay 2, pas de chevauchement. Le reste du « néon » est
+   émissif + faux volumes (cônes, halos, reflets dans les flaques).
+   Le tableau nightLights[] héberge les PointLights ; classLights[] indexe
+   par rôle (zone) pour le couplage simulation→lumière.
+   ===================================================================== */
 const nightLights=[];
+const classLights=[];                       // { role, zone, light, baseI, color }
 function buildNightLights(){
-  const SPOTS=[[-72,6,-25],[55,6,-25],[-15,6,30],[0,5,62],[102,6,2],[-10,6,0]];
-  for(const [x,y,z] of SPOTS){
-    const L=new THREE.PointLight(0xffb45e,0,40,2);
-    L.position.set(x,y,z); scene.add(L); nightLights.push(L);
+  const ALLOC=[
+    // role, zone,                 x,    y,  z,  color,          baseI, dist
+    ['gold','Banque',              -72,  7, -22, 0xffd98a,        1.20, 28],
+    ['gold','Bourse',              -72,  8, -56, 0xffd98a,        1.40, 30],
+    ['forge','Usine',              -15,  6,  28, 0xff5a28,        1.50, 30],
+    ['forge','Mines · Champs',    -105,  6, -58, 0xff5a28,        1.20, 28],
+    ['gas','rue-ouest',            -60,  5,   0, 0xffb45e,        0.95, 26],
+    ['gas','rue-centre-ouest',     -20,  5,   0, 0xffb45e,        0.95, 26],
+    ['gas','rue-centre-est',        20,  5,   0, 0xffb45e,        0.95, 26],
+    ['gas','rue-est',               70,  5,   0, 0xffb45e,        0.95, 26],
+    ['gas-reserve','Quartier ouvrier', 0,5,  56, 0xffb45e,        0.85, 24],
+    ['gas-reserve','Port · Marché mondial', 95, 6, 2, 0xffb45e,   0.85, 24],
+  ];
+  for(const [role, zone, x, y, z, color, baseI, dist] of ALLOC){
+    const L=new THREE.PointLight(color, 0, dist, 2);
+    L.position.set(x,y,z);
+    L.userData.role=role;
+    L.userData.zone=zone;
+    L.userData.baseI=baseI;
+    scene.add(L);
+    nightLights.push(L);
+    classLights.push({role, zone, light:L, baseI, color});
   }
 }
+/* createLampPost — lampadaire à gaz : poteau, potence, cage, verre émissif (la
+   FLAMME, qui nourrit le bloom), halo sprite + mare au sol additif, cône de
+   lumière additif sous la lanterne. Tous tracés enregistrés dans gasLamps[]
+   pour que updateWindowGlow / updateClassLighting / _applyM4Quality les pilotent. */
 function createLampPost(){ const g=new THREE.Group(); _gasTextures();
   g.add(box(0.22,4,0.22,COL.fer,0,2,0,false));
   g.add(box(0.9,0.1,0.1,COL.fer,0.34,3.95,0,false));                       // potence
   g.add(box(0.34,0.4,0.34,0x2a241c,0.68,3.7,0,false));                     // cage de la lanterne
-  const glass=new THREE.Mesh(new THREE.SphereGeometry(0.22,8,8),
+  // FLAMME : petit mesh émissif dans la cage. emissiveIntensity piloté par updateWindowGlow.
+  const flame=new THREE.Mesh(new THREE.SphereGeometry(0.22,8,8),
     new THREE.MeshStandardMaterial({color:0xffe6ad,emissive:0xffb347,emissiveIntensity:.6,flatShading:true}));
-  glass.position.set(0.68,3.7,0); g.add(glass); g.userData.lamp=glass;
+  flame.position.set(0.68,3.7,0); g.add(flame); g.userData.lamp=flame;
+  // halo sprite (additif via blending, ici opacité simple)
   const halo=new THREE.Sprite(new THREE.SpriteMaterial({map:_gasHaloTex,transparent:true,
     opacity:0,depthWrite:false}));
   halo.scale.set(3.6,3.6,1); halo.position.set(0.68,3.7,0); g.add(halo);
+  // mare au sol
   const pool=new THREE.Mesh(new THREE.PlaneGeometry(7,7),
     new THREE.MeshBasicMaterial({map:_gasPoolTex,transparent:true,opacity:0,depthWrite:false}));
   pool.rotation.x=-Math.PI/2; pool.position.set(0.68,0.035,0); g.add(pool);
-  gasLamps.push({halo,pool,ph:Math.random()*6.28});
+  // M4 — FAUX CÔNE de lumière sous la lanterne : ConeGeometry ouverte,
+  // MeshBasicMaterial additif, dégradé d'opacité (0.16 en haut → 0 en bas) via
+  // une atténuation par vertex colors. On garde une géométrie simple.
+  const coneH=3.55, coneR=2.0;
+  const cgeo=new THREE.ConeGeometry(coneR, coneH, 12, 1, true);     // ouvert
+  // vertex colors : pleine opacité au sommet (apex), 0 à la base
+  const pos=cgeo.attributes.position;
+  const colors=new Float32Array(pos.count*3);
+  for(let i=0;i<pos.count;i++){
+    const y=pos.getY(i);
+    // y va de +coneH/2 (apex) à -coneH/2 (base ouverte)
+    const t=(y + coneH/2)/coneH;                 // 0 base → 1 apex
+    colors[i*3]=colors[i*3+1]=colors[i*3+2]=t*t; // grad quadratique
+  }
+  cgeo.setAttribute('color', new THREE.BufferAttribute(colors,3));
+  const cmat=new THREE.MeshBasicMaterial({
+    color:0xffb45e, transparent:true, opacity:0.16,
+    depthWrite:false, blending:THREE.AdditiveBlending,
+    side:THREE.DoubleSide, vertexColors:true,
+    fog:false,
+  });
+  const cone=new THREE.Mesh(cgeo, cmat);
+  // apex en haut (sous la flamme), base en bas (au sol). Cône natif a apex en +Y.
+  cone.position.set(0.68, 3.7 - coneH/2, 0);
+  cone.renderOrder=-1;
+  g.add(cone);
+  // entrée gasLamps : halo, pool, flame, cône, phase de flicker (sin bruité ±8%)
+  gasLamps.push({
+    halo, pool, flame, cone,
+    ph: Math.random()*6.28,
+    flickerSeed: Math.random()*100,
+    group: g,
+    // worldPos sera renseigné après attachement à la scène (M4.afterWorld)
+    worldPos: null,
+  });
   return g; }
 function createFenceSegment(len=4){ const g=new THREE.Group();
   g.add(box(0.15,1.1,0.15,COL.brun,-len/2,0.55,0,false)); g.add(box(0.15,1.1,0.15,COL.brun,len/2,0.55,0,false));
@@ -5651,6 +5978,8 @@ function applyRenderQuality(q){
   // M2 — fumées de skyline, godrays, voile doré, nuages : OFF en Basse.
   // Dôme + skyline + soleil conservés (forme du ciel inchangée).
   if(typeof _applyM2Quality === 'function') _applyM2Quality(q);
+  // M4 — cônes, reflets, flicker : OFF en Basse. PointLights réduites à 4.
+  if(typeof _applyM4Quality === 'function') _applyM4Quality(q);
   // M1b — log lisible pour valider que les 3 niveaux produisent des configs
   // distinctes. Une seule ligne par changement, à la console.
   console.info('[M1] render quality =', q,
@@ -8691,7 +9020,8 @@ function loop(){
   CityGrowth.updateRails(dt);         // v54 : wagon navette usines -> port
   WorldBeauty.update(dt);             // v56 : nuages, oiseaux, tangage des bateaux
   DayCycle.update();                  // v57 : la lumière du jour respire
-  updateWindowGlow();                 // v62 : les fenêtres de la ville s'allument la nuit
+  updateClassLighting(dt);            // M4 : sim → facteurs lissés (avant le rendu des vitres)
+  updateWindowGlow();                 // v62 + M4 : fenêtres + lampes + cônes
   Atmosphere.update(dt);              // v58 : brume + position du soleil
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
   updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
