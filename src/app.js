@@ -819,7 +819,7 @@ function buildWorld(){
   defineZone('État · Tribunal',             -8,-60, COL.vert,   '',    buildEtat);
   defineZone('Usine',                      -15, 30, COL.charbon,'P',   buildUsine);
   defineZone('Entrepôt',                    18, 32, COL.brun,   'M′',  buildEntrepot);
-  defineZone('Quartier ouvrier',             0, 62, COL.froid,  '',    buildQuartier);
+  defineZone('Quartier ouvrier',             0, 62, COL.froid,  '',    buildQuartierSystem);
   defineZone('Port · Marché mondial',      102,  2, COL.bleu,   '',    buildPort);
 
   buildMainStreet();   // v52 : la grand-rue, épine dorsale visible dès le premier instant
@@ -2383,44 +2383,423 @@ function createLaundryLine(len=3.5, height=3.8){
   return g;
 }
 
-function buildQuartier(g){            // QUARTIER OUVRIER — maisons étroites serrées, décrépit
-  // ALIGNEMENT serré (front à la rue) — 6 maisons collées en rangée
-  // empreinte de zone : ±9. On compose 3 rangées de 2.
-  const layouts=[
-    // [x, z, w, h, d, tone, rot]
-    [-6.0, -3.0, 2.8, 5.5, 3.0, 0x3d4a5c, 0.05],
-    [-3.0, -3.0, 2.4, 6.5, 3.0, 0x344151, 0],
-    [ 0.0, -3.0, 2.8, 5.2, 3.0, 0x4a5462, -0.02],
-    [ 3.0, -3.0, 2.4, 6.0, 3.0, 0x3a4654, 0],
-    [ 6.0, -3.0, 2.6, 5.8, 3.0, 0x3d4a5c, 0.03],
-    [-6.0,  2.0, 2.6, 5.0, 3.0, 0x4a5462, 0.05],
-    [-3.0,  2.0, 2.4, 6.2, 3.0, 0x344151, 0],
-    [ 0.0,  2.0, 2.8, 5.5, 3.0, 0x3d4a5c, 0],
-    [ 3.0,  2.0, 2.6, 5.8, 3.0, 0x3a4654, 0.04],
-    [ 6.0,  2.0, 2.4, 6.0, 3.0, 0x4a5462, 0],
-  ];
-  for(const [x,z,w,h,d,tone,rot] of layouts){
-    const house=createTenementHouse(w, h, d, tone);
-    house.position.set(x, 0, z); house.rotation.y=rot;
-    g.add(house);
+/* =====================================================================
+   M-QUARTIER — QUARTIER OUVRIER EXTENSIBLE.
+   Le quartier n'est plus un bâtiment unique : c'est un SYSTÈME urbain
+   qui s'étend et se densifie avec l'accumulation du capital.
+   Sens : la prolétarisation rendue spatiale.
+
+   Architecture :
+   - 4 gabarits de maisons (taille + tonalité + hauteur). Chaque gabarit
+     a 3 InstancedMesh (corps, plinthe, toit) avec count = slots de ce
+     gabarit dont level ≤ quartierLevel.
+   - Doors, chimneys, fenêtres (lit + dark) en InstancedMesh partagés.
+   - Détails (linge, pavé, lampadaires, pompe) en Group avec level seuil.
+   - quartierLevel ∈ [0,5] dérivé de la simulation (profitCumule, cycle,
+     niveauVille) : niveau 0 = 3 masures éparses, niveau 5 = trame
+     dense de ruelles mitoyennes.
+   - updateQuartier(dt) ne fait QUE des écritures de .count et .visible.
+     ZÉRO allocation par frame.
+   ===================================================================== */
+const Quartier = {
+  built:false, level:-1,
+  bodyIM:[], plinthIM:[], roofIM:[],        // [variant] → InstancedMesh
+  doorIM:null, chimIM:null,
+  winLitIM:null, winDarkIM:null,
+  litMat:null,                              // material des fenêtres allumées (pour DayCycle gating)
+  details:[],                               // [{ obj, level }]
+  anchorObj:null,                           // maison principale (ancre d'interaction)
+  perVariantCountByLevel:[],
+  totalCountByLevel:[],
+  doorCountByLevel:[], chimCountByLevel:[],
+  winLitCountByLevel:[], winDarkCountByLevel:[],
+};
+function _M_Q_layout(){
+  // Retourne la liste des SLOTS (positions + variant + level seuil),
+  // triée par level ASC pour que setCount progressif révèle les premiers.
+  // Emprise locale (zone Group à world (0, 62)) : x ∈ [-22, 22], z ∈ [-22, 28].
+  const slots=[];
+  // Helper d'ajout
+  const add=(x, z, rot, variant, level)=>slots.push({x, z, rot, variant, level});
+
+  // ====== LEVEL 0 — 3 masures éparses (le hameau d'origine) ======
+  add(-4, -2, 0.20, 0, 0);
+  add(3, 3, -0.10, 3, 0);
+  add(-7, 6, 0.05, 1, 0);
+
+  // ====== LEVEL 1 — ruelle principale nord-sud (alley centre), 8 maisons ======
+  // ruelle au centre x=0. Rangée ouest x=-3.5 face EST. Rangée est x=+3.5 face OUEST.
+  for(let i=0;i<4;i++){
+    const z=-7 + i*3.2;
+    add(-3.5, z, Math.PI/2,     (i%4),       1);   // face vers +X (alley)
+    add( 3.5, z, -Math.PI/2,    ((i+2)%4),   1);   // face vers -X
   }
-  // LINGE TENDU entre 2 maisons (façade ouest)
-  const laundry1=createLaundryLine(2.6, 3.5); laundry1.position.set(-4.5, 0, -1.5); g.add(laundry1);
-  const laundry2=createLaundryLine(2.6, 3.5); laundry2.position.set(1.5, 0, -1.5); g.add(laundry2);
-  const laundry3=createLaundryLine(2.6, 3.0); laundry3.position.set(-4.5, 0, 4.5); g.add(laundry3);
 
-  // RUELLE pavée centrale (sombre)
+  // ====== LEVEL 2 — ruelle ouest x=-12, 6 maisons ======
+  for(let i=0;i<3;i++){
+    const z=-6 + i*3.4;
+    add(-15.5, z, Math.PI/2,    ((i+1)%4),   2);
+    add(-8.5,  z, -Math.PI/2,   ((i+3)%4),   2);
+  }
+
+  // ====== LEVEL 3 — ruelle est x=+12, 6 maisons ======
+  for(let i=0;i<3;i++){
+    const z=-6 + i*3.4;
+    add( 8.5,  z, Math.PI/2,    ((i+2)%4),   3);
+    add( 15.5, z, -Math.PI/2,   ((i+1)%4),   3);
+  }
+
+  // ====== LEVEL 4 — extension SUD de la ruelle centrale, 6 maisons ======
+  for(let i=0;i<3;i++){
+    const z=8 + i*3.2;
+    add(-3.5, z, Math.PI/2,     ((i+1)%4), 4);
+    add( 3.5, z, -Math.PI/2,    ((i+3)%4), 4);
+  }
+
+  // ====== LEVEL 5 — bloc final SE + ruelle perpendiculaire, 6 maisons ======
+  for(let i=0;i<3;i++){
+    const z=18 + i*3.2;
+    add(-3.5, z, Math.PI/2,     ((i+2)%4), 5);
+    add( 3.5, z, -Math.PI/2,    ((i+1)%4), 5);
+  }
+
+  // Tri par level ASC (essentiel pour InstancedMesh.count progressif).
+  slots.sort((a,b)=>a.level - b.level);
+  return slots;
+}
+function _M_Q_pitchedRoofGeo(w, d, rise){
+  // Toit en bâtière fermé construit à la main en UN SEUL BufferGeometry
+  // pour pouvoir l'instancier. Forme de "tente" :
+  //   6 sommets : 4 angles bas (rectangle) + 2 sommets de faîtage (ligne).
+  //   Faces : 2 pans inclinés + 2 pignons triangulaires.
+  // mergeGeometries refuse BoxGeometry+ExtrudeGeometry (attributs UV
+  // incompatibles), d'où cette construction manuelle.
+  const W=w/2, D=d/2;
+  const verts=[
+    // 0: BBL (bottom-back-left, -X, y=0, -Z)
+    -W, 0, -D,
+    // 1: BBR (+X, -Z)
+     W, 0, -D,
+    // 2: BFR (+X, +Z)
+     W, 0,  D,
+    // 3: BFL (-X, +Z)
+    -W, 0,  D,
+    // 4: RB (ridge-back)
+     0, rise, -D,
+    // 5: RF (ridge-front)
+     0, rise,  D,
+  ];
+  // UV plaqués naïvement (pas de tuilage critique pour un toit foncé)
+  const uvs=[
+    0, 0,   1, 0,   1, 1,   0, 1,
+    0.5, 1, 0.5, 1,
+  ];
+  const indices=[
+    // pan ouest (sommets 0, 3, 5, 4) — 2 triangles, winding CCW vue dessus
+    0, 3, 5,   0, 5, 4,
+    // pan est (sommets 1, 4, 5, 2)
+    1, 4, 5,   1, 5, 2,
+    // pignon arrière (0, 1, 4) — face -Z
+    0, 4, 1,
+    // pignon avant (3, 2, 5) — face +Z
+    3, 5, 2,
+  ];
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+function buildQuartierSystem(g){
+  if(Quartier.built) return;
+  Quartier.built=true;
+
+  // ----- matériaux partagés -----
+  const brique=briqueTexture('decrep');
+  const VARIANTS=[
+    { w:2.4, h:4.2, d:2.8, tone:0x3d4a5c },   // basse étroite
+    { w:2.6, h:5.0, d:3.0, tone:0x344151 },   // standard
+    { w:2.8, h:5.8, d:3.2, tone:0x4a5462 },   // haute
+    { w:3.0, h:4.6, d:3.4, tone:0x3a4654 },   // large basse
+  ];
+  const matToit=new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true});
+  const matPlinthe=new THREE.MeshStandardMaterial({color:0x2a241d, roughness:0.95, metalness:0, flatShading:true});
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x14181f, roughness:0.5, metalness:0.7, flatShading:true});
+  const matBrique=new THREE.MeshStandardMaterial({color:0x4a2620, map:brique.map, roughnessMap:brique.roughnessMap, roughness:1.0, metalness:0});
+
+  // ----- layout & buckets par gabarit -----
+  const slots=_M_Q_layout();
+  const byVariant=[[],[],[],[]];
+  for(const s of slots) byVariant[s.variant].push(s);
+  // Tri intra-variant par level ASC pour pouvoir révéler progressivement
+  // via .count = perVariantCountByLevel[v][lvl].
+  for(const arr of byVariant) arr.sort((a,b)=>a.level - b.level);
+
+  const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3(1,1,1);
+
+  // ----- pour chaque gabarit : corps, plinthe, toit en InstancedMesh -----
+  for(let v=0; v<VARIANTS.length; v++){
+    const cfg=VARIANTS[v];
+    const list=byVariant[v];
+    if(!list.length){ Quartier.bodyIM[v]=null; Quartier.plinthIM[v]=null; Quartier.roofIM[v]=null; continue; }
+
+    // CORPS — brique décrépie, tonalité par variant
+    const bodyMat=new THREE.MeshStandardMaterial({
+      color:cfg.tone, map:brique.map, roughnessMap:brique.roughnessMap,
+      roughness:1.0, metalness:0,
+    });
+    const bodyGeo=new THREE.BoxGeometry(cfg.w, cfg.h, cfg.d);
+    const body=new THREE.InstancedMesh(bodyGeo, bodyMat, list.length);
+    body.castShadow=true; body.receiveShadow=true;
+    list.forEach((s,i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+      P.set(s.x, cfg.h/2 + 0.30, s.z);
+      M.compose(P, Q, S); body.setMatrixAt(i, M);
+    });
+    body.instanceMatrix.needsUpdate=true;
+    body.userData.maxCount=list.length;
+    g.add(body); Quartier.bodyIM[v]=body;
+
+    // PLINTHE débordante
+    const plinthGeo=new THREE.BoxGeometry(cfg.w+0.20, 0.40, cfg.d+0.20);
+    const plinth=new THREE.InstancedMesh(plinthGeo, matPlinthe, list.length);
+    plinth.castShadow=true; plinth.receiveShadow=true;
+    list.forEach((s,i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+      P.set(s.x, 0.20, s.z);
+      M.compose(P, Q, S); plinth.setMatrixAt(i, M);
+    });
+    plinth.instanceMatrix.needsUpdate=true;
+    g.add(plinth); Quartier.plinthIM[v]=plinth;
+
+    // TOIT pitched fermé (geometrie pré-mergée)
+    const roofGeo=_M_Q_pitchedRoofGeo(cfg.w+0.4, cfg.d+0.4, 0.8);
+    const roof=new THREE.InstancedMesh(roofGeo, matToit, list.length);
+    roof.castShadow=true; roof.receiveShadow=true;
+    list.forEach((s,i)=>{
+      Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+      P.set(s.x, cfg.h + 0.30, s.z);
+      M.compose(P, Q, S); roof.setMatrixAt(i, M);
+    });
+    roof.instanceMatrix.needsUpdate=true;
+    g.add(roof); Quartier.roofIM[v]=roof;
+  }
+
+  // ----- PORTES (geometrie partagée), 1 par slot, placée au pied face avant -----
+  const doorGeo=new THREE.BoxGeometry(0.70, 1.50, 0.08);
+  const door=new THREE.InstancedMesh(doorGeo, matBois, slots.length);
+  door.castShadow=false; door.receiveShadow=true;
+  slots.forEach((s,i)=>{
+    const cfg=VARIANTS[s.variant];
+    // face avant = +Z LOCAL avant rotation. Décalée à d/2 - 0.05.
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+    const localFront=new THREE.Vector3(0, 0.85, cfg.d/2 + 0.05);
+    localFront.applyQuaternion(Q);
+    P.set(s.x + localFront.x, 0.30 + 0.75, s.z + localFront.z);
+    M.compose(P, Q, S); door.setMatrixAt(i, M);
+  });
+  door.instanceMatrix.needsUpdate=true;
+  g.add(door); Quartier.doorIM=door;
+
+  // ----- CHEMINÉES (geometrie partagée) -----
+  const chimGeo=new THREE.BoxGeometry(0.45, 1.20, 0.45);
+  const chim=new THREE.InstancedMesh(chimGeo, matBrique, slots.length);
+  chim.castShadow=true; chim.receiveShadow=true;
+  slots.forEach((s,i)=>{
+    const cfg=VARIANTS[s.variant];
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+    const localOffset=new THREE.Vector3(cfg.w*0.30, cfg.h + 0.30 + 0.95, -cfg.d*0.20);
+    localOffset.applyQuaternion(Q);
+    P.set(s.x + localOffset.x, localOffset.y, s.z + localOffset.z);
+    M.compose(P, Q, S); chim.setMatrixAt(i, M);
+  });
+  chim.instanceMatrix.needsUpdate=true;
+  g.add(chim); Quartier.chimIM=chim;
+
+  // ----- FENÊTRES ALLUMÉES (M4 — gasLight) — 2 par maison face avant -----
+  //   Material partagé, emissiveIntensity pilotée par updateQuartier
+  //   (gating night × densité ; pas de M4 windowPanes individuels).
+  Quartier.litMat=new THREE.MeshStandardMaterial({
+    color:0x33414c, emissive:new THREE.Color(COLORSCRIPT.gasLight),
+    emissiveIntensity:0.0, roughness:0.7, metalness:0, flatShading:true,
+  });
+  const winGeo=new THREE.BoxGeometry(0.50, 0.65, 0.05);
+  // Une fenêtre allumée par slot, face avant étage haut.
+  const winLit=new THREE.InstancedMesh(winGeo, Quartier.litMat, slots.length);
+  winLit.castShadow=false; winLit.receiveShadow=false;
+  slots.forEach((s,i)=>{
+    const cfg=VARIANTS[s.variant];
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+    // étage haut, légèrement décalée à gauche
+    const localOffset=new THREE.Vector3(-cfg.w*0.20, 0.30 + cfg.h*0.65, cfg.d/2 + 0.04);
+    localOffset.applyQuaternion(Q);
+    P.set(s.x + localOffset.x, localOffset.y, s.z + localOffset.z);
+    M.compose(P, Q, S); winLit.setMatrixAt(i, M);
+  });
+  winLit.instanceMatrix.needsUpdate=true;
+  g.add(winLit); Quartier.winLitIM=winLit;
+
+  // ----- FENÊTRES SOMBRES (3 par maison : 1 front rdc + 1 arrière + 1 côté) -----
+  const matWinDark=new THREE.MeshStandardMaterial({
+    color:0x12161c, roughness:0.7, metalness:0.1, flatShading:true,
+  });
+  const winDarkCount=slots.length * 3;
+  const winDark=new THREE.InstancedMesh(winGeo, matWinDark, winDarkCount);
+  winDark.castShadow=false; winDark.receiveShadow=false;
+  let wi=0;
+  // Pour rester aligné sur le tri par level, on construit ENTRELACÉ : pour
+  // chaque slot dans l'ordre, on ajoute ses 3 fenêtres dark.
+  slots.forEach((s)=>{
+    const cfg=VARIANTS[s.variant];
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);
+    // fenêtre rdc front (décalée droite)
+    let lo=new THREE.Vector3(cfg.w*0.20, 0.30 + 1.6, cfg.d/2 + 0.04);
+    lo.applyQuaternion(Q);
+    P.set(s.x + lo.x, lo.y, s.z + lo.z); M.compose(P, Q, S); winDark.setMatrixAt(wi++, M);
+    // arrière
+    lo.set(0, 0.30 + cfg.h*0.50, -cfg.d/2 - 0.04); lo.applyQuaternion(Q);
+    P.set(s.x + lo.x, lo.y, s.z + lo.z); M.compose(P, Q, S); winDark.setMatrixAt(wi++, M);
+    // côté
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot - Math.PI/2);
+    lo.set(0, 0.30 + cfg.h*0.50, cfg.w/2 + 0.04); lo.applyQuaternion(Q);
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot);   // restore Q
+    P.set(s.x + lo.x, lo.y, s.z + lo.z);
+    // recalcule rotation pour la fenêtre côté
+    const Qside=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), s.rot + Math.PI/2);
+    M.compose(P, Qside, S); winDark.setMatrixAt(wi++, M);
+  });
+  winDark.instanceMatrix.needsUpdate=true;
+  g.add(winDark); Quartier.winDarkIM=winDark;
+
+  // ----- PAVÉ DES RUELLES (paneaux séparés, visibilité par level) -----
   const pave=paveTexture(0);
-  pave.map.repeat.set(2.5, 0.5); pave.roughnessMap.repeat.set(2.5, 0.5);
-  const ruelle=new THREE.Mesh(new THREE.PlaneGeometry(18, 1.6),
-    new THREE.MeshStandardMaterial({color:0x55473a, map:pave.map, roughnessMap:pave.roughnessMap, roughness:1.0, metalness:0}));
-  ruelle.rotation.x=-Math.PI/2; ruelle.position.set(0, 0.02, -0.5);
-  ruelle.receiveShadow=true; g.add(ruelle);
+  pave.map.repeat.set(3, 1); pave.roughnessMap.repeat.set(3, 1);
+  const matPave=new THREE.MeshStandardMaterial({
+    color:0x55473a, map:pave.map, roughnessMap:pave.roughnessMap, roughness:1.0, metalness:0,
+  });
+  const addRuelle=(x, z, w, d, level)=>{
+    const r=new THREE.Mesh(new THREE.PlaneGeometry(w, d), matPave);
+    r.rotation.x=-Math.PI/2; r.position.set(x, 0.02, z); r.receiveShadow=true;
+    g.add(r); Quartier.details.push({obj:r, level});
+  };
+  addRuelle(0, 0, 2.8, 18, 1);                   // ruelle centrale
+  addRuelle(-12, 0, 2.8, 14, 2);                  // ruelle ouest
+  addRuelle(12, 0, 2.8, 14, 3);                   // ruelle est
+  addRuelle(0, 14, 2.8, 12, 4);                   // extension sud
+  addRuelle(0, 22, 2.8, 8, 5);                    // dernier tronçon
+  // ruelle perpendiculaire (relie centrale → est/ouest)
+  addRuelle(0, -10, 28, 2.4, 3);
 
-  // LAMPADAIRE + BANC (existants)
-  const lamp=createLampPost(); lamp.position.set(7, 0, -0.5); g.add(lamp);
-  g.add(_M5_box(2.4, 0.40, 0.7, new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true}),
-    -7, 0.20, -0.5));
+  // ----- LINGE TENDU dans la ruelle centrale (level 2+) -----
+  for(let i=0;i<3;i++){
+    const lin=createLaundryLine(2.6, 3.5);
+    lin.position.set(0, 0, -4 + i*4.0);
+    g.add(lin); Quartier.details.push({obj:lin, level:2});
+  }
+  for(let i=0;i<2;i++){
+    const lin=createLaundryLine(2.6, 3.2);
+    lin.position.set(-12, 0, -3 + i*5.0);
+    g.add(lin); Quartier.details.push({obj:lin, level:3});
+  }
+
+  // ----- POMPE COMMUNE (level 2) -----
+  const pompe=new THREE.Group();
+  const base=new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.18, 0.6), matFer);
+  base.position.y=0.09; pompe.add(base);
+  const fut=new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.12, 1.20, 8), matFer);
+  fut.position.y=0.78; pompe.add(fut);
+  const bec=new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.10, 0.10), matFer);
+  bec.position.set(0.17, 1.20, 0); pompe.add(bec);
+  const levier=new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 0.06), matFer);
+  levier.position.set(-0.20, 1.50, 0); pompe.add(levier);
+  pompe.position.set(0, 0, 0);
+  g.add(pompe); Quartier.details.push({obj:pompe, level:2});
+
+  // ----- LAMPADAIRES DE RUELLE (cohérents M4) -----
+  // 2 lampadaires niveau 1, +2 niveau 3, +1 niveau 5
+  const lampPositions=[
+    [0, -8, 1], [0, 8, 1],
+    [-12, -4, 3], [12, -4, 3],
+    [0, 20, 5],
+  ];
+  for(const [lx, lz, lvl] of lampPositions){
+    const lp=createLampPost(); lp.position.set(lx, 0, lz);
+    g.add(lp); Quartier.details.push({obj:lp, level:lvl});
+  }
+
+  // ----- BANC près de la ruelle centrale (level 1) -----
+  const banc=new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.40, 0.7), matBois);
+  banc.position.set(-2.5, 0.20, -10); banc.castShadow=true;
+  g.add(banc); Quartier.details.push({obj:banc, level:1});
+
+  // ----- COMPUTE COUNTS BY LEVEL (clé : zéro alloc en update) -----
+  Quartier.perVariantCountByLevel=[];
+  for(let v=0; v<4; v++){
+    const arr=byVariant[v];
+    const cnts=[0,0,0,0,0,0];
+    for(let lvl=0; lvl<=5; lvl++){
+      cnts[lvl]=arr.filter(s=>s.level<=lvl).length;
+    }
+    Quartier.perVariantCountByLevel[v]=cnts;
+  }
+  const totalCnt=[0,0,0,0,0,0];
+  for(let lvl=0; lvl<=5; lvl++) totalCnt[lvl]=slots.filter(s=>s.level<=lvl).length;
+  Quartier.totalCountByLevel=totalCnt;
+  Quartier.doorCountByLevel=totalCnt;
+  Quartier.chimCountByLevel=totalCnt;
+  Quartier.winLitCountByLevel=totalCnt;
+  // winDark = 3 par slot
+  Quartier.winDarkCountByLevel=totalCnt.map(c=>c*3);
+
+  // ----- ANCRE D'INTERACTION (la maison principale, ouest centre) -----
+  // Trouve le slot le plus proche de l'origine — c'est celui qu'on désigne
+  // comme « entrée » du quartier pour le gameplay.
+  Quartier.anchorObj={position:new THREE.Vector3(slots[0].x, 0.30, slots[0].z)};
+
+  // Visibilité initiale = niveau 0 (3 masures éparses).
+  updateQuartier(0);
+}
+function _computeQuartierLevel(){
+  if(typeof state==='undefined' || !state) return 0;
+  const pc=state.profitCumule || 0;
+  const nv=state.niveauVille || 0;
+  const cy=state.cycle || 0;
+  // Plusieurs sources convergent : max des contributions, capé à 5.
+  return Math.min(5, Math.max(
+    Math.floor(nv * 0.85),         // niveauVille 7 → 5.95 → 5
+    Math.floor(pc / 1500),         // 7500 profit → 5
+    Math.floor(cy / 3)             // 15 cycles → 5
+  ));
+}
+function updateQuartier(dt){
+  if(!Quartier.built) return;
+  const lvl=_computeQuartierLevel();
+  if(lvl !== Quartier.level){
+    Quartier.level=lvl;
+    // Variants — count = nombre de slots de ce variant avec level ≤ lvl.
+    for(let v=0; v<4; v++){
+      const cnt=(Quartier.perVariantCountByLevel[v] && Quartier.perVariantCountByLevel[v][lvl]) || 0;
+      if(Quartier.bodyIM[v])   Quartier.bodyIM[v].count   = cnt;
+      if(Quartier.plinthIM[v]) Quartier.plinthIM[v].count = cnt;
+      if(Quartier.roofIM[v])   Quartier.roofIM[v].count   = cnt;
+    }
+    if(Quartier.doorIM)    Quartier.doorIM.count    = Quartier.doorCountByLevel[lvl];
+    if(Quartier.chimIM)    Quartier.chimIM.count    = Quartier.chimCountByLevel[lvl];
+    if(Quartier.winLitIM)  Quartier.winLitIM.count  = Quartier.winLitCountByLevel[lvl];
+    if(Quartier.winDarkIM) Quartier.winDarkIM.count = Quartier.winDarkCountByLevel[lvl];
+    for(const d of Quartier.details) d.obj.visible = d.level <= lvl;
+  }
+  // Fenêtres allumées : intensité pilotée par DayCycle.kDay + chômage M4.
+  if(Quartier.litMat){
+    const night=Math.max(0, 1 - (DayCycle.kDay || 1) * 1.7);
+    const chom=(M4 && M4.s_chomage) ? M4.s_chomage : 0;
+    // densité décroît avec chômage : on simule en dimmant les fenêtres allumées
+    // (au lieu d'allumer/éteindre par instance — InstancedMesh partage le material).
+    const densityK=1.0 - chom*0.6;
+    Quartier.litMat.emissiveIntensity = night * 1.5 * densityK;
+  }
 }
 
 function buildMarcheMP(g){            // HALLE BALTARD — fer + verre + colonnes fonte
@@ -12790,6 +13169,7 @@ function loop(){
   CityGrowth.updateRails(dt);         // v54 : wagon navette usines -> port
   WorldBeauty.update(dt);             // v56 : nuages, oiseaux, tangage des bateaux
   DayCycle.update(dt);                // v57/M7 : avance timeOfDay + sun/moon via SunState
+  updateQuartier(dt);                 // M-Quartier : niveaux d'extension du quartier ouvrier
   updateClassLighting(dt);            // M4 : sim → facteurs lissés (avant le rendu des vitres)
   updateWindowGlow();                 // v62 + M4 : fenêtres + lampes + cônes
   Atmosphere.update(dt);              // v58 : brume + position du soleil
