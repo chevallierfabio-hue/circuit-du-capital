@@ -767,8 +767,16 @@ function buildWorld(){
   // lumières — M1 : ciel bleu froid / sol terre encre, intensité abaissée
   // pour laisser l'IBL (ENV_INTENSITY=0.7) faire le gros de l'ambiance.
   // r128 → r16x : intensités multipliées par π (cf. en-tête, LIGHT_GAIN).
-  hemiLight=new THREE.HemisphereLight(0x6b7a9c, 0x2e2820, physI(0.45)); scene.add(hemiLight);
+  // M7 — sol nocturne légèrement réchauffé : groundColor de hemi tiré vers
+  // 0x35251a (brun foncé) au lieu de 0x2e2820 — restitue la chaleur résiduelle
+  // de la ville/réverbères dans le ciel renvoyé au sol.
+  hemiLight=new THREE.HemisphereLight(0x6b7a9c, 0x35251a, physI(0.45)); scene.add(hemiLight);
   scene.add(new THREE.AmbientLight(0xb9a884, physI(.22)));
+  // M7 — moonAmbient : floor warm subtil activé UNIQUEMENT la nuit.
+  // Réveille les zones non éclairées en les amenant juste au-dessus du noir
+  // (0x14110c env. après intégration) sans casser le contraste ni nourrir
+  // le bloom (couleur très sombre + intensité basse).
+  nightAmbient=new THREE.AmbientLight(0x24180e, 0); scene.add(nightAmbient);
   sunLight=new THREE.DirectionalLight(COLORSCRIPT.sunColor, physI(0.85));
   sunLight.position.set(58,72,42); sunLight.castShadow=true;
   sunLight.shadow.mapSize.set(2048,2048); sunLight.shadow.bias=-0.0004;
@@ -8727,6 +8735,7 @@ function createConeMarker(){ const g=new THREE.Group();
 /* --- peuplement --- */
 let envGroup=null, envProps=[], kickProps=[], envLamps=[], envGears=[], envReady=false;
 let sunLight=null, hemiLight=null;   // v57 : poignées du cycle de lumière
+let nightAmbient=null;               // M7 : floor warm nocturne (sol lisible la nuit)
 let composer=null, bloomPass=null, gradePass=null;   // v66/M1 : bloom + GradePass (null si bypass)
 
 /* M1 — GradeShader : ShaderPass terminal, trois effets dans un seul shader.
@@ -11509,15 +11518,15 @@ const DayCycle={
      d'encre lavée, jouable : la lumière lunaire garde des ombres lisibles. */
   PERIOD:420, lampBoost:0.6, kDay:1,
   STOPS:[
-    {p:0.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit d'encre bleue (lune)
-    {p:0.07, el:0.12, az: 1.15, sunC:0xffb27a, sunI:0.50, hemC:0xb9a48c, hemI:0.46, fog:0xc9a98c, top:0x7d8fb0, lamp:1.2, k:0.30}, // aurore
+    {p:0.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit (M7 : hemI 0.32→0.46)
+    {p:0.07, el:0.12, az: 1.15, sunC:0xffb27a, sunI:0.50, hemC:0xb9a48c, hemI:0.50, fog:0xc9a98c, top:0x7d8fb0, lamp:1.2, k:0.30}, // aurore
     {p:0.14, el:0.45, az: 0.95, sunC:0xffd9a4, sunI:0.95, hemC:0xe8d8b8, hemI:0.68, fog:0xd2bd92, top:0x9bb0c8, lamp:0.6, k:0.80}, // matin
     {p:0.40, el:0.95, az: 0.35, sunC:0xfff1d4, sunI:1.12, hemC:0xefe2c6, hemI:0.78, fog:0xcbbd9a, top:0x7fb0d4, lamp:0.35,k:1.00}, // midi
     {p:0.62, el:0.60, az:-0.55, sunC:0xffe2b0, sunI:1.00, hemC:0xead9b4, hemI:0.70, fog:0xcfbd96, top:0x8fb0c8, lamp:0.5, k:0.90}, // après-midi
     {p:0.72, el:0.30, az:-0.95, sunC:0xffc98e, sunI:0.85, hemC:0xe2c9a2, hemI:0.62, fog:0xd2b88c, top:0x9bb0c8, lamp:0.9, k:0.60}, // heure dorée
-    {p:0.80, el:0.08, az:-1.15, sunC:0xff7d4a, sunI:0.50, hemC:0xb08a78, hemI:0.42, fog:0xc07a52, top:0x4c5a86, lamp:1.3, k:0.25}, // crépuscule embrasé
-    {p:0.88, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit tombée
-    {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.32, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // boucle
+    {p:0.80, el:0.08, az:-1.15, sunC:0xff7d4a, sunI:0.50, hemC:0xb08a78, hemI:0.48, fog:0xc07a52, top:0x4c5a86, lamp:1.3, k:0.25}, // crépuscule (M7 : 0.42→0.48)
+    {p:0.88, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit (M7)
+    {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // boucle (M7)
   ],
   _cA:null,_cB:null,
   phase(){ return ((t/this.PERIOD)+0.22)%1; },          // la partie commence en fin de matinée
@@ -11536,6 +11545,11 @@ const DayCycle={
     this._mixColor(sunLight.color, a.sunC, b.sunC, u);
     if(hemiLight){ hemiLight.intensity=physI(a.hemI+(b.hemI-a.hemI)*u);
       this._mixColor(hemiLight.color, a.hemC, b.hemC, u); }
+    // M7 — moonAmbient : intensité ∝ (1 - kDay), pic à 0.16 la nuit, 0 le jour.
+    // Le sol M3 reste lisible sans casser le contraste ni nourrir le bloom
+    // (couleur très sombre 0x24180e, ne dépasse JAMAIS le seuil émissif 0.82).
+    const kDay = a.k+(b.k-a.k)*u;
+    if(nightAmbient) nightAmbient.intensity = physI(0.16) * Math.max(0, 1 - kDay);
     if(scene.fog) this._mixColor(scene.fog.color, a.fog, b.fog, u);
     this.kDay=a.k+(b.k-a.k)*u;            // calculé AVANT le ciel : les étoiles lisent la bonne valeur
     if(skyDome){
