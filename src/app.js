@@ -755,11 +755,13 @@ function buildWorld(){
   scene=new THREE.Scene();
   // M1 — filet de sécurité derrière le dôme : passe à la brume bleu-encre.
   scene.background=new THREE.Color(COLORSCRIPT.fogColor);
-  buildSky();                                    // v59 : un vrai ciel
-  buildHorizon();                                // v65/v66 : le monde continue au-delà du cadre
+  buildSky();                                    // M2 : dôme 3 stops + biais ouest doré
+  buildHorizon();                                // M2 : skyline industrielle 2 couches + fumées
+  buildSkyAtmosphere();                          // M2 : soleil, voile doré, godrays, nuages
   buildNightLights();                            // v66 : les lumières qui peignent la nuit
-  // M1 — fog : on garde near/far v49, seule la couleur bascule sur COLORSCRIPT.
-  scene.fog=new THREE.Fog(COLORSCRIPT.fogColor, 100, 310);
+  // M2 — fog réchauffé : 0x5a5560 (bleu-mauve plus chaud, accordé à l'inflexion
+  // dorée). near/far retunés pour fondre la skyline (210/280) dans le bas du ciel.
+  scene.fog=new THREE.Fog(0x5a5560, 90, 260);
 
   // lumières — M1 : ciel bleu froid / sol terre encre, intensité abaissée
   // pour laisser l'IBL (ENV_INTENSITY=0.7) faire le gros de l'ambiance.
@@ -4889,7 +4891,10 @@ export function init(opts={}){
   updateBuildings(); updateZoneVisibility(); refreshNiveauVille(); updateVilleBadge();
   LivingWorld.init();
   WorldBeauty.init();      // v56
-  Atmosphere.init();       // v58 : brume + soleil visible
+  Atmosphere.init();       // v58 : brume + (anciennement soleil — désormais via SkyAtmo)
+  // M2 : SkyAtmo possède le soleil DA (bas-horizon ouest, doré). On efface
+  // l'ancien sprite-soleil de Atmosphere pour éviter le double-soleil.
+  if(Atmosphere.sun){ Atmosphere.sun.visible=false; }
   PuffTrains.init();       // v63 : bouffées de cheminées
   // le son démarre au premier geste (politique d'autoplay des navigateurs)
   const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
@@ -5643,6 +5648,9 @@ function applyRenderQuality(q){
   // M3 — flaques (réfléchissantes ↔ mates) et débris (densité écrêtée)
   // suivent le sélecteur de qualité.
   if(typeof _applyM3Quality === 'function') _applyM3Quality(q);
+  // M2 — fumées de skyline, godrays, voile doré, nuages : OFF en Basse.
+  // Dôme + skyline + soleil conservés (forme du ciel inchangée).
+  if(typeof _applyM2Quality === 'function') _applyM2Quality(q);
   // M1b — log lisible pour valider que les 3 niveaux produisent des configs
   // distinctes. Une seule ligne par changement, à la console.
   console.info('[M1] render quality =', q,
@@ -7346,85 +7354,465 @@ const CityGrowth={
    le monde du jeu n'est qu'une formation sociale parmi d'autres).
    Matériaux soumis au brouillard : la profondeur se peint toute seule.
    ===================================================================== */
-/* v66 — L'HORIZON EN VOLUMES. Les plans-silhouettes de la v65 lisaient comme
-   des découpages superposés (critique juste). Remplacés par de VRAIS volumes
-   bas-poly que le brouillard et la lumière modèlent : collines écrasées,
-   montagnes à facettes, et au nord-est des BLOCS DE VILLES lointaines hérissés
-   de cheminées, piqués de minuscules fenêtres émissives qui bloomeront la nuit
-   (d'autres capitaux veillent). */
-const distantGlows=[];
+/* =====================================================================
+   M2 — L'HORIZON (refonte « Veille du Capital »).
+   Toutes les masses beiges/pyramides/collines de la version précédente
+   sont remplacées par une SKYLINE INDUSTRIELLE en 2 couches de profondeur :
+     couche proche (~210) : silhouettes hautes (façades, toits variés, cheminées
+                            fines), densité forte côté ouest = centre financier.
+     couche lointaine (~280) : silhouettes plus basses, fondues plus avant.
+   Matériau 0x232a3a, fog:true → le brouillard sculpte la profondeur.
+   Géographie de classe : fenêtres émissives gasLight 0xffb45e éparses,
+   denses à l'OUEST (cœur financier), rares à l'EST (faubourgs noirs).
+   4-5 colonnes de fumée animées (sprites empilés) sur les cheminées lointaines.
+   ===================================================================== */
+const distantGlows=[];                                  // fenêtres : DayCycle les rallume la nuit
+const SMOKE_COLUMNS=[];                                 // pour le sélecteur qualité
+
 function buildHorizon(){
   let seed=99; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
-  const hillMat =new THREE.MeshStandardMaterial({color:0x55604c,roughness:1,flatShading:true});
-  const mtnMat  =new THREE.MeshStandardMaterial({color:0x5c626e,roughness:1,flatShading:true});
-  const cityMat =new THREE.MeshStandardMaterial({color:0x3c4250,roughness:1,flatShading:true});
-  const hill=(x,z,r,h)=>{ const m=new THREE.Mesh(new THREE.IcosahedronGeometry(r,1),hillMat);
-    m.scale.set(1,h/r,1); m.position.set(x,0,z); m.rotation.y=rnd()*6.28; scene.add(m); };
-  const mtn=(x,z,r,h)=>{ const m=new THREE.Mesh(new THREE.ConeGeometry(r,h,5),mtnMat);
-    m.position.set(x,h/2-2,z); m.rotation.y=rnd()*6.28; scene.add(m); };
-  const cityBlock=(x,z,ang)=>{
-    const g=new THREE.Group();
-    const n=3+Math.floor(rnd()*3);
-    for(let i=0;i<n;i++){
-      const w=8+rnd()*10, h=10+rnd()*18, d=8+rnd()*8;
-      const b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),cityMat);
-      b.position.set((i-(n-1)/2)*11+(rnd()-0.5)*4, h/2, (rnd()-0.5)*8); g.add(b);
-      for(let k=0;k<3;k++){                       // fenêtres lointaines : graines de bloom
-        const fw=new THREE.Mesh(new THREE.PlaneGeometry(0.9,1.2),
-          new THREE.MeshStandardMaterial({color:0x1c2026,emissive:0xffb45e,emissiveIntensity:0}));
-        fw.position.set(b.position.x+(rnd()-0.5)*w*0.7, 3+rnd()*(h-5), b.position.z+d/2+0.06);
-        g.add(fw); distantGlows.push(fw.material);
-      }
-    }
-    for(let c=0;c<2;c++){
-      const ch=new THREE.Mesh(new THREE.CylinderGeometry(1.2,1.7,26+rnd()*16,7),cityMat);
-      ch.position.set((rnd()-0.5)*n*10, 16, (rnd()-0.5)*6); g.add(ch);
-      ch.userData.chimney=true; ch.userData.glowless=true;     // elles fument aussi, au loin
-    }
-    g.position.set(x,0,z); g.rotation.y=ang; scene.add(g);
+  // matière commune : sombre, mate, ramassée par scene.fog (fog:true)
+  const sky_skyline=new THREE.MeshStandardMaterial({
+    color:0x232a3a, roughness:1, metalness:0, flatShading:true, fog:true,
+  });
+  const sky_chimney=new THREE.MeshStandardMaterial({
+    color:0x1c222e, roughness:1, metalness:0, flatShading:true, fog:true,
+  });
+
+  // densité fenêtres : ouest (-X) = riche, est (+X) = pauvre/noir
+  const windowDensity=(x,z)=>{
+    const angle=Math.atan2(z,x);                        // 0 = est, π = ouest
+    const westness=(Math.cos(angle)*-0.5)+0.5;          // 0 est → 1 ouest
+    return 0.10 + 0.55*westness*westness;
   };
-  // couronne 1 (~170) : collines au sud/ouest, villes au nord/est
-  for(let i=0;i<14;i++){ const a=(i/14)*6.28, dx=Math.sin(a), dz=Math.cos(a);
-    const x=dx*172+(rnd()-0.5)*18, z=dz*172+(rnd()-0.5)*18;
-    if(dx>0.45||dz<-0.45) cityBlock(x,z,a+Math.PI); else hill(x,z,26+rnd()*16,10+rnd()*8); }
-  // couronne 2 (~225) : grandes collines + villes plus rares
-  for(let i=0;i<10;i++){ const a=(i/10)*6.28+0.3, dx=Math.sin(a), dz=Math.cos(a);
-    const x=dx*226+(rnd()-0.5)*22, z=dz*226+(rnd()-0.5)*22;
-    if((dx>0.5||dz<-0.5)&&rnd()<0.6) cityBlock(x,z,a+Math.PI); else hill(x,z,38+rnd()*20,16+rnd()*10); }
-  // couronne 3 (~280) : montagnes à facettes
-  for(let i=0;i<9;i++){ const a=(i/9)*6.28+0.15;
-    mtn(Math.sin(a)*282+(rnd()-0.5)*26, Math.cos(a)*282+(rnd()-0.5)*26, 46+rnd()*26, 34+rnd()*22); }
+
+  // une « façade » dans la skyline : box principale + 2-3 toits décalés,
+  // 1-2 cheminées fines, fenêtres aléatoires sur la face tournée vers la scène.
+  const buildFacade=(parent, w, hMax, depth, facingY)=>{
+    const h=hMax*(0.6+rnd()*0.4);
+    const main=new THREE.Mesh(new THREE.BoxGeometry(w,h,depth), sky_skyline);
+    main.position.y=h/2; parent.add(main);
+
+    // toits variés : tantôt plat (corniche), tantôt pignon
+    if(rnd()<0.6){
+      const cw=w*(0.95+rnd()*0.1), cd=depth*1.1, ch=0.6+rnd()*0.8;
+      const cor=new THREE.Mesh(new THREE.BoxGeometry(cw,ch,cd), sky_skyline);
+      cor.position.y=h+ch/2; parent.add(cor);
+    } else {
+      const peak=new THREE.Mesh(new THREE.ConeGeometry(w*0.55, 1.4+rnd()*1.8, 4), sky_skyline);
+      peak.rotation.y=Math.PI/4;
+      peak.position.y=h+(1.4+rnd()*1.8)/2; parent.add(peak);
+    }
+    // cheminées fines (1-2)
+    const nCh=1+(rnd()<0.5?1:0);
+    for(let i=0;i<nCh;i++){
+      const ch=new THREE.Mesh(new THREE.CylinderGeometry(0.45+rnd()*0.25, 0.5+rnd()*0.3, 4+rnd()*8, 6), sky_chimney);
+      ch.position.set((rnd()-0.5)*w*0.7, h+(ch.geometry.parameters.height)/2, (rnd()-0.5)*depth*0.4);
+      parent.add(ch);
+      // marqueur pour que les colonnes de fumée se posent dessus
+      ch.userData.smokeAnchor=true;
+    }
+    // fenêtres émissives sur la face avant (Y face -1, donc face = +Y vers caméra ? non, c'est la face Z+)
+    // En réalité après la rotation parent.rotation.y=facingY, on veut placer les fenêtres sur la face
+    // tournée vers la scène. Le parent est positionné à (sin(a), 0, cos(a))*R avec rotation.y=facingY,
+    // donc la face "intérieure" est celle à -Z local (orientée vers l'origine).
+    const dens=windowDensity(parent.position.x, parent.position.z);
+    const targetN=Math.round(8*dens);                   // max ~8, ouest = ~5-6, est = ~1
+    for(let k=0;k<targetN;k++){
+      const wx=(rnd()-0.5)*w*0.7;
+      const wy=2+rnd()*(h-4);
+      const fw=new THREE.Mesh(new THREE.PlaneGeometry(0.55+rnd()*0.5, 0.7+rnd()*0.5),
+        new THREE.MeshStandardMaterial({
+          color:0x1c2026, emissive:COLORSCRIPT.gasLight, emissiveIntensity:0.0,
+          fog:true,
+        }));
+      fw.position.set(wx, wy, -depth/2-0.04);           // face intérieure (vers la scène)
+      fw.rotation.y=Math.PI;                            // normale vers la scène
+      parent.add(fw); distantGlows.push(fw.material);
+    }
+  };
+
+  // construit une couche de skyline sur un cercle de rayon R
+  const buildLayer=(R, count, hMax, depth, minW, maxW)=>{
+    for(let i=0;i<count;i++){
+      const a=(i/count)*Math.PI*2 + (rnd()-0.5)*0.1;
+      const x=Math.sin(a)*R+(rnd()-0.5)*10;
+      const z=Math.cos(a)*R+(rnd()-0.5)*10;
+      const g=new THREE.Group();
+      g.position.set(x,0,z);
+      // chaque façade regarde vers l'origine
+      g.rotation.y=Math.atan2(x,z);
+      // 2-4 façades adjacentes (un "block")
+      const n=2+Math.floor(rnd()*3);
+      for(let j=0;j<n;j++){
+        const sub=new THREE.Group();
+        sub.position.x=(j-(n-1)/2)*(maxW*0.95);
+        const w=minW+rnd()*(maxW-minW);
+        buildFacade(sub, w, hMax, depth, g.rotation.y);
+        g.add(sub);
+      }
+      scene.add(g);
+    }
+  };
+
+  buildLayer(210, 16, 22, 7, 5, 9);    // couche proche : silhouettes hautes, plus de détail
+  buildLayer(280, 14, 14, 6, 4, 7);    // couche lointaine : plus basse, fondue plus avant
+
+  // 4-5 colonnes de fumée sur cheminées lointaines.
+  // On choisit des ancres parmi les cheminées posées + parmi les couches.
+  const anchors=[];
+  scene.traverse(o=>{ if(o.userData && o.userData.smokeAnchor) anchors.push(o); });
+  // tri par distance pour préférer les colonnes "lointaines"
+  anchors.sort((a,b)=>{
+    const pa=new THREE.Vector3(), pb=new THREE.Vector3(); a.getWorldPosition(pa); b.getWorldPosition(pb);
+    return (pb.x*pb.x+pb.z*pb.z)-(pa.x*pa.x+pa.z*pa.z);
+  });
+  const NCols = Math.min(5, anchors.length);
+  for(let i=0;i<NCols;i++){
+    const a=anchors[Math.floor(i*anchors.length/NCols)];
+    const wp=new THREE.Vector3(); a.getWorldPosition(wp);
+    buildSmokeColumn(wp.x, wp.y+2, wp.z);
+  }
 }
 
-/* v59 — LE CIEL. Un dôme en dégradé (shader minimal) : zénith bleu-gris
-   désaturé, horizon qui se fond EXACTEMENT dans la couleur du brouillard —
-   pas de couture entre le sol et le ciel. DayCycle pilote les deux teintes :
-   midi clair et bleuté, heure dorée chaude et basse. Les nuages, le soleil
-   et les oiseaux vivent à l'intérieur du dôme. */
+/* buildSmokeColumn — 5 sprites empilés qui montent, se dilatent, s'estompent.
+   Dérive vers l'est (vent d'ouest comme PuffTrains). Pour la skyline lointaine. */
+function _smokeTexture(){
+  if(_smokeTexture._cached) return _smokeTexture._cached;
+  const c=document.createElement('canvas'); c.width=c.height=128;
+  const x=c.getContext('2d');
+  const g=x.createRadialGradient(64,64,2,64,64,62);
+  g.addColorStop(0,'rgba(220,210,200,0.65)');
+  g.addColorStop(0.5,'rgba(170,158,148,0.30)');
+  g.addColorStop(1,'rgba(120,108,100,0)');
+  x.fillStyle=g; x.fillRect(0,0,128,128);
+  return _smokeTexture._cached=new THREE.CanvasTexture(c);
+}
+function buildSmokeColumn(x, y0, z){
+  const tex=_smokeTexture();
+  const col={x, y0, z, puffs:[]};
+  for(let i=0;i<5;i++){
+    const sp=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:tex, color:0x6a6660, transparent:true, opacity:0,
+      depthWrite:false, fog:true,
+    }));
+    sp.scale.set(3.5, 3.5, 1);
+    scene.add(sp);
+    col.puffs.push({obj:sp, phase: i/5, age: i/5});
+  }
+  SMOKE_COLUMNS.push(col);
+}
+function updateSkySmoke(dt){
+  if(!SMOKE_COLUMNS.length) return;
+  for(const col of SMOKE_COLUMNS){
+    for(const p of col.puffs){
+      p.age += dt*0.18;                            // ~5.5 s par cycle
+      if(p.age>=1) p.age-=1;
+      const a=p.age;
+      // monte de 0 à +18 m
+      const y=col.y0 + a*18;
+      // dérive vers l'est (+x)
+      const dx=a*6;
+      p.obj.position.set(col.x+dx, y, col.z);
+      // se dilate
+      const s=3.5 + a*5;
+      p.obj.scale.set(s, s, 1);
+      // s'estompe (in/out)
+      const op=Math.sin(a*Math.PI)*0.45;
+      p.obj.material.opacity=op;
+    }
+  }
+}
+
+/* =====================================================================
+   M2 — ATMOSPHÈRE DORÉE.
+   Sun bas-horizon ouest + halo additif (nourrit le bloom sans saturer) ;
+   voile additif doré sur le quart ouest (opacité 0.12, 0xb08a5a) ; nuages
+   canvas (10-14, 2 altitudes, dérive est ; tache 0x4a4252 / 0xd98a3d face soleil) ;
+   3-4 godrays cônes additifs très diffus du soleil, oscillation lente.
+   Tout est sprite/plan transparent → coût frame < 3 ms.
+   Position d'ancrage : suit la caméra (toujours visible côté ouest).
+   ===================================================================== */
+const SkyAtmo = {
+  ready:false,
+  sunDisk:null, sunHalo:null,
+  clouds:[],
+  veil:null,
+  godrays:[],
+  // direction "ouest" en monde : -X (cohérent avec uWestDir du dôme)
+  // hauteur soleil bas-horizon
+  build(){
+    if(this.ready) return; this.ready=true;
+    // ----- soleil : disque émissif + halo additif -----
+    const sunTex=this._sunDiskTex();
+    this.sunDisk=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:sunTex, color:0xffe6b0, transparent:true, opacity:0.95,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.sunDisk.scale.set(22,22,1);
+    this.sunDisk.renderOrder=-1;
+    scene.add(this.sunDisk);
+
+    const haloTex=this._sunHaloTex();
+    this.sunHalo=new THREE.Sprite(new THREE.SpriteMaterial({
+      map:haloTex, color:0xffd98a, transparent:true, opacity:0.55,
+      depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+    }));
+    this.sunHalo.scale.set(95,95,1);
+    this.sunHalo.renderOrder=-1;
+    scene.add(this.sunHalo);
+
+    // ----- voile doré : grand plan additif côté ouest -----
+    // Quad ancré sur le dôme — rotation Y suit la position du soleil.
+    const veilTex=this._veilTex();
+    this.veil=new THREE.Mesh(new THREE.PlaneGeometry(280, 160),
+      new THREE.MeshBasicMaterial({
+        map:veilTex, color:0xb08a5a, transparent:true, opacity:0.12,
+        depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+        side:THREE.DoubleSide,
+      }));
+    this.veil.renderOrder=-1;
+    scene.add(this.veil);
+
+    // ----- godrays : 3 cônes additifs très diffus -----
+    const rayTex=this._rayTex();
+    for(let i=0;i<3;i++){
+      const ray=new THREE.Mesh(new THREE.PlaneGeometry(60, 220),
+        new THREE.MeshBasicMaterial({
+          map:rayTex, color:0xffd9a0, transparent:true, opacity:0.0,
+          depthWrite:false, fog:false, blending:THREE.AdditiveBlending,
+          side:THREE.DoubleSide,
+        }));
+      ray.userData.baseOp=[0.10,0.08,0.06][i];
+      ray.userData.tilt=(i-1)*0.18;
+      ray.renderOrder=-1;
+      scene.add(ray);
+      this.godrays.push(ray);
+    }
+
+    // ----- nuages : 12 sprites, 2 altitudes -----
+    const cloudA=this._cloudTex(0xd98a3d);   // côté soleil : ourlet doré
+    const cloudB=this._cloudTex(0x4a4252);   // côté ombre : nuage sombre
+    for(let i=0;i<12;i++){
+      const altHigh = i%3 === 0;
+      const map = (i%2===0) ? cloudA : cloudB;
+      const m=new THREE.Sprite(new THREE.SpriteMaterial({
+        map, transparent:true, opacity:0.0,
+        depthWrite:false, fog:true,
+      }));
+      const s=22+Math.random()*22;
+      m.scale.set(s, s*0.55, 1);
+      m.userData={
+        baseY: altHigh? 95 : 62,
+        radius: 180+Math.random()*40,
+        angle: Math.random()*Math.PI*2,
+        drift: 0.012+Math.random()*0.014,
+        baseOp: 0.45+Math.random()*0.20,
+      };
+      scene.add(m);
+      this.clouds.push(m);
+    }
+  },
+  _sunDiskTex(){
+    const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
+    const g=x.createRadialGradient(64,64,4,64,64,62);
+    g.addColorStop(0,   'rgba(255,238,196,1.0)');
+    g.addColorStop(0.45,'rgba(255,210,140,0.85)');
+    g.addColorStop(0.75,'rgba(255,180,90,0.30)');
+    g.addColorStop(1,   'rgba(255,170,70,0)');
+    x.fillStyle=g; x.fillRect(0,0,128,128);
+    return new THREE.CanvasTexture(c);
+  },
+  _sunHaloTex(){
+    const c=document.createElement('canvas'); c.width=c.height=256; const x=c.getContext('2d');
+    const g=x.createRadialGradient(128,128,8,128,128,128);
+    g.addColorStop(0,   'rgba(255,224,170,0.55)');
+    g.addColorStop(0.5, 'rgba(255,200,130,0.12)');
+    g.addColorStop(1,   'rgba(255,180,90,0)');
+    x.fillStyle=g; x.fillRect(0,0,256,256);
+    return new THREE.CanvasTexture(c);
+  },
+  _veilTex(){
+    const c=document.createElement('canvas'); c.width=512; c.height=256; const x=c.getContext('2d');
+    const g=x.createRadialGradient(256,170,40,256,170,260);
+    g.addColorStop(0,   'rgba(255,220,180,0.55)');
+    g.addColorStop(0.55,'rgba(220,170,110,0.20)');
+    g.addColorStop(1,   'rgba(176,138,90,0)');
+    x.fillStyle=g; x.fillRect(0,0,512,256);
+    return new THREE.CanvasTexture(c);
+  },
+  _rayTex(){
+    const c=document.createElement('canvas'); c.width=128; c.height=512; const x=c.getContext('2d');
+    // bande verticale très douce, plus dense vers le haut (source soleil)
+    const g=x.createLinearGradient(0,0,0,512);
+    g.addColorStop(0,   'rgba(255,225,170,0.75)');
+    g.addColorStop(0.4, 'rgba(255,210,150,0.30)');
+    g.addColorStop(1,   'rgba(255,200,130,0)');
+    x.fillStyle=g; x.fillRect(0,0,128,512);
+    // pinceau latéral pour éviter une bande nette
+    const gh=x.createRadialGradient(64,256,8,64,256,90);
+    gh.addColorStop(0,'rgba(255,255,255,0.0)'); gh.addColorStop(1,'rgba(0,0,0,0.55)');
+    x.globalCompositeOperation='destination-out';
+    x.fillStyle=gh; x.fillRect(0,0,128,512);
+    x.globalCompositeOperation='source-over';
+    return new THREE.CanvasTexture(c);
+  },
+  _cloudTex(rimColor){
+    const c=document.createElement('canvas'); c.width=256; c.height=128; const x=c.getContext('2d');
+    // base sombre / floue
+    for(let i=0;i<5;i++){
+      const px=40+Math.random()*180, py=50+Math.random()*30, rr=30+Math.random()*40;
+      const g=x.createRadialGradient(px,py,4,px,py,rr);
+      g.addColorStop(0,'rgba(74,66,82,0.85)'); g.addColorStop(1,'rgba(74,66,82,0)');
+      x.fillStyle=g; x.beginPath(); x.arc(px,py,rr,0,Math.PI*2); x.fill();
+    }
+    // ourlet (rim light) côté soleil — superposé en haut-droite
+    const rim=`rgba(${(rimColor>>16)&0xff},${(rimColor>>8)&0xff},${rimColor&0xff},`;
+    for(let i=0;i<3;i++){
+      const px=140+Math.random()*80, py=40+Math.random()*20, rr=22+Math.random()*22;
+      const g=x.createRadialGradient(px,py,2,px,py,rr);
+      g.addColorStop(0, rim+'0.65)'); g.addColorStop(1, rim+'0)');
+      x.fillStyle=g; x.beginPath(); x.arc(px,py,rr,0,Math.PI*2); x.fill();
+    }
+    return new THREE.CanvasTexture(c);
+  },
+  update(dt){
+    if(!this.ready) return;
+    // anchor : suit la caméra horizontalement → atmosphère toujours visible
+    const cx = (typeof camera!=='undefined' && camera) ? camera.position.x : 0;
+    const cz = (typeof camera!=='undefined' && camera) ? camera.position.z : 0;
+
+    // soleil bas horizon OUEST (monde -X)
+    const sunX = cx - 240, sunY = 38, sunZ = cz + 0;
+    if(this.sunDisk) this.sunDisk.position.set(sunX, sunY, sunZ);
+    if(this.sunHalo) this.sunHalo.position.set(sunX, sunY, sunZ);
+
+    // voile : grand plan orienté vers la caméra, posé côté ouest
+    if(this.veil){
+      this.veil.position.set(cx - 180, 55, cz);
+      this.veil.lookAt(cx, 30, cz);
+    }
+
+    // godrays : du soleil vers le sol, oscillation
+    for(let i=0;i<this.godrays.length;i++){
+      const ray=this.godrays[i];
+      ray.position.set(sunX + 6 + i*4, sunY - 12, sunZ + (i-1)*6);
+      ray.rotation.z = ray.userData.tilt + Math.sin(t*0.25 + i)*0.06;
+      ray.rotation.y = Math.PI/2;                  // face caméra (placée à l'est du soleil)
+      ray.material.opacity = ray.userData.baseOp * (0.85 + 0.15*Math.sin(t*0.4 + i*1.7));
+    }
+
+    // nuages : dérive est, garder l'altitude
+    for(const c of this.clouds){
+      const u=c.userData;
+      u.angle += u.drift*dt;
+      const x = cx + Math.cos(u.angle)*u.radius;
+      const z = cz + Math.sin(u.angle)*u.radius;
+      c.position.set(x, u.baseY, z);
+      c.material.opacity = u.baseOp;
+    }
+  },
+};
+function buildSkyAtmosphere(){ SkyAtmo.build(); }
+function updateSkyAtmosphere(dt){ SkyAtmo.update(dt); }
+
+/* M2 — sélecteur qualité : Basse coupe ce qui anime / additionne du bloom
+   (fumées de skyline, godrays, voile, nuages). Dôme + skyline + soleil restent. */
+function _applyM2Quality(q){
+  const live = (q !== 'low');
+  // colonnes de fumée des cheminées lointaines
+  for(const col of SMOKE_COLUMNS){
+    for(const p of col.puffs){ p.obj.visible = live; }
+  }
+  if(SkyAtmo.ready){
+    if(SkyAtmo.veil) SkyAtmo.veil.visible = live;
+    for(const r of SkyAtmo.godrays) r.visible = live;
+    for(const c of SkyAtmo.clouds) c.visible = live;
+    // sunDisk + sunHalo restent toujours (le soleil fait partie du ciel DA)
+  }
+}
+if(typeof window !== 'undefined') window._applyM2Quality = _applyM2Quality;
+
+/* =====================================================================
+   M2 — LE CIEL. Dôme inversé r=380 (sous camera.far=400). ShaderMaterial
+   à 3 arrêts verticaux pilotés par COLORSCRIPT (zénith bleu nuit / mid
+   bleu-acier / horizon ambre 0xd98a3d) avec biais DIRECTIONNEL : l'ouest
+   s'embrase, l'est se refroidit en bleu-gris. Dither anti-banding sur la
+   couleur finale. depthWrite=false, fog=false : le dôme passe SOUS tout.
+   uWestDir oriente le bias en monde — uniformes lisibles par DayCycle
+   pour moduler le zénith jour/nuit sans toucher à l'horizon doré (DA fixe).
+   ===================================================================== */
 let skyDome=null, skyStars=null;
 function buildSky(){
   const uniforms={
-    topColor:   {value:new THREE.Color(0x9eb6bd)},
-    bottomColor:{value:new THREE.Color(0xcbbd9a)},
-    offset:     {value:2},       // v59b : horizon bas — le ciel commence tout de suite
-    exponent:   {value:0.45}     // v59c : avec la compression hh, monte vite et plafonne
+    uZenith:    {value:new THREE.Color(COLORSCRIPT.skyZenith)},   // 0x1b2433
+    uMid:       {value:new THREE.Color(0x3d4a66)},
+    uHorizon:   {value:new THREE.Color(COLORSCRIPT.skyHorizon)},  // 0xd98a3d
+    uEastCool:  {value:new THREE.Color(0x4a5868)},                // est bleu-gris froid
+    uWestDir:   {value:new THREE.Vector3(-1,0,0).normalize()},    // monde : -X = ouest
+    uHorizonExp:{value:0.55},
+    uMidExp:    {value:1.4},
+    uTime:      {value:0},
   };
+  // Alias rétro-compat DayCycle : laisse moduler uniquement le zénith
+  // (l'horizon reste verrouillé sur COLORSCRIPT.skyHorizon — DA fixe).
+  uniforms.topColor = uniforms.uZenith;
   const mat=new THREE.ShaderMaterial({
     uniforms, side:THREE.BackSide, depthWrite:false, fog:false,
-    vertexShader:`varying vec3 vPos; void main(){ vPos=position;
-      gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
-    fragmentShader:`uniform vec3 topColor; uniform vec3 bottomColor;
-      uniform float offset; uniform float exponent; varying vec3 vPos;
-      void main(){ float h=normalize(vPos+vec3(0.0,offset,0.0)).y;
-        float hh=clamp(h*2.3,0.0,1.0);                 // v59c : compression — le bleu n'attend pas le zénith
-        gl_FragColor=vec4(mix(bottomColor,topColor,pow(hh,exponent)),1.0); }`
+    vertexShader:`
+      varying vec3 vWorldDir;
+      void main(){
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldDir = normalize(wp.xyz - cameraPosition);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader:`
+      uniform vec3  uZenith;
+      uniform vec3  uMid;
+      uniform vec3  uHorizon;
+      uniform vec3  uEastCool;
+      uniform vec3  uWestDir;
+      uniform float uHorizonExp;
+      uniform float uMidExp;
+      uniform float uTime;
+      varying vec3  vWorldDir;
+      // dither 8-bit (anti-banding)
+      float dither(vec2 fc){
+        return fract(sin(dot(fc, vec2(12.9898,78.233)) + uTime*0.0001) * 43758.5453);
+      }
+      void main(){
+        vec3 d = normalize(vWorldDir);
+        float h = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);          // 0 horizon-bas → 1 zénith
+        // dégradé vertical en 3 arrêts (horizon → mid → zénith)
+        float hHor = pow(1.0 - h, uHorizonExp);              // poids horizon
+        float hZen = pow(h, uMidExp);                        // poids zénith
+        float hMid = clamp(1.0 - hHor - hZen, 0.0, 1.0);     // résidu = mid
+        vec3 vert = uHorizon*hHor + uMid*hMid + uZenith*hZen;
+
+        // BIAIS DIRECTIONNEL — embrasement à l'OUEST, refroidissement à l'EST.
+        // westFactor positif vers l'ouest, négatif vers l'est. Cantonné au bas du ciel.
+        float westFactor = dot(d, uWestDir);                 // [-1,+1]
+        float lowMask    = smoothstep(0.55, -0.05, d.y);     // n'agit que près de l'horizon
+        float warm       = clamp(westFactor, 0.0, 1.0) * lowMask;
+        float cool       = clamp(-westFactor, 0.0, 1.0) * lowMask;
+        // côté ouest : pousse vers l'horizon doré (embrasement)
+        vec3 sky = mix(vert, uHorizon, warm * 0.55);
+        // côté est : refroidit vers bleu-gris
+        sky      = mix(sky,  uEastCool, cool * 0.40);
+
+        // dither : ±0.5/255 sur chaque canal — élimine les bandes en bas du ciel
+        float n = dither(gl_FragCoord.xy);
+        sky += (n - 0.5) / 255.0;
+
+        gl_FragColor = vec4(sky, 1.0);
+      }`,
   });
-  skyDome=new THREE.Mesh(new THREE.SphereGeometry(345,20,12),mat);
+  skyDome=new THREE.Mesh(new THREE.SphereGeometry(380,32,16),mat);
   skyDome.renderOrder=-2;
   scene.add(skyDome);
-  // v60 — étoiles (enfants du dôme : elles suivent la caméra avec lui)
+  // étoiles (enfants du dôme : suivent la caméra)
   const N=260, pos=new Float32Array(N*3);
-  for(let i=0;i<N;i++){ const a=Math.random()*6.28, e=0.18+Math.random()*1.3, r=330;
+  for(let i=0;i<N;i++){ const a=Math.random()*6.28, e=0.18+Math.random()*1.3, r=360;
     pos[i*3]=Math.cos(e)*Math.sin(a)*r; pos[i*3+1]=Math.sin(e)*r; pos[i*3+2]=Math.cos(e)*Math.cos(a)*r; }
   const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.BufferAttribute(pos,3));
   skyStars=new THREE.Points(sg,new THREE.PointsMaterial({color:0xfff2d8,size:2.0,sizeAttenuation:false,
@@ -7740,8 +8128,13 @@ const DayCycle={
     if(scene.fog) this._mixColor(scene.fog.color, a.fog, b.fog, u);
     this.kDay=a.k+(b.k-a.k)*u;            // calculé AVANT le ciel : les étoiles lisent la bonne valeur
     if(skyDome){
-      this._mixColor(skyDome.material.uniforms.topColor.value, a.top, b.top, u);
-      skyDome.material.uniforms.bottomColor.value.copy(scene.fog.color);
+      // M2 — DayCycle ne touche QUE le zénith (alias topColor → uZenith).
+      // L'horizon doré (COLORSCRIPT.skyHorizon) reste fixe : c'est l'inflexion
+      // de DA « La Veille du Capital ». uHorizon est volontairement laissé.
+      const uTop=skyDome.material.uniforms.topColor;
+      if(uTop) this._mixColor(uTop.value, a.top, b.top, u);
+      if(skyDome.material.uniforms.uTime)
+        skyDome.material.uniforms.uTime.value=t;
       if(typeof camera!=='undefined'&&camera)
         skyDome.position.set(camera.position.x,0,camera.position.z);
       if(typeof skyStars!=='undefined'&&skyStars)
@@ -8301,6 +8694,8 @@ function loop(){
   updateWindowGlow();                 // v62 : les fenêtres de la ville s'allument la nuit
   Atmosphere.update(dt);              // v58 : brume + position du soleil
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
+  updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
+  updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
