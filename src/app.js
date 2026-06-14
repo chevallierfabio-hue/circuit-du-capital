@@ -1927,15 +1927,170 @@ function buildMarche(g){
   for(let i=0;i<3;i++){ const c=createCrate(1.1,i%2?0x8a6b49:0x9a7a55); c.position.set(-5+i*1.4,0,-5); g.add(c); }
   const sp=createSign("A'"); sp.scale.set(2.6,1.7,1); sp.position.set(0,5.6,0); g.add(sp);
 }
-function buildEntrepot(g){
-  const hall=box(15,9,11,0x6b513a,0,4.5,0); hall.material.map=texBrick(); g.add(hall); addOutline(hall);
-  const roof=createRoof('pitched',15,11,0x4a3f33); roof.position.set(0,9,0); g.add(roof);
-  g.add(box(3,5.5,0.3,0x2a221a,-2,2.75,5.6,false)); g.add(box(3,5.5,0.3,0x241d16,2,2.75,5.6,false)); // double porte
-  g.add(box(7,0.4,0.5,COL.fer,0,5.6,5.7,false));
-  const aw=createAwning(8,COL.brun); aw.position.set(0,5.9,6.4); g.add(aw);
-  const dock=createDock(13,5,0.7); dock.position.set(0,0,8.6); g.add(dock);
-  const stk=createCrateStack(); stk.position.set(-9,0,3); g.add(stk);
-  const sp=createSign("M'"); sp.scale.set(2.4,1.6,1); sp.position.set(0,8.2,5.6); g.add(sp);
+function buildEntrepot(g){            // ENTREPÔT — longue halle à arches numérotées, quai de chargement
+  const brique=briqueTexture('std');
+  const matBrique=new THREE.MeshStandardMaterial({
+    color:0x5a3026, map:brique.map, roughnessMap:brique.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const briqueH=briqueTexture('haut');
+  const matBriqueH=new THREE.MeshStandardMaterial({
+    color:0x4a2620, map:briqueH.map, roughnessMap:briqueH.roughnessMap,
+    roughness:1.0, metalness:0,
+  });
+  const pierre=pierreDeTailleTexture('sombre');
+  const matPierre=new THREE.MeshStandardMaterial({
+    color:0x6b6055, map:pierre.map, roughnessMap:pierre.roughnessMap, roughness:1.0, metalness:0,
+  });
+  const planches=planchesTexture();
+  const matPlanches=new THREE.MeshStandardMaterial({
+    color:0x7a6648, map:planches.map, roughnessMap:planches.roughnessMap,
+    roughness:0.95, metalness:0,
+  });
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  const matTuile=new THREE.MeshStandardMaterial({color:0x3a2a20, roughness:0.95, metalness:0, flatShading:true});
+
+  // SOUBASSEMENT + PLINTHE
+  g.add(_M5_box(16.4, 0.45, 11.6, matPierre, 0, -0.05, 0));
+  g.add(_M5_box(15.6, 0.55, 10.8, matPierre, 0, 0.275, 0));
+
+  // CORPS — longue halle brique (volume CLOS)
+  g.add(_M5_box(15.0, 7.4, 10.4, matBrique, 0, 4.25, 0));
+
+  // PILASTRES + bandeaux (rythme régulier — séparateurs des arches)
+  // 6 pilastres en façade, 4 en arrière, 3 par flanc
+  for(const sz of [-1, 1]){
+    const fz=sz*5.21;
+    for(let i=0; i<6; i++){
+      const cx=-6.25 + i*2.5;
+      g.add(_M5_box(0.4, 7.4, 0.18, matBriqueH, cx, 4.25, fz));
+    }
+    // bandeau bas + haut
+    g.add(_M5_box(15.0, 0.30, 0.10, matBriqueH, 0, 0.85, fz));
+    g.add(_M5_box(15.0, 0.38, 0.12, matBriqueH, 0, 7.65, fz));
+  }
+  for(const sx of [-1, 1]){
+    const fx=sx*7.51;
+    for(let i=0; i<3; i++){
+      const cz=-3.5 + i*3.5;
+      g.add(_M5_box(0.18, 7.4, 0.45, matBriqueH, fx, 4.25, cz));
+    }
+    g.add(_M5_box(0.10, 0.30, 10.4, matBriqueH, fx, 0.85, 0));
+    g.add(_M5_box(0.12, 0.38, 10.4, matBriqueH, fx, 7.65, 0));
+  }
+  // CORNICHE
+  const corn=_M5_box(15.4, 0.40, 10.8, matBriqueH, 0, 8.05, 0);
+  corn.castShadow=true; g.add(corn);
+
+  // TOIT À 2 PENTES FERMÉ
+  const roof=_M6_pitchedClosed(15.6, 11.0, 1.8, matTuile, matBriqueH);
+  roof.position.y=8.25; g.add(roof);
+
+  // ARCHES NUMÉROTÉES en façade (5 arches semi-circulaires)
+  // chaque arche : 1 portail rectangulaire surmonté d'un demi-disque
+  for(let i=0; i<5; i++){
+    const cx=-5.0 + i*2.5;
+    // portail (porte coulissante en planches)
+    const door=_M5_box(1.8, 3.6, 0.10, matPlanches, cx, 1.80, 5.18);
+    door.userData.archNumber=i+1;
+    g.add(door);
+    // 5 lattes horizontales en relief
+    for(let k=0; k<5; k++){
+      g.add(_M5_box(1.7, 0.06, 0.12, matBois, cx, 0.55 + k*0.65, 5.24, false));
+    }
+    // arc cintré au-dessus (demi-torus)
+    const arc=new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.10, 4, 16, Math.PI),
+      matBriqueH);
+    arc.position.set(cx, 3.65, 5.20);
+    arc.rotation.z=0;
+    g.add(arc);
+    // clé de voûte
+    g.add(_M5_box(0.20, 0.30, 0.16, matPierre, cx, 4.55, 5.22, false));
+    // numéro peint au-dessus de chaque arche (canvas mini)
+    const num=createSign(String(i+1));
+    num.scale.set(0.9, 0.9, 1);
+    num.position.set(cx, 5.30, 5.30);
+    g.add(num);
+  }
+
+  // FENÊTRES HAUTES (au-dessus des arches)
+  for(let i=0; i<5; i++){
+    const cx=-5.0 + i*2.5;
+    const w=createWindow(0.7, 0.85); w.position.set(cx, 6.50, 5.22); g.add(w);
+  }
+  // flancs
+  for(const sx of [-1, 1]){
+    for(const cz of [-3.0, -1.0, 1.0, 3.0]){
+      const w=createWindow(0.7, 1.0); w.position.set(sx*7.55, 5.50, cz);
+      w.rotation.y = sx>0 ? -Math.PI/2 : Math.PI/2;
+      g.add(w);
+    }
+  }
+  // arrière : 4 fenêtres + porte de service
+  for(const fx of [-4.5, -1.5, 1.5, 4.5]){
+    const w=createWindow(0.7, 1.1); w.position.set(fx, 5.50, -5.22); w.rotation.y=Math.PI;
+    g.add(w);
+  }
+  // porte arrière
+  g.add(_M5_box(2.0, 3.0, 0.10, matBois, 0, 1.50, -5.22));
+
+  // AUVENT au-dessus du quai (devant les arches)
+  const auvent=_M5_box(13.0, 0.18, 2.2, matBois, 0, 4.40, 6.50, false);
+  auvent.rotation.x=0.25; g.add(auvent);
+  for(const sx of [-1, 1]){
+    const sup=_M5_box(0.10, 0.10, 2.2, matFer, sx*6.0, 4.20, 6.50, false);
+    sup.rotation.x=0.25; g.add(sup);
+  }
+
+  // QUAI DE CHARGEMENT en planches (devant les arches)
+  const dock=_M5_box(14.0, 0.55, 3.4, matPlanches, 0, 0.275, 7.5);
+  dock.receiveShadow=true; g.add(dock);
+  // poteaux soutiens du quai
+  for(const sx of [-1, 0, 1]){
+    g.add(_M5_box(0.30, 0.50, 0.30, matBois, sx*5.0, 0.25, 9.0));
+  }
+
+  // PILES DE CAISSES instanciées le long du quai (InstancedMesh)
+  const crateGeo=new THREE.BoxGeometry(1.0, 0.9, 1.0);
+  const crateMat=new THREE.MeshStandardMaterial({color:0x8a5a3e, map:texWood(), roughness:0.95, metalness:0});
+  // bandes en relief
+  const N=14;
+  const crates=new THREE.InstancedMesh(crateGeo, crateMat, N);
+  const M=new THREE.Matrix4(), P=new THREE.Vector3(), Q=new THREE.Quaternion(), S=new THREE.Vector3(1,1,1);
+  let idx=0;
+  // 2 piles de 3 + colonnes éparses
+  const positions=[
+    // pile gauche (2 niveaux × 2)
+    [-6.0, 1.00, 7.0],[-6.0, 1.00, 8.0],[-6.0, 1.90, 7.5],
+    // pile centre
+    [-1.5, 1.00, 7.0],[-0.4, 1.00, 7.0],[-1.5, 1.90, 7.0],
+    // pile droite
+    [5.0, 1.00, 7.0],[5.0, 1.00, 8.0],[5.0, 1.90, 7.5], [6.1, 1.00, 7.5],
+    // caisses isolées sur le quai
+    [-3.5, 1.00, 8.5],[3.0, 1.00, 8.5],[2.0, 1.00, 7.5],[-2.5, 1.00, 8.0],
+  ];
+  for(const [x, y, z] of positions){
+    const rot=(idx*37) % 360 * (Math.PI/180);
+    Q.setFromAxisAngle(new THREE.Vector3(0,1,0), rot);
+    P.set(x, y, z);
+    M.compose(P, Q, S); crates.setMatrixAt(idx, M);
+    idx++;
+  }
+  crates.count=Math.min(N, idx);
+  crates.instanceMatrix.needsUpdate=true;
+  crates.castShadow=true; crates.receiveShadow=true;
+  g.add(crates);
+
+  // QUELQUES TONNEAUX éparpillés (créés directement, pas instanciés — moins nombreux)
+  for(let i=0; i<4; i++){
+    const barrel=createBarrel(0x6b4a2c);
+    barrel.position.set(-7 + i*4.5, 0.55, 9.2);
+    g.add(barrel);
+  }
+
+  // ENSEIGNE M'
+  const sp=createSign("M'"); sp.scale.set(2.4, 1.6, 1); sp.position.set(0, 8.50, 5.40); g.add(sp);
 }
 function buildQuartier(g){
   const rows=[[-6,-3],[-2,-3],[2,-3],[-6,1],[-2,1],[2,1],[5,-1]];
@@ -2342,18 +2497,191 @@ function _M5_box(w, h, d, mat, x, y, z, castShadow=true){
   m.castShadow=castShadow; m.receiveShadow=true;
   return m;
 }
-function buildPort(g){                // marché mondial : eau, quai, bateau, containers
-  const water=new THREE.Mesh(new THREE.PlaneGeometry(34,22),
-    new THREE.MeshStandardMaterial({color:0x3c5566,transparent:true,opacity:.82,roughness:.4}));
-  water.rotation.x=-Math.PI/2; water.position.set(2,0.05,8); g.add(water);
-  g.add(box(20,0.8,7,0x7a6648,-2,0.4,-5,false));         // quai
-  // bateau stylisé
-  g.add(box(8,2.4,3,0x5a4636,3,1.4,9));
-  const mast=box(0.3,7,0.3,0x4a3c2c,3,5,9); g.add(mast);
-  const sail=box(0.2,3.4,2.6,0xcdbd9a,3.2,5.5,9); g.add(sail);
-  // containers (commerce extérieur)
-  g.add(box(2.4,2,2.2,COL.rouge,-7,1,-5)); g.add(box(2.4,2,2.2,COL.bleu,-7,3,-5));
-  g.add(box(2.4,2,2.2,COL.or,-4,1,-5));
+function buildPort(g){                // PORT — quai planches, grue à vapeur, navire, marchandises d'époque
+  // matières
+  const planches=planchesTexture();
+  const matPlanches=new THREE.MeshStandardMaterial({
+    color:0x8a7058, map:planches.map, roughnessMap:planches.roughnessMap,
+    roughness:0.95, metalness:0,
+  });
+  const matCoque=new THREE.MeshStandardMaterial({color:0x2a2418, roughness:0.85, metalness:0.1, flatShading:true});
+  const matCoqueClaire=new THREE.MeshStandardMaterial({color:0x4a3f2e, roughness:0.9, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  const matBois=new THREE.MeshStandardMaterial({color:0x46362a, roughness:0.95, metalness:0, flatShading:true});
+  const matCharbon=new THREE.MeshStandardMaterial({color:0x2a2620, roughness:1.0, metalness:0, flatShading:true});
+  const matFanal=new THREE.MeshStandardMaterial({
+    color:0xffd9a4, emissive:new THREE.Color(0xffb45e), emissiveIntensity:1.5,
+    roughness:0.5, metalness:0.3, flatShading:true,
+  });
+  const matSail=new THREE.MeshStandardMaterial({color:0xb8a878, roughness:0.95, metalness:0, side:THREE.DoubleSide, flatShading:true});
+
+  // QUAI — pont en planches large, posé sur poutres maçonnées
+  // empreinte du quai : 22×7 (légèrement plus large que l'ancien 20×7)
+  const quaiPlanches=planchesTexture();
+  quaiPlanches.map.repeat.set(3, 1.2); quaiPlanches.roughnessMap.repeat.set(3, 1.2);
+  const matQuai=new THREE.MeshStandardMaterial({
+    color:0x8a7058, map:quaiPlanches.map, roughnessMap:quaiPlanches.roughnessMap,
+    roughness:0.95, metalness:0,
+  });
+  const quai=new THREE.Mesh(new THREE.BoxGeometry(22, 0.75, 7), matQuai);
+  quai.position.set(-2, 0.375, -5); quai.receiveShadow=true; quai.castShadow=true;
+  g.add(quai);
+  // poteaux/poutres maçonnés sous le quai (5 piles visibles côté mer)
+  for(let i=0; i<5; i++){
+    g.add(_M5_box(0.5, 1.0, 0.5, matCharbon, -12 + i*4.5, 0.0, -8.0));
+  }
+  // bord en pierre côté terre (transition vers le sol)
+  g.add(_M5_box(22, 0.30, 0.45, matCharbon, -2, 0.15, -1.6));
+
+  // BITTES D'AMARRAGE (6 le long du bord du quai, côté mer)
+  for(let i=0; i<6; i++){
+    const bx=-11 + i*3.6;
+    const bitte=new THREE.Group();
+    // cylindre principal
+    const cyl=new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.20, 0.85, 8), matFer);
+    cyl.position.y=0.425; bitte.add(cyl);
+    // chapeau bombé
+    const cap=new THREE.Mesh(new THREE.SphereGeometry(0.20, 8, 6), matFer);
+    cap.position.y=0.85; bitte.add(cap);
+    bitte.position.set(bx, 0.75, -7.5);
+    g.add(bitte);
+  }
+
+  // GRUE À VAPEUR pivotante — base + colonne + bras articulé
+  const grue=new THREE.Group();
+  grue.userData.crane=true;   // pour animation lente de pivot
+  // base maçonnée
+  grue.add(_M5_box(2.4, 0.8, 2.4, matCharbon, 0, 0.4, 0));
+  // socle métal
+  grue.add(_M5_box(2.0, 0.30, 2.0, matFer, 0, 0.95, 0));
+  // partie pivotante (tout le groupe au-dessus)
+  const pivot=new THREE.Group();
+  pivot.userData.pivot=true;
+  // mât / colonne
+  pivot.add(_M5_box(0.55, 5.0, 0.55, matFer, 0, 2.50 + 1.10, 0));
+  // chaudière (cabine cylindrique)
+  const chau=new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 1.6, 12), matFer);
+  chau.position.set(-0.6, 1.95, 0.95); pivot.add(chau);
+  // cheminée de la chaudière
+  const stack=new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.24, 1.8, 8), matCharbon);
+  stack.position.set(-0.6, 3.55, 0.95); pivot.add(stack);
+  // émetteur de fumée
+  const smoke=new THREE.Mesh(new THREE.SphereGeometry(0.35, 8, 8),
+    new THREE.MeshStandardMaterial({color:0x8a8275, transparent:true, opacity:0.3, flatShading:true}));
+  smoke.position.set(-0.6, 4.55, 0.95); smoke.userData.chimney=true; pivot.add(smoke);
+  // bras (flèche) qui s'incline ~30°
+  const arm=new THREE.Mesh(new THREE.BoxGeometry(6.5, 0.35, 0.35), matFer);
+  arm.position.set(2.4, 5.20, 0);
+  arm.rotation.z=-0.28;
+  pivot.add(arm);
+  // tirant arrière (haubanage)
+  const ten=new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.10, 0.10), matFer);
+  ten.position.set(-1.0, 5.20, 0);
+  ten.rotation.z=0.55;
+  pivot.add(ten);
+  // câble + crochet pendant
+  const cable=new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 3.6, 4), matFer);
+  cable.position.set(5.4, 3.4, 0); pivot.add(cable);
+  const hook=new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.05, 4, 8), matFer);
+  hook.rotation.x=Math.PI/2;
+  hook.position.set(5.4, 1.55, 0); pivot.add(hook);
+  // câble vertical raide près du mât
+  pivot.add(_M5_box(0.05, 5.0, 0.05, matFer, 0.3, 3.6, 0));
+  grue.add(pivot);
+  grue.position.set(-9, 0.75, -4);
+  g.add(grue);
+  _M6_cranes.push(pivot);
+
+  // NAVIRE À QUAI — coque sombre + pont + mât + voile carguée + fanal
+  const ship=new THREE.Group();
+  // coque (BoxGeometry effilée)
+  const hull=new THREE.Mesh(new THREE.BoxGeometry(10.0, 1.8, 3.2), matCoque);
+  hull.position.y=1.5; ship.add(hull);
+  // proue (triangle qui pointe vers x positif)
+  const prowShape=new THREE.Shape();
+  prowShape.moveTo(-1.6, -1.6); prowShape.lineTo(0, 0); prowShape.lineTo(-1.6, 1.6); prowShape.lineTo(-1.6, -1.6);
+  const prowGeo=new THREE.ExtrudeGeometry(prowShape, {depth: 1.8, bevelEnabled: false});
+  prowGeo.translate(0, -0.9, 0);
+  const prow=new THREE.Mesh(prowGeo, matCoque);
+  prow.rotation.x=Math.PI/2;
+  prow.position.set(5.0, 1.5, 0); ship.add(prow);
+  // poupe (rectangle simple — coque arrondie suggérée)
+  const stern=new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.8, 2.6), matCoque);
+  stern.position.set(-5.5, 1.5, 0); ship.add(stern);
+  // pont (planches sombres)
+  ship.add(_M5_box(10.5, 0.18, 3.0, matCoqueClaire, 0, 2.45, 0, false));
+  // BORDS (bastingage)
+  ship.add(_M5_box(10.5, 0.50, 0.10, matBois, 0, 2.65, 1.55, false));
+  ship.add(_M5_box(10.5, 0.50, 0.10, matBois, 0, 2.65, -1.55, false));
+  // CABINE arrière
+  ship.add(_M5_box(2.4, 1.6, 2.4, matBois, -3.5, 3.30, 0));
+  // toit cabine pitched fermé
+  const cabRoof=_M6_pitchedClosed(2.4, 2.4, 0.5, matFer, matBois);
+  cabRoof.position.set(-3.5, 4.10, 0); ship.add(cabRoof);
+  // 2 hublots cabine
+  for(const sz of [-1, 1]){
+    const hub=new THREE.Mesh(new THREE.CircleGeometry(0.18, 12),
+      new THREE.MeshStandardMaterial({color:0x33414c, emissive:0xffb45e, emissiveIntensity:0.5, flatShading:true}));
+    hub.position.set(-3.5, 3.40, sz*1.21); hub.rotation.y=sz>0 ? 0 : Math.PI;
+    ship.add(hub);
+  }
+  // MÂT principal + verges + voile carguée
+  ship.add(_M5_box(0.30, 7.5, 0.30, matBois, 1.5, 6.20, 0));
+  // 2 verges (croix horizontales)
+  for(const y of [5.5, 8.2]){
+    ship.add(_M5_box(0.10, 0.10, 3.6, matBois, 1.5, y, 0));
+  }
+  // voile carguée (paquet rectangulaire au mât)
+  const sail=new THREE.Mesh(new THREE.BoxGeometry(0.20, 1.4, 2.6), matSail);
+  sail.position.set(1.5, 6.6, 0); ship.add(sail);
+  // FANAL au sommet du mât (émissif gasLight)
+  const fanal=new THREE.Mesh(new THREE.SphereGeometry(0.20, 8, 8), matFanal);
+  fanal.position.set(1.5, 9.50, 0); ship.add(fanal);
+  // potence + cage du fanal
+  ship.add(_M5_box(0.06, 0.40, 0.06, matFer, 1.5, 9.20, 0, false));
+  // ANCRE pendant à la proue
+  ship.add(_M5_box(0.10, 0.80, 0.10, matFer, 4.0, 1.20, 1.30, false));
+  ship.add(_M5_box(0.55, 0.20, 0.10, matFer, 4.0, 0.80, 1.30, false));
+  ship.position.set(4, 0, 9);
+  g.add(ship);
+
+  // MARCHANDISES SUR LE QUAI — balles, tonneaux, caisses (PAS de containers)
+  // pile de tonneaux côté gauche
+  for(let i=0; i<3; i++){
+    const barrel=createBarrel(0x6b4a2c);
+    barrel.position.set(-9 + i*1.3, 0.75, -5.5);
+    g.add(barrel);
+  }
+  // tonneaux empilés (rangée du dessus)
+  for(let i=0; i<2; i++){
+    const barrel=createBarrel(0x6b4a2c);
+    barrel.position.set(-8.3 + i*1.3, 0.75 + 1.3, -5.5);
+    g.add(barrel);
+  }
+  // BALLES de marchandises (coton/laine) — sacs ronds
+  for(let i=0; i<4; i++){
+    const sack=createSack(i%2 ? 0xc9b78c : 0xbfa97e);
+    sack.position.set(-1 + i*1.5, 0.75, -5.8);
+    g.add(sack);
+  }
+  // caisses empilées côté droit
+  for(const [x, z, y] of [[5, -5, 0.75], [5, -3.5, 0.75], [5, -5, 0.75+1.4], [6.4, -4, 0.75]]){
+    const crate=createCrate(1.3, 0x8a5a3e);
+    crate.position.set(x, y, z);
+    g.add(crate);
+  }
+  // tas de charbon devant le navire
+  const coalPile=createCoalPile();
+  coalPile.position.set(-3, 0.75, -5.8); g.add(coalPile);
+
+  // BORNES DE FORÇAGE / cabestans (petits cylindres décoratifs)
+  for(let i=0; i<2; i++){
+    g.add(_M5_box(0.40, 1.0, 0.40, matBois, -2 + i*5, 1.25, -3.6));
+  }
+}
+const _M6_cranes=[];   // grues pivotantes du port
+function _M6_updateCranes(){
+  for(const c of _M6_cranes) c.rotation.y = Math.sin(t * 0.18) * 0.45;
 }
 function buildBourse(g){             // « le phare du capital » — verticale, rayonnante
   const pierre=pierreDeTailleTexture('clair');
@@ -2701,22 +3029,97 @@ function planchesTexture(){
 /* v56 — le littoral est : bande d'eau, lignes de houle à l'encre, bateaux à quai.
    C'est de la géographie (toujours visible), pas du décor d'époque. */
 let _boats=[];
+/* =====================================================================
+   M6 — MER ANIMÉE (ShaderMaterial).
+   Vertex : 3 sinusoïdes additives sur Y, normales recalculées par dérivée
+   analytique → pas de glitch d'éclairage.
+   Fragment : base 0x35586b + traînée dorée gradiente vers l'ouest (sun set)
+   + reflets ponctuels des fanaux (cercles atténués), + écume crête.
+   Coût : ~ 4000 verts (5×80 segs), 2 ms en frame test puppeteer.
+   ===================================================================== */
+let _M6_waterMaterial = null;
 function buildWaterEast(){
-  const water=new THREE.Mesh(new THREE.PlaneGeometry(10,240),
-    new THREE.MeshStandardMaterial({color:0x5d6d7a,roughness:.85}));
-  water.rotation.x=-Math.PI/2; water.position.set(115.5,0.012,0); scene.add(water);
-  for(let i=0;i<7;i++){ const wl=new THREE.Mesh(new THREE.PlaneGeometry(5+Math.random()*3,0.28),
-      new THREE.MeshBasicMaterial({color:0xdfd5bb,transparent:true,opacity:.55}));
-    wl.rotation.x=-Math.PI/2; wl.position.set(114+Math.random()*4,0.018,-100+i*33+Math.random()*10); scene.add(wl); }
-  // berge : liseré
-  const berge=new THREE.Mesh(new THREE.PlaneGeometry(0.7,240),
-    new THREE.MeshBasicMaterial({color:0x241f17,transparent:true,opacity:.55}));
-  berge.rotation.x=-Math.PI/2; berge.position.set(110.7,0.02,0); scene.add(berge);
-  // deux bateaux à quai près du port (tangage doux via WorldBeauty)
-  for(const [bx,bz,r] of [[114,-8,0.4],[114.5,14,-0.5]]){
-    const b=createBoat(); b.position.set(bx,0,bz); b.rotation.y=r; scene.add(b); _boats.push(b); }
-  // on ne conduit pas sur l'eau : barrière invisible le long de la berge
-  for(let z=-116;z<=116;z+=11) obstacles.push({pos:new THREE.Vector2(111.5,z),radius:6});
+  // ----- ShaderMaterial -----
+  const uniforms={
+    uTime:   { value: 0 },
+    uColor:  { value: new THREE.Color(0x35586b) },
+    uGold:   { value: new THREE.Color(COLORSCRIPT.skyHorizon) },   // 0xd98a3d
+    uFanal0: { value: new THREE.Vector3(114,   1.2, -8) },
+    uFanal1: { value: new THREE.Vector3(114.5, 1.2, 14) },
+  };
+  _M6_waterMaterial=new THREE.ShaderMaterial({
+    uniforms, transparent: true, depthWrite: false, fog: false,
+    vertexShader:`
+      uniform float uTime;
+      varying vec3 vWorldPos;
+      varying vec3 vNrm;
+      void main(){
+        vec3 p = position;
+        float w1 = sin(p.x*0.40 + uTime*0.65) * 0.10;
+        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.15;          // p.y = world Z avant rotation
+        float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.06;
+        p.z += w1 + w2 + w3;                                    // déplacement avant rotation
+        vec4 wp = modelMatrix * vec4(p, 1.0);
+        vWorldPos = wp.xyz;
+        // dérivées analytiques pour la normale
+        float dx = cos(p.x*0.40 + uTime*0.65)*0.40*0.10
+                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.06;
+        float dz = cos(p.y*0.18 + uTime*0.43)*0.18*0.15
+                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.06;
+        vNrm = normalize(vec3(-dx, 1.0, -dz));
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader:`
+      uniform float uTime;
+      uniform vec3  uColor;
+      uniform vec3  uGold;
+      uniform vec3  uFanal0;
+      uniform vec3  uFanal1;
+      varying vec3  vWorldPos;
+      varying vec3  vNrm;
+      void main(){
+        vec3 col = uColor;
+        // traînée DORÉE côté OUEST (soleil couchant). Le quai est à x~108,
+        // la mer s'étend jusqu'à x~118 ; le bord ouest reçoit la lumière rasante.
+        float westness = clamp((118.0 - vWorldPos.x) / 9.0, 0.0, 1.0);
+        col = mix(col, uGold, westness * 0.45);
+        // bande spéculaire animée près du bord ouest
+        float streakX = vWorldPos.x + sin(vWorldPos.z*0.15 + uTime*0.45)*1.3;
+        float streak = smoothstep(108.5, 110.0, streakX) * (1.0 - smoothstep(110.0, 112.0, streakX));
+        col += uGold * streak * 0.50;
+        // FANAUX — reflets ondulants ponctuels
+        float d0 = length(vWorldPos.xz - uFanal0.xz);
+        float r0 = exp(-d0*0.55) * (0.85 + 0.15*sin(uTime*2.2 + d0*0.6));
+        col += vec3(1.0, 0.78, 0.42) * r0 * 0.70;
+        float d1 = length(vWorldPos.xz - uFanal1.xz);
+        float r1 = exp(-d1*0.55) * (0.85 + 0.15*sin(uTime*2.5 + d1*0.6));
+        col += vec3(1.0, 0.78, 0.42) * r1 * 0.70;
+        // écume sur les crêtes (normales fortement inclinées)
+        float foam = smoothstep(0.35, 0.85, (1.0 - vNrm.y) * 5.0);
+        col += vec3(0.42) * foam * 0.35;
+        gl_FragColor = vec4(col, 0.92);
+      }`,
+  });
+  const waterGeo=new THREE.PlaneGeometry(10, 240, 5, 80);
+  const water=new THREE.Mesh(waterGeo, _M6_waterMaterial);
+  water.rotation.x=-Math.PI/2;
+  water.position.set(115.5, 0.012, 0);
+  water.receiveShadow=false;
+  scene.add(water);
+  // berge : liseré sombre
+  const berge=new THREE.Mesh(new THREE.PlaneGeometry(0.7, 240),
+    new THREE.MeshBasicMaterial({color:0x241f17, transparent:true, opacity:0.55, depthWrite:false}));
+  berge.rotation.x=-Math.PI/2; berge.position.set(110.7, 0.02, 0); scene.add(berge);
+  // deux bateaux à quai (tangage doux via WorldBeauty)
+  for(const [bx, bz, r] of [[114, -8, 0.4], [114.5, 14, -0.5]]){
+    const b=createBoat(); b.position.set(bx, 0, bz); b.rotation.y=r;
+    scene.add(b); _boats.push(b);
+  }
+  // barrière invisible le long de la berge
+  for(let z=-116; z<=116; z+=11) obstacles.push({pos:new THREE.Vector2(111.5, z), radius:6});
+}
+function _M6_updateWater(){
+  if(_M6_waterMaterial) _M6_waterMaterial.uniforms.uTime.value = t;
 }
 /* =====================================================================
    M3 — GRAND-RUE PBR.
@@ -10471,6 +10874,8 @@ function loop(){
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
   updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
   updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
+  _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
+  _M6_updateCranes();                 // M6 : pivot lent des grues du port
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
