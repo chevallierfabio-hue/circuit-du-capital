@@ -8307,11 +8307,66 @@ function createFence(len=4){ return createFenceSegment(len); }
 function createPoster(text){ return createPosterBoard(text); }
 
 /* --- objets modulaires réutilisables --- */
-function createCrate(size=1.5,color=COL.brun){
-  const m=box(size,size,size,color,0,size*0.8,0,false); m.material.map=texWood();
-  const band=size*1.02, th=size*0.1;
-  m.add(box(band,th,band,0x2c2113,0,0,0,false));
-  m.add(box(th,band,band,0x2c2113,0,0,0,false));
+/* =====================================================================
+   M7 — PROPS HABILLÉS (Lot C).
+   Toute caisse / tonneau / sac / charrette / lampadaire des zones et de
+   l'habillage récupère ici de la profondeur de construction : planches,
+   clous, cerclages, douves, étoffe liée, roues à rayons, fûts moulurés.
+   Plus aucun cube nu, plus aucune sphère verte plate.
+   ===================================================================== */
+function _M7_stencilTex(label){
+  const c=document.createElement('canvas'); c.width=128; c.height=64;
+  const x=c.getContext('2d');
+  x.clearRect(0,0,128,64);
+  x.font='700 22px "IBM Plex Mono", monospace';
+  x.textAlign='center'; x.textBaseline='middle';
+  x.fillStyle='rgba(28,20,14,0.85)';
+  x.fillText(label, 64, 30);
+  x.strokeStyle='rgba(28,20,14,0.75)'; x.lineWidth=2;
+  x.strokeRect(8, 12, 112, 40);
+  // 2 petites étoiles aux coins (douanes/marquage)
+  for(const cx of [16, 112]){
+    x.fillStyle='rgba(28,20,14,0.7)';
+    x.beginPath(); x.arc(cx, 32, 3, 0, Math.PI*2); x.fill();
+  }
+  return new THREE.CanvasTexture(c);
+}
+const _M7_STENCIL_POOL=['LONDON','MARCH','BRADFORD','STEAM','EAST INDIA','LEEDS','MANCHESTER','£CO'];
+function createCrate(size=1.5, color=0x8a5a3e){
+  const g=new THREE.Group();
+  const matBois=new THREE.MeshStandardMaterial({color, map:texWood(), roughness:0.95, metalness:0, flatShading:true});
+  const matBoisFonce=new THREE.MeshStandardMaterial({color:0x5a3a25, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  // corps
+  const body=new THREE.Mesh(new THREE.BoxGeometry(size, size*0.95, size), matBois);
+  body.position.y=size*0.5; body.castShadow=true; body.receiveShadow=true;
+  g.add(body);
+  // planches verticales en relief sur la face avant (z=+)
+  for(let i=0; i<3; i++){
+    const plank=new THREE.Mesh(new THREE.BoxGeometry(size*0.28, size*0.92, 0.04), matBoisFonce);
+    plank.position.set(-size*0.32 + i*size*0.32, size*0.5, size*0.51);
+    g.add(plank);
+  }
+  // bandeaux fer croisés (X)
+  g.add(_M7_fastBox(size*1.04, size*0.06, 0.06, matFer, 0, size*0.50, size*0.53, false));
+  g.add(_M7_fastBox(0.06, size*0.06, size*1.04, matFer, 0, size*0.50, 0, false));
+  // clous aux 4 coins de la face avant
+  for(const sx of [-1, 1]) for(const sy of [-1, 1]){
+    const nail=new THREE.Mesh(new THREE.SphereGeometry(0.05, 5, 4), matFer);
+    nail.position.set(sx*size*0.42, size*0.5 + sy*size*0.38, size*0.54);
+    g.add(nail);
+  }
+  // estampille canvas (label aléatoire du pool)
+  const label=_M7_STENCIL_POOL[Math.floor(Math.random()*_M7_STENCIL_POOL.length)];
+  const stencil=new THREE.Mesh(new THREE.PlaneGeometry(size*0.55, size*0.22),
+    new THREE.MeshStandardMaterial({map:_M7_stencilTex(label), transparent:true, roughness:0.95, side:THREE.DoubleSide}));
+  stencil.position.set(0, size*0.62, size*0.55);
+  g.add(stencil);
+  return g;
+}
+function _M7_fastBox(w, h, d, mat, x, y, z, castShadow=true){
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); m.castShadow=castShadow; m.receiveShadow=true;
   return m;
 }
 /* ouvrier articulé low-poly — compatible avec les pools (userData.head pour le bob) */
@@ -8416,12 +8471,54 @@ const cyl=(r1,r2,h,c,seg=12)=>new THREE.Mesh(new THREE.CylinderGeometry(r1,r2,h,
   new THREE.MeshStandardMaterial({color:c,flatShading:true,roughness:.85}));
 
 /* --- props (ceux non déjà définis ailleurs) --- */
-function createBarrel(c=0x6b4a2c){ const g=new THREE.Group();
-  const b=cyl(0.6,0.6,1.3,c); b.material.map=texWood(); b.position.y=0.65; g.add(b);
-  for(const y of[0.3,1.0]){ const band=cyl(0.63,0.63,0.14,0x2c2113); band.position.y=y; g.add(band); } return g; }
-function createSack(c=0xc9b78c){ const g=new THREE.Group();
-  const m=new THREE.Mesh(new THREE.SphereGeometry(0.55,8,6),new THREE.MeshStandardMaterial({color:c,flatShading:true}));
-  m.scale.set(1,1.25,1); m.position.y=0.6; g.add(m); g.add(box(0.42,0.18,0.42,0xb0a078,0,1.15,0,false)); return g; }
+function createBarrel(c=0x5a4530){
+  const g=new THREE.Group();
+  const matBois=new THREE.MeshStandardMaterial({color:c, map:texWood(), roughness:0.95, metalness:0, flatShading:true});
+  const matBoisFonce=new THREE.MeshStandardMaterial({color:0x3a2818, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x2c2113, roughness:0.5, metalness:0.7, flatShading:true});
+  // douves : cylindre principal avec radius légèrement supérieur en milieu
+  // pour le bombement caractéristique du tonneau (3 cylindres empilés).
+  const lower=new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.50, 0.42, 14), matBois);
+  lower.position.y=0.22; lower.castShadow=true; g.add(lower);
+  const middle=new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.62, 0.50, 14), matBois);
+  middle.position.y=0.66; middle.castShadow=true; g.add(middle);
+  const upper=new THREE.Mesh(new THREE.CylinderGeometry(0.50, 0.55, 0.42, 14), matBois);
+  upper.position.y=1.10; upper.castShadow=true; g.add(upper);
+  // 3 cerclages fer
+  for(const y of [0.30, 0.66, 1.02]){
+    const band=new THREE.Mesh(new THREE.CylinderGeometry(0.63, 0.63, 0.08, 14), matFer);
+    band.position.y=y; g.add(band);
+  }
+  // fond + couvercle (disques)
+  g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.49, 0.49, 0.04, 14), matBoisFonce)).position.y=0.02;
+  g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.49, 0.49, 0.04, 14), matBoisFonce)).position.y=1.31;
+  // bouchon central (petit cylindre saillant)
+  g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 0.06, 8), matBoisFonce)).position.y=1.35;
+  return g;
+}
+function createSack(c=0xc9b78c){
+  const g=new THREE.Group();
+  const matToile=new THREE.MeshStandardMaterial({color:c, roughness:1.0, metalness:0, flatShading:true});
+  const matCorde=new THREE.MeshStandardMaterial({color:0x4a3a22, roughness:0.95, metalness:0, flatShading:true});
+  // corps : sphère déformée allongée
+  const body=new THREE.Mesh(_M7_deformedSphere(0.50, 8, 17, 0.14, 1.0, 1.30, 1.0), matToile);
+  body.position.y=0.60; body.castShadow=true; body.receiveShadow=true;
+  g.add(body);
+  // pli côté avant (planche sombre suggérée par 2 boxes verticales)
+  g.add(_M7_fastBox(0.04, 0.55, 0.03, matCorde, -0.15, 0.55, 0.45, false));
+  g.add(_M7_fastBox(0.04, 0.55, 0.03, matCorde, 0.15, 0.55, 0.45, false));
+  // corde wrap autour du sommet (torus)
+  const cord=new THREE.Mesh(new THREE.TorusGeometry(0.26, 0.04, 4, 12), matCorde);
+  cord.rotation.x=Math.PI/2; cord.position.y=1.05;
+  g.add(cord);
+  // chignon noué au-dessus
+  const knot=new THREE.Mesh(new THREE.SphereGeometry(0.20, 7, 5), matToile);
+  knot.scale.set(1.0, 0.70, 1.0); knot.position.y=1.18;
+  g.add(knot);
+  // petite mèche tombante
+  g.add(_M7_fastBox(0.04, 0.25, 0.04, matCorde, 0.18, 1.22, 0.05, false)).rotation.z=0.3;
+  return g;
+}
 function createCoalPile(){ const g=new THREE.Group();
   const m=new THREE.Mesh(new THREE.ConeGeometry(1.6,1.3,7),new THREE.MeshStandardMaterial({color:THEME.darkBrown,flatShading:true,roughness:1}));
   m.position.y=0.65; g.add(m);
@@ -8494,8 +8591,28 @@ function buildNightLights(){
    lumière additif sous la lanterne. Tous tracés enregistrés dans gasLamps[]
    pour que updateWindowGlow / updateClassLighting / _applyM4Quality les pilotent. */
 function createLampPost(){ const g=new THREE.Group(); _gasTextures();
-  g.add(box(0.22,4,0.22,COL.fer,0,2,0,false));
-  g.add(box(0.9,0.1,0.1,COL.fer,0.34,3.95,0,false));                       // potence
+  // M7 — fût mouluré en fonte : socle carré + 3 anneaux + chapiteau juste sous
+  // la potence. Le poteau cylindrique remplace la box plate originale.
+  const matFonte=new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.7, flatShading:true});
+  // socle bas carré (plinthe en fonte)
+  g.add(_M7_fastBox(0.40, 0.28, 0.40, matFonte, 0, 0.14, 0, false));
+  // base saillante au-dessus du socle
+  const baseRing=new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.22, 0.18, 10), matFonte);
+  baseRing.position.y=0.39; g.add(baseRing);
+  // fût cylindrique principal
+  const shaft=new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 3.30, 10), matFonte);
+  shaft.position.y=2.13; g.add(shaft);
+  // 3 moulures sur le fût
+  for(const y of [0.88, 1.78, 2.68]){
+    const moul=new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.10, 10), matFonte);
+    moul.position.y=y; g.add(moul);
+  }
+  // chapiteau (mouluration sous la potence)
+  const cap=new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.13, 0.14, 10), matFonte);
+  cap.position.y=3.85; g.add(cap);
+  // potence courbe (2 segments → simulant une courbe)
+  g.add(_M7_fastBox(0.18, 0.08, 0.08, matFonte, 0.15, 3.96, 0, false));   // segment court
+  g.add(_M7_fastBox(0.62, 0.08, 0.08, matFonte, 0.50, 3.96, 0, false));   // segment principal
   g.add(box(0.34,0.4,0.34,0x2a241c,0.68,3.7,0,false));                     // cage de la lanterne
   // FLAMME : petit mesh émissif dans la cage. emissiveIntensity piloté par updateWindowGlow.
   const flame=new THREE.Mesh(new THREE.SphereGeometry(0.22,8,8),
@@ -8548,13 +8665,50 @@ function createLampPost(){ const g=new THREE.Group(); _gasTextures();
 function createFenceSegment(len=4){ const g=new THREE.Group();
   g.add(box(0.15,1.1,0.15,COL.brun,-len/2,0.55,0,false)); g.add(box(0.15,1.1,0.15,COL.brun,len/2,0.55,0,false));
   g.add(box(len,0.12,0.12,COL.brun,0,0.9,0,false)); g.add(box(len,0.12,0.12,COL.brun,0,0.45,0,false)); return g; }
-function createSmallCart(){ const g=new THREE.Group();
-  const plateau=box(1.4,0.5,2,0x6b513a,0,0.7,0,false); addOutline(plateau); g.add(plateau);
-  for(const x of[-0.82,0.82])for(const z of[-0.7,0.7]){
-    const w=cyl(0.44,0.44,0.3,0x2a241c,10); w.rotation.z=Math.PI/2; w.position.set(x,0.44,z); g.add(w);
-    const hub=cyl(0.14,0.14,0.34,0x8a8076,8); hub.rotation.z=Math.PI/2; hub.position.set(x,0.44,z); g.add(hub);
+function createSmallCart(){
+  const g=new THREE.Group();
+  const matBois=new THREE.MeshStandardMaterial({color:0x6b513a, map:texWood(), roughness:0.95, metalness:0, flatShading:true});
+  const matBoisFonce=new THREE.MeshStandardMaterial({color:0x4a3625, roughness:0.95, metalness:0, flatShading:true});
+  const matFer=new THREE.MeshStandardMaterial({color:0x2a241c, roughness:0.5, metalness:0.6, flatShading:true});
+  const matHub=new THREE.MeshStandardMaterial({color:0x8a8076, roughness:0.5, metalness:0.6, flatShading:true});
+  // plateau
+  const plateau=new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.35, 2.0), matBois);
+  plateau.position.y=0.72; plateau.castShadow=true; g.add(plateau);
+  // ridelles (3 côtés)
+  g.add(_M7_fastBox(1.4, 0.40, 0.10, matBoisFonce, 0, 0.97, -0.95));
+  g.add(_M7_fastBox(0.10, 0.40, 2.0, matBoisFonce, -0.65, 0.97, 0));
+  g.add(_M7_fastBox(0.10, 0.40, 2.0, matBoisFonce, 0.65, 0.97, 0));
+  // ROUES À RAYONS (4 roues : jante torique + moyeu cylindrique + 6 rayons)
+  for(const sx of [-1, 1]) for(const sz of [-1, 1]){
+    const wx=sx*0.82, wz=sz*0.70;
+    // jante
+    const rim=new THREE.Mesh(new THREE.TorusGeometry(0.40, 0.06, 4, 14), matFer);
+    rim.rotation.y=Math.PI/2;
+    rim.position.set(wx, 0.40, wz);
+    g.add(rim);
+    // moyeu
+    const hub=new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 0.14, 8), matHub);
+    hub.rotation.z=Math.PI/2;
+    hub.position.set(wx, 0.40, wz);
+    g.add(hub);
+    // 6 rayons (boxes plates tournés autour de l'axe)
+    for(let i=0; i<6; i++){
+      const spoke=new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.78, 0.03), matFer);
+      spoke.position.set(wx, 0.40, wz);
+      spoke.rotation.z=Math.PI/2;
+      spoke.rotation.x=i*Math.PI/6;
+      g.add(spoke);
+    }
   }
-  g.add(box(0.12,0.12,1.4,0x4a4236,0.6,0.95,1.3,false)); return g; }
+  // brancards (poignées avant)
+  for(const sx of [-1, 1]){
+    const branc=_M7_fastBox(0.10, 0.08, 1.4, matBois, sx*0.42, 0.85, 1.55);
+    g.add(branc);
+  }
+  // poignée transversale
+  g.add(_M7_fastBox(1.0, 0.08, 0.08, matBois, 0, 0.85, 2.20));
+  return g;
+}
 function createWagon(){ const g=new THREE.Group();
   g.add(box(2.6,1.5,4.2,0x4a4236,0,1,0,false)); g.add(box(2.8,0.4,4.4,COL.fer,0,1.85,0,false));
   for(const x of[-1.1,1.1])for(const z of[-1.4,1.4]){ const w=cyl(0.55,0.55,0.3,0x201c16,14); w.rotation.z=Math.PI/2; w.position.set(x,0.55,z); g.add(w); } return g; }
