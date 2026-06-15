@@ -4893,12 +4893,10 @@ const Vehicle = {
     this.lampPool=new THREE.Mesh(new THREE.PlaneGeometry(7,9),
       new THREE.MeshBasicMaterial({map:haloTex,transparent:true,opacity:0,depthWrite:false}));
     this.lampPool.rotation.x=-Math.PI/2; this.lampPool.position.set(0,0.03,-5.2); g.add(this.lampPool);
-    // v63 — le conducteur : assis devant la colonne de direction (jambes dans le châssis),
-    // casquette d'origine, mains "au levier". C'est lui qui rend le chariot vivant.
-    const drv=createWorkerFigure({color:0x8a3b2a, scale:0.92, cap:0x241f17});
+    // M-Peuple-d : le conducteur est une figure GLTF animée (rôle sitting
+    // = SittingIdle, donne l'illusion d'être posté au levier).
+    const drv = spawnFigure({ type:'ouvrier', anim:'idle', tint:0x8a3b2a });
     drv.position.set(0,0.42,1.55); drv.rotation.y=Math.PI;
-    if(drv.userData.armR) drv.userData.armR.rotation.x=-0.9;       // bras tendu vers la commande
-    if(drv.userData.armL) drv.userData.armL.rotation.x=-0.5;
     g.add(drv); this.driver=drv;
 
     // --- les trois cargaisons (une seule visible à la fois) ---
@@ -5673,16 +5671,34 @@ function updateConsequences(){
         new THREE.MeshStandardMaterial({color:0x4b4438,metalness:.35,roughness:.6,flatShading:true}));
       m.rotation.z=Math.PI/2; m.position.set(-5+i*2.1,1.2,5.5); m.userData.layer='mach'; m.castShadow=true; us.add(m);
     }
-    // --- chômage : silhouettes devant l'usine ---
+    // --- chômage : file d'ouvriers GLTF devant l'usine (file ∝ chômage,
+    // 4 → 14 personnages selon le taux). M-Peuple-d : remplace l'ancien
+    // empilement de box+sphere par des figures animées en Idle.
     clearLayer(us,'chom');
-    const nCh=Math.min(8,Math.round(state.chomage*state.populationActive));
+    const chRatio = Math.max(0, Math.min(1, state.chomage || 0));
+    const nCh = Math.max(4, Math.min(14, Math.round(4 + chRatio * 10)));
     for(let i=0;i<nCh;i++){
-      const s=new THREE.Group();
-      const body=box(0.8,1.6,0.5,0x46535e,0,0.95,0); body.userData.layer='chom';
-      const head=new THREE.Mesh(new THREE.SphereGeometry(0.42,8,8),
-        new THREE.MeshStandardMaterial({color:0x3a4750,flatShading:true}));
-      head.position.y=2.0; head.userData.layer='chom'; s.add(body); s.add(head);
-      s.position.set(-7+(i%4)*2.0, 0, 8.5+Math.floor(i/4)*1.8); s.userData.layer='chom'; us.add(s);
+      // M-Peuple-proc : type chomeur (palette terne, épaules basses).
+      // 1 sur 3 en ouvrier (avec outil) — la file mêle qui a perdu son
+      // travail et qui en cherche un nouveau.
+      const fig = spawnFigure({ type: (i%3===0) ? 'ouvrier' : 'chomeur', anim:'idle' });
+      fig.position.set(-8+(i%5)*1.8, 0, 8.5+Math.floor(i/5)*1.8);
+      fig.rotation.y = Math.PI + (i%2 ? -0.25 : 0.25);
+      tagLayer(fig,'chom'); us.add(fig);
+    }
+    // M-Peuple-proc : ouvriers/mineurs en travail dans la cour de l'usine,
+    // anim work (pelletage). Nombre lié aux travailleurs employés.
+    clearLayer(us,'travail');
+    if(state.productionActive){
+      const nW = Math.max(2, Math.min(6, Math.round(2 + (state.travailleurs||0)*0.4)));
+      for(let i=0;i<nW;i++){
+        const a = (i / nW) * Math.PI - Math.PI/2;
+        const isMineur = (i%3===0);
+        const fig = spawnFigure({ type: isMineur ? 'mineur' : 'ouvrier', anim:'work' });
+        fig.position.set(Math.cos(a)*5.5, 0, Math.sin(a)*4.5 - 2);
+        fig.rotation.y = -a + Math.PI/2;
+        tagLayer(fig,'travail'); us.add(fig);
+      }
     }
     // --- grève : barrière qui bloque l'usine ---
     clearLayer(us,'greve');
@@ -5707,6 +5723,30 @@ function updateConsequences(){
       const cx=-9+(i%5)*2.5, cz=10+Math.floor(i/5)*2.5;
       const crate=box(2.1,2.1,2.1,0x7d6242,cx,1.1,cz); crate.userData.layer='stock'; crate.rotation.y=(i*0.3); ent.add(crate);
     }
+  }
+  // M-Peuple-proc : peuplement du quartier ouvrier — ouvrières devant
+  // les maisons, un mineur qui rentre, 2 passants en va-et-vient sur la
+  // ruelle principale.
+  const qPop = zoneGroups['Quartier ouvrier'];
+  if(qPop && state.buildings && state.buildings.quartier>0){
+    clearLayer(qPop,'qpop');
+    const np = 2 + (state.niveauVille>=3 ? 1 : 0);
+    for(let i=0;i<np;i++){
+      const f = spawnFigure({ type:'ouvriere', anim:'idle' });
+      f.position.set(-5 + i*3.2, 0, -4 + (i%2)*1.4);
+      f.rotation.y = (i%2) ? Math.PI*0.4 : -Math.PI*0.4;
+      tagLayer(f,'qpop'); qPop.add(f);
+    }
+    const min = spawnFigure({ type:'mineur', anim:'idle' });
+    min.position.set(6, 0, 4); min.rotation.y = Math.PI*0.8;
+    tagLayer(min,'qpop'); qPop.add(min);
+    // 2 passants en patrouille
+    const p1 = spawnFigure({ type:'ouvriere',
+      patrol:{ ax:-9, az:5,   bx:9, bz:5.4, period:18 } });
+    tagLayer(p1,'qpop'); qPop.add(p1);
+    const p2 = spawnFigure({ type:'ouvrier',
+      patrol:{ ax: 8, az:7,   bx:-8, bz:7.4, period:22 } });
+    tagLayer(p2,'qpop'); qPop.add(p2);
   }
   // --- colère : quartier qui s'assombrit + banderoles au-delà d'un seuil ---
   const q=zoneGroups['Quartier ouvrier'];
@@ -5756,7 +5796,9 @@ function updateConsequences(){
     const tv=(state.d&&state.d.tauxVente!=null)?state.d.tauxVente:1;
     const clients=Math.round(5*clamp(tv));
     for(let i=0;i<clients;i++){
-      const c=createWorkerFigure({color:i%2?0x6c7d8c:0x5a4530,scale:0.8});
+      // M-Peuple-proc : alternance bourgeois (melon + journal) / ouvrière
+      // (fichu + panier) — la clientèle du marché de vente.
+      const c = spawnFigure({ type: (i%2===0) ? 'bourgeois' : 'ouvriere', anim:'idle' });
       c.position.set(-6+i*2.6,0,7.5+(i%2)*1.6); c.rotation.y=Math.PI+(i*0.4);
       tagLayer(c,'demande'); mv.add(c);
     }
@@ -5773,6 +5815,65 @@ function updateConsequences(){
       const sign=makeLabel('FAILLITE'); sign.scale.set(6,1.4,1);
       sign.position.set(-5+i*5,8+i*1.6,0); sign.userData.layer='faillite'; bo.add(sign);
     });
+  }
+  // M-Peuple-proc : flâneurs sur le parvis de la Bourse, 3 à 5 selon
+  // l'argent. Capitalistes (haut-de-forme, canne) et bourgeois (melon,
+  // journal) mêlés. Un fonctionnaire en faction.
+  if(bo && state.buildings && state.buildings.bourse>0){
+    clearLayer(bo,'flaneurs');
+    const argent = Math.max(0, state.argent || 0);
+    const nFl = Math.max(3, Math.min(5, 3 + Math.floor(argent / 800)));
+    for(let i=0;i<nFl;i++){
+      const fig = spawnFigure({ type: (i%2===0) ? 'capitaliste' : 'bourgeois', anim:'idle' });
+      fig.position.set(-6 + (i/nFl)*12, 0, 9 + (i%2)*1.2);
+      fig.rotation.y = Math.PI + i*0.13;
+      tagLayer(fig,'flaneurs'); bo.add(fig);
+    }
+    const func = spawnFigure({ type:'fonctionnaire', anim:'idle' });
+    func.position.set(7, 0, 8); func.rotation.y = Math.PI*0.92;
+    tagLayer(func,'flaneurs'); bo.add(func);
+  }
+  // M-Peuple-proc : dockers en va-et-vient sur le quai du port (patrouille
+  // réelle), nombre lié au cycle pour rester vivant.
+  const po = zoneGroups['Port · Marché mondial'];
+  if(po && state.buildings && state.buildings.port>0){
+    clearLayer(po,'dockers');
+    const nDk = 3 + ((state.cycle||0) % 2);
+    for(let i=0;i<nDk;i++){
+      const zOff = 5 + (i%2)*1.4;
+      const fig = spawnFigure({
+        type:'ouvrier',
+        patrol:{ ax:-7, az:zOff, bx:7, bz:zOff, period:12 + (i%3)*2 },
+      });
+      tagLayer(fig,'dockers'); po.add(fig);
+    }
+  }
+  // M-Peuple-proc : attroupement devant l'usine quand la colère dépasse
+  // le seuil des banderoles (0.4). Type ouvrier, anim angry (bras levé).
+  if(us && (state.colere||0) > 0.4){
+    clearLayer(us,'attroup');
+    const n = Math.min(7, 3 + Math.floor((state.colere - 0.4) * 10));
+    for(let i=0;i<n;i++){
+      const a = (i / n - 0.5) * Math.PI * 0.7;
+      const fig = spawnFigure({ type:'ouvrier', anim:'angry' });
+      fig.position.set(Math.sin(a)*7, 0, 11 + Math.cos(a)*1.8);
+      fig.rotation.y = Math.PI;
+      tagLayer(fig,'attroup'); us.add(fig);
+    }
+  } else if(us){
+    clearLayer(us,'attroup');
+  }
+  // M-Peuple-proc : paysans rares aux Terres communes (anim work). Tint
+  // brun-terre pour les distinguer des ouvriers d'usine.
+  const tc = zoneGroups['Terres communes'];
+  if(tc){
+    clearLayer(tc,'paysans');
+    for(let i=0;i<2;i++){
+      const fig = spawnFigure({ type:'ouvrier', anim:'work', tint:0x4a3c2a });
+      fig.position.set(-3 + i*5, 0, 3 + (i%2)*2);
+      fig.rotation.y = Math.PI*0.5 + (i%2 ? 0.3 : -0.3);
+      tagLayer(fig,'paysans'); tc.add(fig);
+    }
   }
   document.getElementById('crisisVeil').classList.toggle('on', !!state.d.declenche || (state.d.risqueCrise||0)>0.85);
   document.getElementById('crisisTag').classList.toggle('on', !!state.d.declenche);
@@ -8201,6 +8302,13 @@ let clock;
 export function init(opts={}){
   if(opts.environment !== undefined) _bootedEnv = opts.environment;
   buildWorld();
+  // M-Peuple-d : initialise le module GLTF AVANT tout placement de figures
+  // (Vehicle.build pose le driver, CompetitorWorld.build et populateEnvironment
+  // peupleront aussi via spawnFigure). Sans cela, les premiers appels
+  // retomberaient sur le stub invisible.
+  try{ Peuple.init(); }catch(e){
+    console.warn('[M-Peuple] init :', e&&e.message||e);
+  }
   CompetitorWorld.build();          // v48 : districts concurrents (cachés jusqu'à la formation sociale)
   Vehicle.build();
   camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.1,400);
@@ -8369,7 +8477,20 @@ function tabHouse(x,z,kind){
   g.position.set(x,0,z); return tabAdd(g);
 }
 function tabFigure(x,z,color,pose,rotY){
-  const f=createWorkerFigure({color:color, scale:0.95, pose:pose}); f.position.set(x,0,z); if(rotY)f.rotation.y=rotY; return tabAdd(f);
+  // M-Peuple-proc : tabFigure produit une figure procédurale via spawnFigure.
+  // Mapping pose → type/anim (slump → chomeur idle, strike → ouvrier angry,
+  // les gendarmes utilisent un type 'fonctionnaire' implicite via la couleur
+  // d'uniforme). La couleur du caller surcharge le vêtement via tint.
+  const isGendarme = (color === 0x222c3a);
+  const type = isGendarme        ? 'fonctionnaire'
+             : pose === 'slump'  ? 'chomeur'
+             : 'ouvrier';
+  const anim = pose === 'strike' ? 'angry'
+             : pose === 'walk'   ? 'walk'
+             : 'idle';
+  const f = spawnFigure({ type, anim, tint: color });
+  f.position.set(x,0,z); if(rotY) f.rotation.y=rotY;
+  return tabAdd(f);
 }
 function buildSocialTableau(){
   if(typeof scene==='undefined'||!scene) return;
@@ -8403,7 +8524,14 @@ function buildSocialTableau(){
       const BX=30, BZ=-78;
       tabAdd(makeLabelMesh('Beaux quartiers', BX, 11, BZ-2));
       for(let i=0;i<nRiche;i++){ const hx=BX-8+(i%4)*5.5, hz=BZ-4+Math.floor(i/4)*6; tabHouse(hx,hz,'riche'); }
-      if(prosp>0.5){ tabFigure(BX-2,BZ+5,0x6b2f2f,'idle',Math.PI); tabFigure(BX+2,BZ+5,0x3a3a55,'idle',Math.PI); } // bourgeois en promenade
+      if(prosp>0.5){
+        // M-Peuple-d : bourgeois en promenade — melon, posture droite,
+        // l'un statique, l'autre qui surveille les passants.
+        const b1 = spawnFigure({ type:'bourgeois', anim:'idle', tint:0x6b2f2f });
+        b1.position.set(BX-2,0,BZ+5); b1.rotation.y=Math.PI; tabAdd(b1);
+        const b2 = spawnFigure({ type:'bourgeois', anim:'idle', tint:0x3a3a55 });
+        b2.position.set(BX+2,0,BZ+5); b2.rotation.y=Math.PI; tabAdd(b2);
+      }
     }
     // ---- 3. QUARTIER OUVRIER : grandit avec le nombre, s'organise, ou s'enfonce dans la misère ----
     const pop = Math.max(s.travailleurs, Math.round(s.populationActive||s.travailleurs));
@@ -8429,7 +8557,10 @@ function buildSocialTableau(){
     }
     if(misere>0.78){
       // mourir de faim : une silhouette à terre
-      const fallen=createWorkerFigure({color:0x55504a, scale:0.95}); fallen.position.set(QO.x-2, 0.4, QO.z-13); fallen.rotation.z=Math.PI/2; tabAdd(fallen);
+      // M-Peuple-proc : silhouette à terre — type chomeur, anim idle puis
+      // rotation Z pour le coucher au sol.
+      const fallen = spawnFigure({ type:'chomeur', anim:'idle' });
+      fallen.position.set(QO.x-2, 0.4, QO.z-13); fallen.rotation.z=Math.PI/2; tabAdd(fallen);
       tabAdd(makeLabelMesh('La faim', QO.x-2, 3, QO.z-15));
     }
     // ---- 5. RÉPRESSION D'ÉTAT : gendarmes en charge sur le quartier ouvrier ----
@@ -8930,41 +9061,11 @@ function _M7_fastBox(w, h, d, mat, x, y, z, castShadow=true){
   return m;
 }
 /* ouvrier articulé low-poly — compatible avec les pools (userData.head pour le bob) */
-function createWorkerFigure(opt){
-  const o=(opt&&typeof opt==='object')?opt:{color:opt};
-  const cloth=o.color||THEME.worker, skin=0xb9966a, cap=(o.cap!=null?o.cap:0x2f3a44);
-  const sc=o.scale||(0.92+Math.random()*0.16);
-  const g=new THREE.Group();
-  const torso=box(0.78,0.95,0.5,cloth,0,1.35,0,false);
-  const hips=box(0.7,0.3,0.46,0x3a3128,0,0.85,0,false);
-  const legL=box(0.3,0.85,0.34,0x33291d,-0.2,0.43,0,false);
-  const legR=box(0.3,0.85,0.34,0x33291d, 0.2,0.43,0,false);
-  const armL=box(0.2,0.8,0.24,cloth,-0.49,1.4,0,false);
-  const armR=box(0.2,0.8,0.24,cloth, 0.49,1.4,0,false);
-  const head=new THREE.Mesh(new THREE.SphereGeometry(0.3,10,8),stdMat(skin)); head.position.set(0,2.06,0); head.scale.set(1,1.08,1);
-  const capM=box(0.52,0.18,0.52,cap,0,2.3,0,false);
-  const brim=box(0.52,0.07,0.22,cap,0,2.23,0.3,false);
-  const nose=box(0.08,0.08,0.12,skin,0,2.03,0.31,false);
-  [torso,hips,legL,legR,armL,armR,head,capM,brim,nose].forEach(m=>g.add(m));
-  g.scale.setScalar(sc);
-  g.userData.head=head; g.userData.legL=legL; g.userData.legR=legR; g.userData.armL=armL; g.userData.armR=armR; g.userData.torso=torso;
-  if(o.pose) setWorkerPose(g,o.pose);
-  return g;
-}
-function createDetailedWorker(opt){ return createWorkerFigure(opt); }
-function setWorkerPose(w,pose){ const u=w.userData; if(!u||!u.torso) return;
-  if(pose==='idle'){ u.torso.rotation.x=0.04; }
-  else if(pose==='slump'){ u.torso.rotation.x=0.22; u.head.rotation.x=0.22; u.head.position.z=0.1; }
-  else if(pose==='strike'){ u.armR.rotation.z=2.35; u.armR.position.set(0.55,1.75,0); }
-  else if(pose==='walk'){ u.legL.rotation.x=0.4; u.legR.rotation.x=-0.4; }
-}
-function animateWorker(w,dt,moving){ const u=w.userData; if(!u||!u.legL) return;
-  u.armR.rotation.z*=0.85;
-  if(moving){ const ph=(u._ph=(u._ph||0)+dt*8), s=Math.sin(ph)*0.5;
-    u.legL.rotation.x=s; u.legR.rotation.x=-s; u.armL.rotation.x=-s*0.7; u.armR.rotation.x=s*0.7;
-    w.position.y=(u._baseY||0)+Math.abs(Math.cos(ph))*0.06;
-  } else { u.legL.rotation.x*=0.8; u.legR.rotation.x*=0.8; u.armL.rotation.x*=0.8; u.armR.rotation.x*=0.8; }
-}
+/* M-Peuple-proc : l'ancien système procédural (createWorkerFigure /
+   createDetailedWorker / setWorkerPose / animateWorker) a été supprimé.
+   Le nouveau module Peuple (figures stylisées construites à la main) est
+   la seule population du monde. tabFigure est conservé en helper et route
+   vers spawnFigure avec mapping pose→type/anim. */
 function createSmokeStack(h=11,color=COL.charbon){
   const g=new THREE.Group(); g.add(box(1.8,h,1.8,color,0,h/2,0));
   g.add(box(2.2,0.6,2.2,COL.fer,0,h,0,false)); return g;
@@ -9597,7 +9698,9 @@ function populateMeansMarket(){ placeAround('Marché des moyens',[
 ]); }
 function populateLaborSquare(){ placeAround('Marché du travail',[
   [()=>createPosterBoard('Ft — FORCE DE TRAVAIL'),0,10,0,0],
-  [()=>createWorkerFigure(),-3,8,0,1], [()=>createWorkerFigure(),-1.5,8.6,0,1], [()=>createWorkerFigure(),0,9,0,1],
+  [()=>spawnFigure({type:'ouvrier',  anim:'idle'}),-3,  8,  0,1],
+  [()=>spawnFigure({type:'ouvriere', anim:'idle'}),-1.5,8.6,0,1],
+  [()=>spawnFigure({type:'ouvrier',  anim:'idle'}), 0,  9,  0,1],
   [()=>box(2.4,0.4,0.7,0x5a4530,0,0.4,0,false),5,8,0,0],   // banc
   [()=>createWorkerHouse(2.8),11,6,0,2], [()=>createWorkerHouse(3.0),12,9,0,2],
   [()=>createLampPost(),-8,7,0,0], [()=>createFenceSegment(6),-7,10,0,0],
@@ -9848,7 +9951,13 @@ const LivingWorld={
     return Math.max(0.06,Math.min(1,a));
   },
 
-  mkWorker(col){ const g=createWorkerFigure(col); g.visible=false; this.grp.add(g); return g; },
+  mkWorker(col){
+    // M-Peuple-proc : routé vers spawnFigure. `col` peut être un hex
+    // (LivingWorld) ou un objet legacy. Le tint colore le vêtement.
+    const color = (typeof col === 'number') ? col : (col && col.color != null ? col.color : null);
+    const g = spawnFigure({ type:'ouvrier', anim:'idle', tint: color });
+    g.visible = false; this.grp.add(g); return g;
+  },
   mkCrate(){ const m=createCrate(1.5,COL.brun); m.visible=false; this.grp.add(m); return m; },
   /* v60 — la marchandise voyage en chariot : petit chariot + caisse colorée sur le plateau */
   mkCargo(){ const cart=createSmallCart(); const load=createCrate(1.15,COL.brun);
@@ -9919,20 +10028,28 @@ const LivingWorld={
     const nIdle=Math.min(state.enGreve?0:Math.min(4,idle),cap);
     let used=0;
     for(let i=0;i<this.workers.length;i++){ const w=this.workers[i],o=w.obj;
+      // M-Peuple-proc : ces ouvriers sont des figures procédurales
+      // (LivingWorld.mkWorker appelle spawnFigure). Leur animation est
+      // portée par le module Peuple ; on ne pilote ici que position/visibilité.
+      // Selon le rôle on bascule l'anim entre marche (commute) et idle.
       if(used<nGreve){                        // grève : regroupés devant l'usine
         const a=(used/Math.max(1,nGreve))*Math.PI-Math.PI/2;
         o.visible=true; o.position.set(U.x+Math.cos(a)*7,0,U.z+9+Math.sin(a)*2.5); o.rotation.y=Math.PI;
-        animateWorker(o,dt,false); if(o.userData.armR) o.userData.armR.rotation.z=2.35; used++; continue; }
+        if(o.userData) o.userData.anim='angry';
+        used++; continue; }
       if(used<nGreve+nCommute){               // navette quartier <-> usine
         const tri=Math.abs(((t*0.05*(0.5+A)+w.phase/6.28)%1)*2-1);
         o.visible=true; o.position.x=Q.x+(U.x-Q.x)*tri+Math.sin(w.phase)*1.5;
         o.position.z=Q.z+(U.z-Q.z)*tri+Math.cos(w.phase)*1.5; o.position.y=0;
         o.rotation.y=Math.atan2(U.x-Q.x,U.z-Q.z);
-        animateWorker(o,dt,true); used++; continue; }
+        if(o.userData) o.userData.anim='walk';
+        used++; continue; }
       if(used<nGreve+nCommute+nIdle){         // chômage : immobiles près du marché du travail
         const kk=used-nGreve-nCommute, base=(kk%2)?MT:Q;
         o.visible=true; o.position.set(base.x+((kk*1.7)%6)-3,0,base.z+(Math.floor(kk/2)%3)*1.6+4);
-        o.rotation.y=w.phase; animateWorker(o,dt,false); used++; continue; }
+        o.rotation.y=w.phase;
+        if(o.userData) o.userData.anim='idle';
+        used++; continue; }
       o.visible=false;
     }
   },
@@ -10004,7 +10121,7 @@ const LivingWorld={
       if(i>=nC){ o.visible=false; continue; }
       o.visible=true; const a=t*0.3+c.phase;
       o.position.set(V.x+Math.cos(a+i)*6,0,V.z+6+Math.sin(a*1.3+i)*3); o.rotation.y=a;
-      animateWorker(o,dt,true);
+      // M-Peuple-d : animation portée par le mixer GLTF, plus d'animateWorker.
     }
     const part=(state.d&&state.d.partJoueur!=null)?state.d.partJoueur:0.4;
     const press=Math.max(0,Math.min(1,1-part*1.4));
@@ -10095,6 +10212,570 @@ function LWmicro(name){
   else if(name==='Marché des moyens'){ fxCrate('Marché des moyens','Usine'); floatText('moyens achetés',{x:p.x,y:8,z:p.z},'neutre'); }
   else if(name==='Marché du travail'){ floatText('embauche',{x:p.x,y:8,z:p.z},'social'); }
 }
+
+
+/* ===================================================================
+   M-Peuple — figures de classe stylisées procédurales
+   Plus de GLTF : chaque personnage est assemblé à la main à partir de
+   ~10 volumes low-poly (bassin, torse, tête, bras×2 segments, jambes×2
+   segments, accessoire + outil). Cohérent avec l'esthétique de diorama
+   du monde. La CLASSE se lit au premier coup d'œil par :
+     • la silhouette (posture, tilt du buste, jupe/redingote/uniforme),
+     • la couleur (palette franche, materiel mat flat),
+     • l'accessoire (casquette, haut-de-forme, melon, képi, casque mineur),
+     • l'outil porté (pelle, marteau, panier, canne, journal).
+
+   API publique :
+     • Peuple.init()
+     • Peuple.spawnFigure({ type, anim, patrol, tint }) → Object3D
+     • Peuple.update(dt) — anime tout, applique le LOD, sweep des morts.
+
+   Le module LIT la simulation via les callsites historiques (updateConse-
+   quences, buildSocialTableau, CompetitorWorld, LivingWorld, …) mais
+   N'Y ÉCRIT JAMAIS. Pas de caméra, pas de HUD, pas de sol. Émissive
+   constante 0.12 (couleur de soi) → visible la nuit sans déclencher le
+   bloom (le mineur a 0.35 sur la lampe seulement, < threshold 0.82).
+   =================================================================== */
+const Peuple = (function(){
+  const ANIM_DIST_NEAR = 55;      // < : animation à chaque frame
+  const ANIM_DIST_MED  = 110;     // < : 1 frame sur 2
+  const ANIM_DIST_FAR  = 200;     // < : 1 frame sur 4 ; > : invisible
+  const MAX_FIGURES    = 140;     // garde-fou — au-delà, retourne un Group vide
+  const SWEEP_EVERY    = 2.0;     // s — recensement des figures détachées de la scène
+
+  const SKIN = 0xb88a5e;
+
+  // -----------------------------------------------------------------
+  // Classes — silhouette + couleur + accessoire + outil + posture.
+  // Les couleurs viennent de COLORSCRIPT (palette froide bleu-encre /
+  // contrastes chauds pour les outils et la peau).
+  // -----------------------------------------------------------------
+  const CLASS_DEFS = {
+    ouvrier:       { cloth:0x4d5f70, pants:0x2a241c, hat:'casquette',
+                     tool:'pelle',     tilt: 0.12, sleevesRoll:true },
+    ouvriere:      { cloth:0x445064, pants:0x33291d, hat:'fichu',
+                     tool:'panier',    tilt: 0.05, skirt:true },
+    chomeur:       { cloth:0x5b5346, pants:0x3a3128, hat:'casquette',
+                     hatColor:0x2a261f, tool:null,  tilt: 0.18 },
+    capitaliste:   { cloth:0x2a2a33, pants:0x16161a, hat:'cylindre',
+                     tool:'canne',     tilt:-0.05 },
+    bourgeois:     { cloth:0x8a8d96, pants:0x4a4d56, hat:'melon',
+                     tool:'journal',   tilt: 0.00 },
+    mineur:        { cloth:0x3a342e, pants:0x2a2622, hat:'casque-mineur',
+                     tool:'pelle',     tilt: 0.15 },
+    fonctionnaire: { cloth:0x2a3140, pants:0x1a1f28, hat:'kepi',
+                     tool:null,        tilt:-0.02 },
+  };
+
+  // -----------------------------------------------------------------
+  // Matériaux & géométries partagés. ZÉRO allocation par frame.
+  // -----------------------------------------------------------------
+  const _matCache = new Map();
+  function _mat(hex){
+    let m = _matCache.get(hex);
+    if(!m){
+      m = new THREE.MeshStandardMaterial({
+        color: hex,
+        emissive: new THREE.Color(hex),
+        emissiveIntensity: 0.12,        // < threshold bloom 0.82 — pas de fleur
+        roughness: 0.85, metalness: 0.0,
+        flatShading: true,
+      });
+      _matCache.set(hex, m);
+    }
+    return m;
+  }
+  const _emiMatCache = new Map();
+  function _emiMat(color, emissive){
+    const key = color + '|' + emissive;
+    let m = _emiMatCache.get(key);
+    if(!m){
+      m = new THREE.MeshStandardMaterial({
+        color, emissive: new THREE.Color(emissive),
+        emissiveIntensity: 0.35,
+        roughness: 0.7, metalness: 0.0, flatShading: true,
+      });
+      _emiMatCache.set(key, m);
+    }
+    return m;
+  }
+  const _geo = {};
+  function _g(key, ctor){ if(!_geo[key]) _geo[key] = ctor(); return _geo[key]; }
+
+  // -----------------------------------------------------------------
+  // Pièces de corps. Pieds à y=0, hauteur totale ~1.80 u.
+  // -----------------------------------------------------------------
+  function _makeArm(clothHex, sleevesRoll){
+    // upper = pivot épaule ; fore = pivot coude ; hand = pivot poignet.
+    const upper = new THREE.Group();
+    const upperMesh = new THREE.Mesh(
+      _g('arm_upper', ()=> new THREE.BoxGeometry(0.10, 0.36, 0.10)),
+      _mat(clothHex));
+    upperMesh.position.y = -0.18;
+    upper.add(upperMesh);
+    const fore = new THREE.Group();
+    fore.position.y = -0.36;
+    const foreColor = sleevesRoll ? SKIN : clothHex;
+    const foreMesh = new THREE.Mesh(
+      _g('arm_fore', ()=> new THREE.BoxGeometry(0.09, 0.32, 0.09)),
+      _mat(foreColor));
+    foreMesh.position.y = -0.16;
+    fore.add(foreMesh);
+    const hand = new THREE.Mesh(
+      _g('hand', ()=> new THREE.BoxGeometry(0.10, 0.09, 0.10)),
+      _mat(SKIN));
+    hand.position.y = -0.36;
+    fore.add(hand);
+    upper.add(fore);
+    upper.userData = { fore, hand };
+    return upper;
+  }
+  function _makeLeg(pantsHex){
+    const thigh = new THREE.Group();
+    const thighMesh = new THREE.Mesh(
+      _g('leg_thigh', ()=> new THREE.BoxGeometry(0.14, 0.40, 0.14)),
+      _mat(pantsHex));
+    thighMesh.position.y = -0.20;
+    thigh.add(thighMesh);
+    const shin = new THREE.Group();
+    shin.position.y = -0.40;
+    const shinMesh = new THREE.Mesh(
+      _g('leg_shin', ()=> new THREE.BoxGeometry(0.13, 0.38, 0.13)),
+      _mat(pantsHex));
+    shinMesh.position.y = -0.19;
+    shin.add(shinMesh);
+    const shoe = new THREE.Mesh(
+      _g('shoe', ()=> new THREE.BoxGeometry(0.16, 0.07, 0.22)),
+      _mat(0x1a1612));
+    shoe.position.set(0, -0.41, 0.04);
+    shin.add(shoe);
+    thigh.add(shin);
+    thigh.userData = { shin };
+    return thigh;
+  }
+  function _makeHat(kind, hatColor){
+    // Espace LOCAL du headGroup ; sommet du crâne ≈ y=0.23.
+    const g = new THREE.Group();
+    if(kind==='casquette'){
+      const col = hatColor || 0x1c1c20;
+      const calotte = new THREE.Mesh(
+        _g('cap_top', ()=> new THREE.CylinderGeometry(0.135, 0.135, 0.06, 10)),
+        _mat(col));
+      calotte.position.y = 0.26;
+      const visor = new THREE.Mesh(
+        _g('cap_visor', ()=> new THREE.BoxGeometry(0.22, 0.025, 0.10)),
+        _mat(col));
+      visor.position.set(0, 0.24, 0.14);
+      g.add(calotte); g.add(visor);
+    } else if(kind==='cylindre'){
+      const col = 0x0c0c10;
+      const corps = new THREE.Mesh(
+        _g('hat_top', ()=> new THREE.CylinderGeometry(0.11, 0.11, 0.22, 12)),
+        _mat(col));
+      corps.position.y = 0.36;
+      const brim = new THREE.Mesh(
+        _g('hat_brim', ()=> new THREE.CylinderGeometry(0.18, 0.18, 0.02, 14)),
+        _mat(col));
+      brim.position.y = 0.24;
+      g.add(corps); g.add(brim);
+    } else if(kind==='melon'){
+      const col = 0x2a282e;
+      const dome = new THREE.Mesh(
+        _g('melon_dome', ()=> new THREE.SphereGeometry(0.13, 10, 8, 0, Math.PI*2, 0, Math.PI/2)),
+        _mat(col));
+      dome.position.y = 0.23;
+      const brim = new THREE.Mesh(
+        _g('melon_brim', ()=> new THREE.CylinderGeometry(0.16, 0.16, 0.015, 14)),
+        _mat(col));
+      brim.position.y = 0.23;
+      g.add(dome); g.add(brim);
+    } else if(kind==='fichu'){
+      const col = hatColor || 0x3a3140;
+      const tissu = new THREE.Mesh(
+        _g('fichu_dome', ()=> new THREE.SphereGeometry(0.15, 10, 8, 0, Math.PI*2, 0, Math.PI*0.62)),
+        _mat(col));
+      tissu.position.y = 0.16;
+      g.add(tissu);
+      const drape = new THREE.Mesh(
+        _g('fichu_drape', ()=> new THREE.BoxGeometry(0.18, 0.14, 0.04)),
+        _mat(col));
+      drape.position.set(0, 0.04, -0.13);
+      g.add(drape);
+    } else if(kind==='kepi'){
+      const col = 0x1a1f28;
+      const cyl = new THREE.Mesh(
+        _g('kepi_cyl', ()=> new THREE.CylinderGeometry(0.13, 0.13, 0.10, 12)),
+        _mat(col));
+      cyl.position.y = 0.28;
+      const top = new THREE.Mesh(
+        _g('kepi_top', ()=> new THREE.CylinderGeometry(0.135, 0.135, 0.03, 12)),
+        _mat(col));
+      top.position.y = 0.34;
+      const visor = new THREE.Mesh(
+        _g('cap_visor', ()=> new THREE.BoxGeometry(0.22, 0.025, 0.10)),
+        _mat(col));
+      visor.position.set(0, 0.23, 0.14);
+      g.add(cyl); g.add(top); g.add(visor);
+    } else if(kind==='casque-mineur'){
+      const col = 0x2c2620;
+      const dome = new THREE.Mesh(
+        _g('helmet_dome', ()=> new THREE.SphereGeometry(0.14, 10, 8, 0, Math.PI*2, 0, Math.PI/2)),
+        _mat(col));
+      dome.position.y = 0.22;
+      const lampe = new THREE.Mesh(
+        _g('lamp_bulb', ()=> new THREE.SphereGeometry(0.035, 8, 6)),
+        _emiMat(0xffd9a0, COLORSCRIPT.gasLight));
+      lampe.position.set(0, 0.22, 0.15);
+      g.add(dome); g.add(lampe);
+    }
+    return g;
+  }
+  function _makeTool(kind){
+    const g = new THREE.Group();
+    if(kind==='pelle'){
+      const stick = new THREE.Mesh(
+        _g('shovel_stick', ()=> new THREE.BoxGeometry(0.035, 0.65, 0.035)),
+        _mat(0x6b4f30));
+      const blade = new THREE.Mesh(
+        _g('shovel_blade', ()=> new THREE.BoxGeometry(0.16, 0.18, 0.025)),
+        _mat(0x4a4236));
+      stick.position.y = -0.30;
+      blade.position.y = -0.62;
+      g.add(stick); g.add(blade);
+    } else if(kind==='marteau'){
+      const stick = new THREE.Mesh(
+        _g('hammer_stick', ()=> new THREE.BoxGeometry(0.035, 0.40, 0.035)),
+        _mat(0x6b4f30));
+      const head = new THREE.Mesh(
+        _g('hammer_head', ()=> new THREE.BoxGeometry(0.16, 0.06, 0.06)),
+        _mat(0x3a342e));
+      stick.position.y = -0.20;
+      head.position.y = -0.40;
+      g.add(stick); g.add(head);
+    } else if(kind==='panier'){
+      const basket = new THREE.Mesh(
+        _g('basket', ()=> new THREE.CylinderGeometry(0.14, 0.10, 0.16, 10)),
+        _mat(0x8a6b3a));
+      basket.position.y = -0.18;
+      g.add(basket);
+    } else if(kind==='canne'){
+      const stick = new THREE.Mesh(
+        _g('cane', ()=> new THREE.BoxGeometry(0.025, 0.60, 0.025)),
+        _mat(0x1a1612));
+      stick.position.y = -0.30;
+      g.add(stick);
+    } else if(kind==='journal'){
+      const paper = new THREE.Mesh(
+        _g('newspaper', ()=> new THREE.BoxGeometry(0.16, 0.20, 0.02)),
+        _mat(0xc9c2a8));
+      paper.position.y = -0.15;
+      paper.rotation.x = 0.4;
+      g.add(paper);
+    }
+    return g;
+  }
+
+  // -----------------------------------------------------------------
+  // buildFigure(type) — assemble le perso. Pieds à y=0, ~1.80 u.
+  // userData expose les pivots animables.
+  // -----------------------------------------------------------------
+  function buildFigure(type, opts){
+    const def = CLASS_DEFS[type] || CLASS_DEFS.ouvrier;
+    const cloth = (opts && opts.tint != null) ? opts.tint : def.cloth;
+    const root = new THREE.Group();
+    root.name = 'Peuple:' + type;
+
+    // BASSIN (haut des cuisses ≈ 0.85 u).
+    const pelvis = new THREE.Mesh(
+      _g('pelvis', ()=> new THREE.BoxGeometry(0.32, 0.22, 0.22)),
+      _mat(def.pants));
+    pelvis.position.y = 0.85;
+    root.add(pelvis);
+
+    // TORSE — Group pivot au sommet du bassin, tilt par classe.
+    const torso = new THREE.Group();
+    torso.position.y = 0.95;
+    torso.rotation.x = def.tilt || 0;
+    const torsoMesh = new THREE.Mesh(
+      _g('torso', ()=> new THREE.BoxGeometry(0.44, 0.55, 0.26)),
+      _mat(cloth));
+    torsoMesh.position.y = 0.28;
+    torso.add(torsoMesh);
+    root.add(torso);
+
+    // TÊTE (ovoïde, pas de visage).
+    const head = new THREE.Group();
+    head.position.y = 0.62;
+    const headMesh = new THREE.Mesh(
+      _g('head', ()=> new THREE.SphereGeometry(0.13, 10, 8)),
+      _mat(SKIN));
+    headMesh.scale.set(1, 1.15, 0.95);
+    headMesh.position.y = 0.08;
+    head.add(headMesh);
+    torso.add(head);
+    if(def.hat) head.add(_makeHat(def.hat, def.hatColor));
+
+    // BRAS — pivots aux épaules (suivent le tilt du buste).
+    const armL = _makeArm(cloth, def.sleevesRoll);
+    armL.position.set(-0.26, 0.55, 0);
+    torso.add(armL);
+    const armR = _makeArm(cloth, def.sleevesRoll);
+    armR.position.set( 0.26, 0.55, 0);
+    torso.add(armR);
+
+    // OUTIL — dans la main droite.
+    if(def.tool){
+      const tool = _makeTool(def.tool);
+      armR.userData.hand.add(tool);
+    }
+
+    // JAMBES — sur le root (indépendantes du tilt du buste).
+    const legL = _makeLeg(def.pants);
+    legL.position.set(-0.10, 0.85, 0);
+    root.add(legL);
+    const legR = _makeLeg(def.pants);
+    legR.position.set( 0.10, 0.85, 0);
+    root.add(legR);
+
+    // JUPE (ouvriere) — drape sur les cuisses, mollets visibles.
+    if(def.skirt){
+      const skirt = new THREE.Mesh(
+        _g('skirt', ()=> new THREE.CylinderGeometry(0.22, 0.32, 0.55, 12, 1, true)),
+        _mat(cloth));
+      skirt.position.y = 0.60;
+      root.add(skirt);
+    }
+
+    root.userData = {
+      type, def,
+      armL, armR,
+      foreL: armL.userData.fore, foreR: armR.userData.fore,
+      legL, legR,
+      shinL: legL.userData.shin, shinR: legR.userData.shin,
+      head, torso,
+      baseY: 0,
+      phase: Math.random() * 6.2831853,
+      speed: 0.85 + Math.random() * 0.30,
+      anim: 'idle',
+      patrol: null, patrolT: 0,
+      lodTick: 0,
+      idleLook: Math.random() * 6.28,
+      _autoHidden: false,
+    };
+    return root;
+  }
+
+  // -----------------------------------------------------------------
+  // Animation procédurale — 4 boucles via uTime partagé. Zéro alloc.
+  // -----------------------------------------------------------------
+  function _animate(fig, t){
+    const u = fig.userData;
+    const ph = u.phase;
+    const sp = u.speed;
+    const def = u.def;
+    const tiltBase = def.tilt || 0;
+    const anim = u.anim;
+
+    if(anim === 'walk'){
+      const w = t * 6 * sp + ph;
+      const swing = Math.sin(w) * 0.55;
+      u.legL.rotation.x = swing;
+      u.legR.rotation.x = -swing;
+      u.shinL.rotation.x = Math.max(0, -swing * 0.55);
+      u.shinR.rotation.x = Math.max(0,  swing * 0.55);
+      u.armL.rotation.x = -swing * 0.45;
+      u.armR.rotation.x =  swing * 0.45;
+      u.armL.rotation.z = 0; u.armR.rotation.z = 0;
+      u.foreL.rotation.x =  swing * 0.30;
+      u.foreR.rotation.x = -swing * 0.30;
+      u.torso.rotation.x = tiltBase;
+      u.torso.rotation.y = 0; u.torso.rotation.z = 0;
+      u.head.rotation.y = 0;
+      fig.position.y = u.baseY + Math.abs(Math.cos(w)) * 0.04;
+    } else if(anim === 'work'){
+      const w = t * 3.2 * sp + ph;
+      const s = Math.sin(w);
+      u.armR.rotation.x = -0.30 + s * 0.85;
+      u.armL.rotation.x = -0.20 + s * 0.55;
+      u.armR.rotation.z = 0; u.armL.rotation.z = 0;
+      u.foreR.rotation.x = -0.55 - s * 0.40;
+      u.foreL.rotation.x = -0.45 - s * 0.30;
+      u.torso.rotation.x = tiltBase + s * 0.05;
+      u.torso.rotation.y = s * 0.10;
+      u.torso.rotation.z = 0;
+      u.legL.rotation.x =  0.05;
+      u.legR.rotation.x = -0.05;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = 0;
+      fig.position.y = u.baseY;
+    } else if(anim === 'angry'){
+      const w = t * 4 * sp + ph;
+      const s = Math.sin(w);
+      u.armR.rotation.z = -2.0 + s * 0.20;          // bras levé droit
+      u.armR.rotation.x = -0.25;
+      u.foreR.rotation.x = -1.10;
+      u.armL.rotation.x = Math.sin(w + 1.1) * 0.45;
+      u.armL.rotation.z = 0;
+      u.foreL.rotation.x = -0.55;
+      u.torso.rotation.x = tiltBase + Math.sin(t * 3 + ph) * 0.04;
+      u.torso.rotation.y = 0;
+      u.torso.rotation.z = 0;
+      u.legL.rotation.x = 0; u.legR.rotation.x = 0;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = Math.sin(w * 0.7) * 0.20;
+      fig.position.y = u.baseY;
+    } else {
+      // idle : léger balancement, tête qui se tourne parfois.
+      const w = t * 1.4 + ph;
+      u.torso.rotation.x = tiltBase;
+      u.torso.rotation.y = 0;
+      u.torso.rotation.z = Math.sin(w) * 0.03;
+      u.armL.rotation.x = Math.sin(w) * 0.04;
+      u.armR.rotation.x = -Math.sin(w) * 0.04;
+      u.armL.rotation.z = 0; u.armR.rotation.z = 0;
+      u.foreL.rotation.x = 0; u.foreR.rotation.x = 0;
+      u.legL.rotation.x = 0; u.legR.rotation.x = 0;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = Math.sin(t * 0.3 + u.idleLook) * 0.4;
+      fig.position.y = u.baseY;
+    }
+  }
+
+  function _patrolStep(e, dt){
+    const u = e.userData;
+    const p = u.patrol; if(!p) return;
+    const per = p.period || 8;
+    u.patrolT = (u.patrolT + dt) % per;
+    const phase = u.patrolT / per;
+    const goingForward = phase < 0.5;
+    const k = goingForward ? (phase * 2) : ((1 - phase) * 2);
+    e.position.x = p.ax + (p.bx - p.ax) * k;
+    e.position.z = p.az + (p.bz - p.az) * k;
+    const dx = goingForward ? (p.bx - p.ax) : (p.ax - p.bx);
+    const dz = goingForward ? (p.bz - p.az) : (p.az - p.bz);
+    e.rotation.y = Math.atan2(dx, dz);
+    u.anim = 'walk';
+  }
+
+  // -----------------------------------------------------------------
+  // État module + API
+  // -----------------------------------------------------------------
+  const state_ = {
+    ready: false,
+    figures: [],          // Object3D racines de chaque figure
+    _camPos: new THREE.Vector3(),
+    _t: 0,
+    _sweepT: 0,
+    _budgetMs: 0,
+    _spawnCount: 0,
+  };
+
+  function init(){
+    if(state_.ready) return;
+    state_.ready = true;
+    console.info('[M-Peuple] prêt · système procédural ·',
+      'classes:', Object.keys(CLASS_DEFS).join(','));
+  }
+
+  /**
+   * Spawn une figure stylisée procédurale.
+   * @param {Object} opts
+   * @param {string} opts.type   'ouvrier'|'ouvriere'|'chomeur'|'capitaliste'|
+   *                             'bourgeois'|'mineur'|'fonctionnaire'
+   * @param {string} opts.anim   'idle'|'walk'|'work'|'angry'
+   * @param {Object} opts.patrol {ax,az,bx,bz,period}  patrouille A↔B (force anim=walk)
+   * @param {number} opts.tint   surcharge la couleur de vêtement (firms, variantes)
+   */
+  function spawnFigure(opts){
+    opts = opts || {};
+    if(!state_.ready || state_.figures.length >= MAX_FIGURES){
+      const g = new THREE.Group(); g.visible = false; return g;
+    }
+    const root = buildFigure(opts.type || 'ouvrier', opts);
+    if(opts.anim) root.userData.anim = opts.anim;
+    if(opts.patrol){
+      root.userData.patrol = opts.patrol;
+      root.userData.patrolT = Math.random() * (opts.patrol.period || 8);
+      root.userData.anim = 'walk';
+      _patrolStep(root, 0);
+    }
+    state_.figures.push(root);
+    state_._spawnCount++;
+    return root;
+  }
+
+  function update(dt){
+    if(!state_.ready) return;
+    const t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    const cam = (typeof camera !== 'undefined') ? camera : null;
+    if(cam) state_._camPos.copy(cam.position);
+    state_._t += dt;
+    state_._sweepT += dt;
+    const doSweep = state_._sweepT >= SWEEP_EVERY;
+    if(doSweep) state_._sweepT = 0;
+    const T = state_._t;
+    const figs = state_.figures;
+    const camx = state_._camPos.x, camz = state_._camPos.z;
+    let writeIdx = 0;
+    for(let i = 0; i < figs.length; i++){
+      const e = figs[i];
+      let attached = !!e.parent;
+      if(attached && doSweep){
+        let p = e.parent;
+        while(p){ if(p === scene) break; p = p.parent; }
+        if(!p) attached = false;
+      }
+      if(!attached) continue;
+      if(e.userData.patrol) _patrolStep(e, dt);
+      const dx = e.position.x - camx;
+      const dz = e.position.z - camz;
+      const d2 = dx*dx + dz*dz;
+      if(d2 > ANIM_DIST_FAR*ANIM_DIST_FAR){
+        if(e.visible){ e.visible = false; e.userData._autoHidden = true; }
+        figs[writeIdx++] = e; continue;
+      } else if(e.userData._autoHidden && !e.visible){
+        e.visible = true; e.userData._autoHidden = false;
+      }
+      if(!e.visible){ figs[writeIdx++] = e; continue; }
+      let doAnim;
+      if(d2 < ANIM_DIST_NEAR*ANIM_DIST_NEAR){
+        doAnim = true;
+      } else if(d2 < ANIM_DIST_MED*ANIM_DIST_MED){
+        e.userData.lodTick++;
+        if(e.userData.lodTick >= 2){ e.userData.lodTick = 0; doAnim = true; }
+        else doAnim = false;
+      } else {
+        e.userData.lodTick++;
+        if(e.userData.lodTick >= 4){ e.userData.lodTick = 0; doAnim = true; }
+        else doAnim = false;
+      }
+      if(doAnim) _animate(e, T);
+      figs[writeIdx++] = e;
+    }
+    figs.length = writeIdx;
+    if(t0){
+      const ms = performance.now() - t0;
+      state_._budgetMs = state_._budgetMs * 0.9 + ms * 0.1;
+    }
+  }
+
+  function debug(){
+    return {
+      ready: state_.ready,
+      live: state_.figures.length,
+      spawned: state_._spawnCount,
+      budgetMs: +state_._budgetMs.toFixed(2),
+    };
+  }
+
+  return { init, spawnFigure, buildFigure, update, debug, CLASS_DEFS };
+})();
+if(typeof window!=='undefined') window.__peuple = Peuple;
+
+/* Bridge global utilisé par tous les anciens callsites. Sûr d'appeler
+   avant Peuple.init() — retourne alors un Group vide invisible. */
+function spawnFigure(opts){ return Peuple.spawnFigure(opts); }
+
 
 
 /* --- nettoyage des effets cinématiques pour éviter tout coût résiduel après l'intro --- */
@@ -11068,8 +11749,12 @@ const CompetitorWorld={
       for(let i=0;i<n;i++) add(createCrate(1.3,0x8a6b49)).position.set(-9.5+(i%4)*1.8,0.65,2.8+Math.floor(i/4)*1.8);
       // ouvriers ∝ effectif, dans la cour (mêmes proportions que le tableau du joueur)
       const w=Math.min(5,Math.ceil(c.workers/2.5));
-      for(let i=0;i<w;i++){ const f=createWorkerFigure({color:c.couleur,scale:0.85});
-        f.position.set(-4+i*2.1,0,6.6); f.rotation.y=Math.PI; add(f); }
+      for(let i=0;i<w;i++){
+        // M-Peuple-proc : ouvriers de la firme en travail (anim work).
+        // Tint = couleur de la firme pour distinguer visuellement.
+        const f = spawnFigure({ type:'ouvrier', anim:'work', tint: c.couleur });
+        f.position.set(-4+i*2.1,0,6.6); f.rotation.y=Math.PI; add(f);
+      }
       // machines visibles ∝ mécanisation
       for(let i=0;i<Math.min(4,c.machineLevel-1);i++){
         const m=new THREE.Mesh(new THREE.CylinderGeometry(0.8,0.8,1.2,10),
@@ -11091,8 +11776,11 @@ const CompetitorWorld={
           new THREE.MeshBasicMaterial({color:0x1a1712,transparent:true,opacity:c.rachete?0.18:0.42,depthWrite:false}));
         veil.rotation.x=-Math.PI/2; veil.position.y=0.05; add(veil);
         const sg=makeLabel(c.rachete?'RACHETÉ':'FAILLITE — FERMÉ'); sg.scale.set(8,1.5,1); sg.position.set(0,7.5,3); add(sg);
-        if(!c.rachete) for(let i=0;i<3;i++){ const f=createWorkerFigure({color:0x46535e,scale:0.85});
-          f.position.set(-4+i*3,0,8.5); add(f); }   // ouvriers dehors
+        if(!c.rachete) for(let i=0;i<3;i++){
+          // M-Peuple-proc : ouvriers licenciés dehors — type chomeur.
+          const f = spawnFigure({ type:'chomeur', anim:'idle' });
+          f.position.set(-4+i*3,0,8.5); add(f);
+        }
       }
       // au district : pas de prix (il s'affiche sur le marché COMMUN) — juste l'enseigne d'activité
       const pb=createPriceBoard(c.vivant?'⚒':'✕');
@@ -12796,7 +13484,9 @@ CompetitorWorld.updateCommuters=function(dt){
   // initialisation paresseuse
   if(!this.commuters.length){
     for(const c of firms){
-      const f=createWorkerFigure({color:c.couleur,scale:0.95}); scene.add(f);
+      // M-Peuple-proc : navetteurs en marche, tintés à la firme.
+      const f = spawnFigure({ type:'ouvrier', anim:'walk', tint: c.couleur });
+      scene.add(f);
       this.commuters.push({obj:f, firm:c, p:Math.random()});
     }
   }
@@ -12809,7 +13499,8 @@ CompetitorWorld.updateCommuters=function(dt){
     const tx=c.district.x+3.5, tz=c.district.z+6.5;
     o.position.set(QO.x+(tx-QO.x)*k, 0, QO.z+(tz-QO.z)*k);
     o.rotation.y=Math.atan2((cm.p<0.5?1:-1)*(tx-QO.x),(cm.p<0.5?1:-1)*(tz-QO.z));
-    if(typeof animateWorker==='function') animateWorker(o,dt,true);
+    // M-Peuple-c : plus d'animation procédurale ; les commuters héritent
+    // d'un Group invisible. Les navetteurs visibles sont gérés par Peuple.
   }
 };
 
@@ -12914,7 +13605,8 @@ const CycleCinematic={
     const travail=zonePos('Marché du travail'), usine=zonePos('Usine'), banque=zonePos('Banque'), moyens=zonePos('Marché des moyens'), entrepot=zonePos('Entrepôt'), vente=zonePos('Marché de vente');
     const workerN=Math.max(4,Math.min(9,state.travailleurs||6));
     for(let i=0;i<workerN;i++){
-      const w=createWorkerFigure({color:i%2?COL.bleu:COL.froid,scale:0.88});
+      // M-Peuple-proc : acteurs cinématiques — ouvriers en marche.
+      const w = spawnFigure({ type:'ouvrier', anim:'walk', tint: i%2 ? COL.bleu : COL.froid });
       const off={x:(i%3-1)*1.6, z:(Math.floor(i/3)-1)*1.3};
       w.position.set(travail.x+off.x,0,travail.z+off.z); w.visible=false; g.add(w);
       this.workers.push({obj:w,off,phase:Math.random()*6.28});
@@ -12966,7 +13658,7 @@ const CycleCinematic={
       o.position.set(sx+(ux-sx)*k,0,sz+(uz-sz)*k);
       o.rotation.y=Math.atan2(ux-sx,uz-sz);
       if(k>0.98){ o.position.x+=Math.sin(t*5+i)*0.35*prodPulse; o.position.z+=Math.cos(t*4+i)*0.28*prodPulse; }
-      animateWorker(o,dt||0.04,k<0.98||prodPulse>0.05);
+      // M-Peuple-d : animation portée par le mixer GLTF, plus d'animateWorker.
     });
   },
   updateMoney(p){
@@ -13313,6 +14005,7 @@ function loop(){
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
+  Peuple.update(dt);                  // M-Peuple : figures de classe animées
   updateInteractiveProps(dt);
   updateFx();
   updateFloaters();

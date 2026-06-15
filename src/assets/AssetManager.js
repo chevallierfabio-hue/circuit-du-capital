@@ -156,7 +156,7 @@ export const DEFAULT_MANIFEST = {
     sunset: '/assets/hdri/industrial_sunset_puresky_2k.hdr',
   },
   models: {
-    test: '/assets/models/test/cube-draco.glb',
+    test:    '/assets/models/test/cube-draco.glb',
   },
   textures: {
     // (M1+ : KTX2 quand on aura un atlas)
