@@ -5671,35 +5671,12 @@ function updateConsequences(){
         new THREE.MeshStandardMaterial({color:0x4b4438,metalness:.35,roughness:.6,flatShading:true}));
       m.rotation.z=Math.PI/2; m.position.set(-5+i*2.1,1.2,5.5); m.userData.layer='mach'; m.castShadow=true; us.add(m);
     }
-    // --- chômage : file d'ouvriers GLTF devant l'usine (file ∝ chômage,
-    // 4 → 14 personnages selon le taux). M-Peuple-d : remplace l'ancien
-    // empilement de box+sphere par des figures animées en Idle.
+    // M-Peuple : chômage à l'usine + ouvriers au travail sont désormais
+    // gérés par PeuplePop (file marché du travail / ouvrier-emploi à
+    // l'usine). On NETTOIE les anciennes couches pour effacer toute figure
+    // résiduelle laissée par une version antérieure.
     clearLayer(us,'chom');
-    const chRatio = Math.max(0, Math.min(1, state.chomage || 0));
-    const nCh = Math.max(4, Math.min(14, Math.round(4 + chRatio * 10)));
-    for(let i=0;i<nCh;i++){
-      // M-Peuple-proc : type chomeur (palette terne, épaules basses).
-      // 1 sur 3 en ouvrier (avec outil) — la file mêle qui a perdu son
-      // travail et qui en cherche un nouveau.
-      const fig = spawnFigure({ type: (i%3===0) ? 'ouvrier' : 'chomeur', anim:'idle' });
-      fig.position.set(-8+(i%5)*1.8, 0, 8.5+Math.floor(i/5)*1.8);
-      fig.rotation.y = Math.PI + (i%2 ? -0.25 : 0.25);
-      tagLayer(fig,'chom'); us.add(fig);
-    }
-    // M-Peuple-proc : ouvriers/mineurs en travail dans la cour de l'usine,
-    // anim work (pelletage). Nombre lié aux travailleurs employés.
     clearLayer(us,'travail');
-    if(state.productionActive){
-      const nW = Math.max(2, Math.min(6, Math.round(2 + (state.travailleurs||0)*0.4)));
-      for(let i=0;i<nW;i++){
-        const a = (i / nW) * Math.PI - Math.PI/2;
-        const isMineur = (i%3===0);
-        const fig = spawnFigure({ type: isMineur ? 'mineur' : 'ouvrier', anim:'work' });
-        fig.position.set(Math.cos(a)*5.5, 0, Math.sin(a)*4.5 - 2);
-        fig.rotation.y = -a + Math.PI/2;
-        tagLayer(fig,'travail'); us.add(fig);
-      }
-    }
     // --- grève : barrière qui bloque l'usine ---
     clearLayer(us,'greve');
     if(state.enGreve){
@@ -5724,30 +5701,12 @@ function updateConsequences(){
       const crate=box(2.1,2.1,2.1,0x7d6242,cx,1.1,cz); crate.userData.layer='stock'; crate.rotation.y=(i*0.3); ent.add(crate);
     }
   }
-  // M-Peuple-proc : peuplement du quartier ouvrier — ouvrières devant
-  // les maisons, un mineur qui rentre, 2 passants en va-et-vient sur la
-  // ruelle principale.
+  // M-Peuple : le quartier ouvrier est désormais peuplé par PeuplePop
+  // (ouvriere-rue + ouvrier-passant, densité ∝ emploi + niveau quartier).
+  // On nettoie l'ancienne couche 'qpop' pour effacer toute silhouette
+  // résiduelle.
   const qPop = zoneGroups['Quartier ouvrier'];
-  if(qPop && state.buildings && state.buildings.quartier>0){
-    clearLayer(qPop,'qpop');
-    const np = 2 + (state.niveauVille>=3 ? 1 : 0);
-    for(let i=0;i<np;i++){
-      const f = spawnFigure({ type:'ouvriere', anim:'idle' });
-      f.position.set(-5 + i*3.2, 0, -4 + (i%2)*1.4);
-      f.rotation.y = (i%2) ? Math.PI*0.4 : -Math.PI*0.4;
-      tagLayer(f,'qpop'); qPop.add(f);
-    }
-    const min = spawnFigure({ type:'mineur', anim:'idle' });
-    min.position.set(6, 0, 4); min.rotation.y = Math.PI*0.8;
-    tagLayer(min,'qpop'); qPop.add(min);
-    // 2 passants en patrouille
-    const p1 = spawnFigure({ type:'ouvriere',
-      patrol:{ ax:-9, az:5,   bx:9, bz:5.4, period:18 } });
-    tagLayer(p1,'qpop'); qPop.add(p1);
-    const p2 = spawnFigure({ type:'ouvrier',
-      patrol:{ ax: 8, az:7,   bx:-8, bz:7.4, period:22 } });
-    tagLayer(p2,'qpop'); qPop.add(p2);
-  }
+  if(qPop){ clearLayer(qPop,'qpop'); }
   // --- colère : quartier qui s'assombrit + banderoles au-delà d'un seuil ---
   const q=zoneGroups['Quartier ouvrier'];
   if(q){ clearLayer(q,'col'); clearLayer(q,'dark');
@@ -5790,18 +5749,12 @@ function updateConsequences(){
       const sign=makeLabel('PRIX ✗'); sign.scale.set(6,1.4,1); sign.position.set(0,7,0);
       sign.userData.layer='crisemkt'; mv.add(sign);
     }
-    // v47 — demande faible = marché qui se vide : les clients désertent les étals.
-    // (relation rendue visible : tauxVente bas -> moins de silhouettes, enseigne MARCHÉ ATONE)
+    // v47/M-Peuple — la demande faible = marché qui se vide. Les clients
+    // sont peuplés par PeuplePop (rôle 'client', proportionnel au taux de
+    // vente). Ici on ne garde que l'enseigne ATONE et on nettoie l'ancienne
+    // couche 'demande' (anti-résidus).
     clearLayer(mv,'demande');
     const tv=(state.d&&state.d.tauxVente!=null)?state.d.tauxVente:1;
-    const clients=Math.round(5*clamp(tv));
-    for(let i=0;i<clients;i++){
-      // M-Peuple-proc : alternance bourgeois (melon + journal) / ouvrière
-      // (fichu + panier) — la clientèle du marché de vente.
-      const c = spawnFigure({ type: (i%2===0) ? 'bourgeois' : 'ouvriere', anim:'idle' });
-      c.position.set(-6+i*2.6,0,7.5+(i%2)*1.6); c.rotation.y=Math.PI+(i*0.4);
-      tagLayer(c,'demande'); mv.add(c);
-    }
     if(tv<0.6 && !crise){
       const sg=makeLabel('MARCHÉ ATONE'); sg.scale.set(7,1.4,1); sg.position.set(0,7,0);
       sg.userData.layer='demande'; mv.add(sg);
@@ -5816,65 +5769,17 @@ function updateConsequences(){
       sign.position.set(-5+i*5,8+i*1.6,0); sign.userData.layer='faillite'; bo.add(sign);
     });
   }
-  // M-Peuple-proc : flâneurs sur le parvis de la Bourse, 3 à 5 selon
-  // l'argent. Capitalistes (haut-de-forme, canne) et bourgeois (melon,
-  // journal) mêlés. Un fonctionnaire en faction.
-  if(bo && state.buildings && state.buildings.bourse>0){
-    clearLayer(bo,'flaneurs');
-    const argent = Math.max(0, state.argent || 0);
-    const nFl = Math.max(3, Math.min(5, 3 + Math.floor(argent / 800)));
-    for(let i=0;i<nFl;i++){
-      const fig = spawnFigure({ type: (i%2===0) ? 'capitaliste' : 'bourgeois', anim:'idle' });
-      fig.position.set(-6 + (i/nFl)*12, 0, 9 + (i%2)*1.2);
-      fig.rotation.y = Math.PI + i*0.13;
-      tagLayer(fig,'flaneurs'); bo.add(fig);
-    }
-    const func = spawnFigure({ type:'fonctionnaire', anim:'idle' });
-    func.position.set(7, 0, 8); func.rotation.y = Math.PI*0.92;
-    tagLayer(func,'flaneurs'); bo.add(func);
-  }
-  // M-Peuple-proc : dockers en va-et-vient sur le quai du port (patrouille
-  // réelle), nombre lié au cycle pour rester vivant.
+  // M-Peuple : parvis Bourse, dockers, attroupement, paysans Terres
+  // communes — tous gérés par PeuplePop (lectures de capital, port,
+  // colère, enclosure). Ici on se borne à NETTOYER les anciennes couches
+  // pour qu'aucune figure résiduelle ne subsiste si une session
+  // antérieure en avait laissé.
+  if(bo){ clearLayer(bo,'flaneurs'); }
   const po = zoneGroups['Port · Marché mondial'];
-  if(po && state.buildings && state.buildings.port>0){
-    clearLayer(po,'dockers');
-    const nDk = 3 + ((state.cycle||0) % 2);
-    for(let i=0;i<nDk;i++){
-      const zOff = 5 + (i%2)*1.4;
-      const fig = spawnFigure({
-        type:'ouvrier',
-        patrol:{ ax:-7, az:zOff, bx:7, bz:zOff, period:12 + (i%3)*2 },
-      });
-      tagLayer(fig,'dockers'); po.add(fig);
-    }
-  }
-  // M-Peuple-proc : attroupement devant l'usine quand la colère dépasse
-  // le seuil des banderoles (0.4). Type ouvrier, anim angry (bras levé).
-  if(us && (state.colere||0) > 0.4){
-    clearLayer(us,'attroup');
-    const n = Math.min(7, 3 + Math.floor((state.colere - 0.4) * 10));
-    for(let i=0;i<n;i++){
-      const a = (i / n - 0.5) * Math.PI * 0.7;
-      const fig = spawnFigure({ type:'ouvrier', anim:'angry' });
-      fig.position.set(Math.sin(a)*7, 0, 11 + Math.cos(a)*1.8);
-      fig.rotation.y = Math.PI;
-      tagLayer(fig,'attroup'); us.add(fig);
-    }
-  } else if(us){
-    clearLayer(us,'attroup');
-  }
-  // M-Peuple-proc : paysans rares aux Terres communes (anim work). Tint
-  // brun-terre pour les distinguer des ouvriers d'usine.
+  if(po){ clearLayer(po,'dockers'); }
+  if(us){ clearLayer(us,'attroup'); }
   const tc = zoneGroups['Terres communes'];
-  if(tc){
-    clearLayer(tc,'paysans');
-    for(let i=0;i<2;i++){
-      const fig = spawnFigure({ type:'ouvrier', anim:'work', tint:0x4a3c2a });
-      fig.position.set(-3 + i*5, 0, 3 + (i%2)*2);
-      fig.rotation.y = Math.PI*0.5 + (i%2 ? 0.3 : -0.3);
-      tagLayer(fig,'paysans'); tc.add(fig);
-    }
-  }
+  if(tc){ clearLayer(tc,'paysans'); }
   document.getElementById('crisisVeil').classList.toggle('on', !!state.d.declenche || (state.d.risqueCrise||0)>0.85);
   document.getElementById('crisisTag').classList.toggle('on', !!state.d.declenche);
 
@@ -6117,27 +6022,24 @@ function updatePrecapVisuals(){
         const c2=box(1.5,1.0,1.5,COL.brun,-2.6,0.5,4.6,false);  c2.userData.layer='pc'; ug.add(c2);
         const c3=box(1.2,0.8,1.2,COL.pierre,-5.4,0.4,5.0,false); c3.userData.layer='pc'; ug.add(c3);
       }
-      if(state.travailleurs>0){                       // un ouvrier dans l'atelier
-        const body=box(0.9,2.0,0.7,COL.bleu,2.6,1.0,3.4,false); body.userData.layer='pc'; ug.add(body);
-        const head=box(0.7,0.7,0.7,0xc9a06a,2.6,2.4,3.4,false); head.userData.layer='pc'; ug.add(head);
-      }
+      // M-Peuple-g : SUPPRIMÉ — c'était un ouvrier-statue en box (corps
+      // 0.9×2.0×0.7 COL.bleu + tête 0.7³ 0xc9a06a) ajouté dès que
+      // state.travailleurs>0. Doublon avec le 'ouvrier-emploi' de
+      // PeuplePop (figures procédurales animées à l'usine).
       if(state.firstProduced && !state.firstSold){    // la première marchandise
         const m=box(1.9,1.9,1.9,COL.or,0.5,0.95,5.2,false); m.userData.layer='pc'; ug.add(m);
       }
     }
   }
-  // Place d'embauche : 2-3 silhouettes une fois le marché du travail ouvert
+  // M-Peuple-g : SUPPRIMÉ — la "Place d'embauche : 2-3 silhouettes" était
+  // un ensemble de 3 box-statues (corps 0.8×1.9×0.6 COL.froid + tête
+  // 0.6³ 0xb9966a) plantées en avant du bureau dès que buildings.travail>0.
+  // Couleurs pâles + posture raide = exactement les "statues" décrites.
+  // La place est désormais peuplée par PeuplePop ('file-chomeurs'
+  // ∝ chômage réel, figures procédurales animées). On nettoie la couche
+  // 'pc' au cas où une session antérieure en aurait laissé.
   const tg=zoneGroups['Marché du travail'];
-  if(tg){
-    clearLayer(tg,'pc');
-    if(state.buildings.travail>0){
-      const xs=[-3,0,3.2], zs=[2.5,3.6,2.2];
-      for(let i=0;i<3;i++){
-        const b=box(0.8,1.9,0.6,COL.froid,xs[i],0.95,zs[i],false); b.userData.layer='pc'; tg.add(b);
-        const h=box(0.6,0.6,0.6,0xb9966a,xs[i],2.25,zs[i],false); h.userData.layer='pc'; tg.add(h);
-      }
-    }
-  }
+  if(tg){ clearLayer(tg,'pc'); }
 }
 function updateBuildings(){
   const b=state.buildings, zg=zoneGroups;
@@ -6191,15 +6093,14 @@ function updateBuildings(){
     }
   }
   // Marché du travail : file d'ouvriers plus longue
-  if(zg['Marché du travail']){ clearLayer(zg['Marché du travail'],'lvl');
-    const extra=Math.min(8,(b.travail-1)*2);
-    for(let i=0;i<extra;i++){ const x=-2-(i%2)*1.3, z=-3+i*1.2;
-      addLvl(zg['Marché du travail'], box(0.9,1.7,0.6,COL.bleu,x,1.05,z));
-      const head=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,8),
-        new THREE.MeshStandardMaterial({color:0x42525f,flatShading:true}));
-      head.position.set(x,2.2,z); addLvl(zg['Marché du travail'],head);
-    }
-  }
+  // M-Peuple-g : SUPPRIMÉ — c'était un empilement box+sphère
+  // (corps COL.bleu + tête 0x42525f) ajouté quand buildings.travail≥2.
+  // Ces silhouettes raides et claires apparaissaient comme des
+  // "statues" alignées devant le bureau d'embauche, sans animation
+  // ni rôle simulationnel. La FILE est désormais une lecture vivante
+  // de la simulation, gérée par PeuplePop ('file-chomeurs' devant le
+  // guichet, ∝ chômage réel, type chomeur procédural, anim idle).
+  if(zg['Marché du travail']){ clearLayer(zg['Marché du travail'],'lvl'); }
   // Port : activé -> halo + caisses d'import/export supplémentaires
   if(zg['Port · Marché mondial']){ clearLayer(zg['Port · Marché mondial'],'lvl');
     if(b.port>0){ goldHalo(zg['Port · Marché mondial']);
@@ -8381,6 +8282,13 @@ export function init(opts={}){
   const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
   addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
   populateEnvironment();
+  // M-Peuple : la population (effectifs par zone × rôle) initialise son
+  // pool ici, APRÈS buildWorld (zoneGroups peuplés) et populateEnvironment
+  // (figures décoratives placées). Elle ajoute ses propres figures dans
+  // chaque zone group, sans .userData.layer — clearLayer ne les touche pas.
+  try{ PeuplePop.init(); }catch(e){
+    console.warn('[M-Peuple/Pop] init :', e&&e.message||e);
+  }
   startIntroTrailer();
   // M1c — audit one-shot des émissifs après peuplement complet (log console.table)
   try{ auditEmissiveMaterials(); }catch(_){}
@@ -9697,10 +9605,10 @@ function populateMeansMarket(){ placeAround('Marché des moyens',[
   [()=>createPosterBoard('M — MOYENS'),-2,11,0,0], [()=>createLampPost(),10,8,0,0],
 ]); }
 function populateLaborSquare(){ placeAround('Marché du travail',[
+  // M-Peuple : les figures du marché du travail sont gérées par PeuplePop
+  // (file de chômeurs ∝ chômage réel). Plus aucun spawn décoratif ici, qui
+  // laissait des silhouettes pâles sans rôle ni rafraîchissement.
   [()=>createPosterBoard('Ft — FORCE DE TRAVAIL'),0,10,0,0],
-  [()=>spawnFigure({type:'ouvrier',  anim:'idle'}),-3,  8,  0,1],
-  [()=>spawnFigure({type:'ouvriere', anim:'idle'}),-1.5,8.6,0,1],
-  [()=>spawnFigure({type:'ouvrier',  anim:'idle'}), 0,  9,  0,1],
   [()=>box(2.4,0.4,0.7,0x5a4530,0,0.4,0,false),5,8,0,0],   // banc
   [()=>createWorkerHouse(2.8),11,6,0,2], [()=>createWorkerHouse(3.0),12,9,0,2],
   [()=>createLampPost(),-8,7,0,0], [()=>createFenceSegment(6),-7,10,0,0],
@@ -10020,37 +9928,13 @@ const LivingWorld={
   },
 
   updateWorkers(dt,A){
-    const Q=zonePos('Quartier ouvrier'),U=zonePos('Usine'),MT=zonePos('Marché du travail');
-    const employed=state.travailleurs|0, idle=Math.round(state.chomage*state.populationActive);
-    const cap=VISUAL_LIFE?Math.round(14*gQual()):3;
-    const nGreve=state.enGreve?Math.min(8,Math.max(2,employed)):0;
-    const nCommute=state.enGreve?0:Math.min(6,employed,cap);
-    const nIdle=Math.min(state.enGreve?0:Math.min(4,idle),cap);
-    let used=0;
-    for(let i=0;i<this.workers.length;i++){ const w=this.workers[i],o=w.obj;
-      // M-Peuple-proc : ces ouvriers sont des figures procédurales
-      // (LivingWorld.mkWorker appelle spawnFigure). Leur animation est
-      // portée par le module Peuple ; on ne pilote ici que position/visibilité.
-      // Selon le rôle on bascule l'anim entre marche (commute) et idle.
-      if(used<nGreve){                        // grève : regroupés devant l'usine
-        const a=(used/Math.max(1,nGreve))*Math.PI-Math.PI/2;
-        o.visible=true; o.position.set(U.x+Math.cos(a)*7,0,U.z+9+Math.sin(a)*2.5); o.rotation.y=Math.PI;
-        if(o.userData) o.userData.anim='angry';
-        used++; continue; }
-      if(used<nGreve+nCommute){               // navette quartier <-> usine
-        const tri=Math.abs(((t*0.05*(0.5+A)+w.phase/6.28)%1)*2-1);
-        o.visible=true; o.position.x=Q.x+(U.x-Q.x)*tri+Math.sin(w.phase)*1.5;
-        o.position.z=Q.z+(U.z-Q.z)*tri+Math.cos(w.phase)*1.5; o.position.y=0;
-        o.rotation.y=Math.atan2(U.x-Q.x,U.z-Q.z);
-        if(o.userData) o.userData.anim='walk';
-        used++; continue; }
-      if(used<nGreve+nCommute+nIdle){         // chômage : immobiles près du marché du travail
-        const kk=used-nGreve-nCommute, base=(kk%2)?MT:Q;
-        o.visible=true; o.position.set(base.x+((kk*1.7)%6)-3,0,base.z+(Math.floor(kk/2)%3)*1.6+4);
-        o.rotation.y=w.phase;
-        if(o.userData) o.userData.anim='idle';
-        used++; continue; }
-      o.visible=false;
+    // M-Peuple : la population (commute, grève visible, chômage) est
+    // désormais gérée par PeuplePop — source de vérité unique. On planque
+    // simplement le pool LivingWorld pour éviter le double affichage et
+    // toute silhouette orpheline.
+    for(let i=0;i<this.workers.length;i++){
+      const o = this.workers[i] && this.workers[i].obj;
+      if(o && o.visible) o.visible = false;
     }
   },
 
@@ -10113,15 +9997,12 @@ const LivingWorld={
   },
 
   updateMarketActivity(dt,A){
-    const V=zonePos('Marché de vente');
-    const risk=(state.d&&state.d.risqueCrise)||0, decl=!!(state.d&&state.d.declenche);
-    const dem=Math.min(1,0.2+A*0.8+((state.niveauVille||0)>=4?0.2:0));
-    const nC=decl?0:Math.round(this.customers.length*dem*(risk>0.6?0.4:1));
-    for(let i=0;i<this.customers.length;i++){ const c=this.customers[i],o=c.obj;
-      if(i>=nC){ o.visible=false; continue; }
-      o.visible=true; const a=t*0.3+c.phase;
-      o.position.set(V.x+Math.cos(a+i)*6,0,V.z+6+Math.sin(a*1.3+i)*3); o.rotation.y=a;
-      // M-Peuple-d : animation portée par le mixer GLTF, plus d'animateWorker.
+    // M-Peuple : la clientèle du Marché de vente est gérée par PeuplePop
+    // (rôle 'client'). On planque le pool legacy LivingWorld.customers
+    // pour éviter le double affichage.
+    for(let i=0;i<this.customers.length;i++){
+      const o = this.customers[i] && this.customers[i].obj;
+      if(o && o.visible) o.visible = false;
     }
     const part=(state.d&&state.d.partJoueur!=null)?state.d.partJoueur:0.4;
     const press=Math.max(0,Math.min(1,1-part*1.4));
@@ -10624,6 +10505,85 @@ const Peuple = (function(){
       u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
       u.head.rotation.y = Math.sin(w * 0.7) * 0.20;
       fig.position.y = u.baseY;
+    } else if(anim === 'farm'){
+      // paysan : labour/fauchage — torse penché, bras qui balayent.
+      const w = t * 2.6 * sp + ph;
+      const s = Math.sin(w);
+      u.torso.rotation.x = tiltBase + 0.42 + s * 0.06;
+      u.torso.rotation.y = s * 0.22;
+      u.torso.rotation.z = 0;
+      u.armR.rotation.x = -0.80 + s * 0.70;
+      u.armR.rotation.z = 0;
+      u.armL.rotation.x = -0.55 - s * 0.45;
+      u.armL.rotation.z = 0;
+      u.foreR.rotation.x = -0.55;
+      u.foreL.rotation.x = -0.30;
+      u.legL.rotation.x = 0.06; u.legR.rotation.x = -0.04;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = 0;
+      fig.position.y = u.baseY;
+    } else if(anim === 'sell'){
+      // marchand debout derrière son étal — hèle le client (bras qui se lève).
+      const w = t * 1.6 * sp + ph;
+      const s = Math.sin(w);
+      const raise = Math.max(0, s);
+      u.torso.rotation.x = tiltBase;
+      u.torso.rotation.y = 0;
+      u.torso.rotation.z = 0;
+      u.armR.rotation.x = -0.50 - raise * 1.30;
+      u.armR.rotation.z = -0.25 - raise * 0.45;
+      u.foreR.rotation.x = -0.30 - raise * 0.55;
+      u.armL.rotation.x = Math.sin(w * 0.7) * 0.06;
+      u.armL.rotation.z = 0;
+      u.foreL.rotation.x = -0.10;
+      u.legL.rotation.x = 0; u.legR.rotation.x = 0;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = Math.sin(w * 0.55) * 0.28;
+      fig.position.y = u.baseY;
+    } else if(anim === 'watch'){
+      // capitaliste / surveille — bras croisés, regard tournant.
+      const w = t * 0.9 + ph;
+      u.torso.rotation.x = tiltBase;
+      u.torso.rotation.y = Math.sin(w * 0.5) * 0.06;
+      u.torso.rotation.z = 0;
+      u.armR.rotation.x = -0.22;
+      u.armR.rotation.z =  1.10;
+      u.foreR.rotation.x = -1.20;
+      u.armL.rotation.x = -0.22;
+      u.armL.rotation.z = -1.10;
+      u.foreL.rotation.x = -1.20;
+      u.legL.rotation.x = 0; u.legR.rotation.x = 0;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = Math.sin(w * 0.4) * 0.55;
+      fig.position.y = u.baseY;
+    } else if(anim === 'stroll'){
+      // bourgeois — marche lente, journal en main, peu de balancement.
+      const w = t * 3.0 * sp + ph;
+      const swing = Math.sin(w) * 0.30;
+      u.legL.rotation.x = swing;
+      u.legR.rotation.x = -swing;
+      u.shinL.rotation.x = Math.max(0, -swing * 0.45);
+      u.shinR.rotation.x = Math.max(0,  swing * 0.45);
+      u.armL.rotation.x = -swing * 0.18;
+      u.armR.rotation.x =  swing * 0.18;
+      u.armL.rotation.z = 0; u.armR.rotation.z = 0;
+      u.foreL.rotation.x = 0; u.foreR.rotation.x = -0.45;     // tient le journal
+      u.torso.rotation.x = tiltBase;
+      u.torso.rotation.y = 0;
+      u.head.rotation.y = Math.sin(t * 0.4 + u.idleLook) * 0.22;
+      fig.position.y = u.baseY + Math.abs(Math.cos(w)) * 0.025;
+    } else if(anim === 'sit'){
+      // chomeur oisif — assis au bord de l'eau, buste penché.
+      u.torso.rotation.x = tiltBase + 0.28;
+      u.torso.rotation.y = 0;
+      u.torso.rotation.z = 0;
+      u.armR.rotation.x = -1.05; u.armR.rotation.z = 0; u.foreR.rotation.x = -0.60;
+      u.armL.rotation.x = -1.05; u.armL.rotation.z = 0; u.foreL.rotation.x = -0.60;
+      u.legL.rotation.x = -1.35; u.legR.rotation.x = -1.35;
+      u.shinL.rotation.x =  1.45; u.shinR.rotation.x =  1.45;
+      const w = t * 0.6 + ph;
+      u.head.rotation.y = Math.sin(w) * 0.18;
+      fig.position.y = u.baseY - 0.55;
     } else {
       // idle : léger balancement, tête qui se tourne parfois.
       const w = t * 1.4 + ph;
@@ -10775,6 +10735,347 @@ if(typeof window!=='undefined') window.__peuple = Peuple;
 /* Bridge global utilisé par tous les anciens callsites. Sûr d'appeler
    avant Peuple.init() — retourne alors un Group vide invisible. */
 function spawnFigure(opts){ return Peuple.spawnFigure(opts); }
+
+/* ===================================================================
+   M-Peuple — POPULATION COMME TRADUCTION DES RAPPORTS DE PRODUCTION
+   La population n'est plus du décor : chaque figure occupe une zone
+   logique, accomplit l'activité de sa CLASSE, et son nombre vit avec
+   la simulation (employés → ouvriers au travail, chômage → file, capi-
+   tal → parvis de la Bourse, enclosure → paysans qui disparaissent
+   des Terres communes, colère → attroupement + gendarmes).
+
+   Implémentation : POOL pré-alloué par (zone × rôle) ; on active/
+   désactive `visible` selon le compte calculé à partir de l'état.
+   Zéro allocation par frame. Throttle ~0.4 s — la population
+   bouge avec le temps social, pas avec le framerate.
+
+   LECTURE SEULE de `state`. N'écrit jamais dans la simulation, ne
+   touche ni HUD ni caméra ni bâtiments.
+   =================================================================== */
+const PeuplePop = (function(){
+  const THROTTLE = 0.40;        // s — rafraîchissement des effectifs
+  let _t = 0, _ready = false;
+  /** @type {Map<string,{figs:THREE.Object3D[],spec:object}>} */
+  let _slots = null;
+
+  // ---------- helpers lecture simulation (jamais d'écriture) ----------
+  const _safeS = ()=> (typeof state !== 'undefined' && state) ? state : null;
+  const _employed   = s => Math.max(0, s.travailleurs|0);
+  const _popActive  = s => Math.max(0, s.populationActive|0);
+  const _chomeursN  = s => Math.max(0, _popActive(s) - _employed(s));
+  const _enclosure  = s => Math.min(1, Math.max(0, (s.niveauVille||0)/7));
+  const _capitalAcc = s => Math.max(0, (s.profitCumule||0)) + Math.max(0, s.argent||0);
+  const _isProd     = s => !!s.productionActive;
+  const _hasBld     = (s,k) => !!(s.buildings && s.buildings[k]>0);
+  const _colere     = s => Math.max(0, Math.min(1, s.colere||0));
+  const _phaseGate  = ()=> (typeof gamePhase==='undefined') || gamePhase !== 'precapital';
+
+  // ---------- SPÉCIFICATIONS de rôle par zone ----------
+  // Chaque spec : { zone, role, type, anim, tint?, max, count(s), place(f,i,n) }
+  // - count(s) : effectif visé (entier ≥ 0), borné à max.
+  // - place(f,i,n) : positionne UNE figure existante (mutate fig.position
+  //   / fig.rotation / fig.userData.patrol). N'alloue rien.
+  const SPECS = [
+    // — Terres communes : paysans qui diminuent avec l'enclosure —
+    { zone:'Terres communes', role:'paysan', type:'ouvrier', anim:'farm',
+      tint:0x6b5a3a, max:6,
+      count: s => Math.round( Math.max(0, 6 * (1 - _enclosure(s))) ),
+      place: (f,i,n)=>{
+        const col = i % 3, row = Math.floor(i/3);
+        f.position.set(-6 + col*5, 0, -3 + row*4);
+        f.rotation.y = Math.PI*0.5 + (i%2 ? 0.30 : -0.30);
+      } },
+
+    // — Mines · Champs : mineurs en extraction —
+    { zone:'Mines · Champs', role:'mineur', type:'mineur', anim:'work', max:5,
+      count: s => _isProd(s)
+        ? Math.max(2, Math.min(5, 2 + Math.floor((s.niveauMachine||0)*0.5)))
+        : 1,
+      place: (f,i,n)=>{
+        const col = i % 3, row = Math.floor(i/3);
+        f.position.set(-5 + col*3, 0, 2 + row*3);
+        f.rotation.y = -0.3 + (i%2 ? 0.6 : -0.6);
+      } },
+
+    // — Usine : ouvriers réellement employés, anim work, orientés au bâtiment —
+    { zone:'Usine', role:'ouvrier-emploi', type:'ouvrier', anim:'work', max:10,
+      count: s => _isProd(s) ? Math.min(10, _employed(s)) : 0,
+      place: (f,i,n)=>{
+        const k = (i/Math.max(1,n) - 0.5);
+        const a = k * Math.PI * 0.9;
+        const r = 5.5 + (i%2)*1.6;
+        f.position.set(Math.sin(a)*r, 0, Math.cos(a)*r*0.55 - 1.8);
+        f.rotation.y = a + Math.PI;       // dos au sud, face au bâtiment
+      } },
+
+    // — Usine : capitaliste qui surveille (1, présent quand on emploie) —
+    { zone:'Usine', role:'capitaliste-surveille', type:'capitaliste', anim:'watch', max:1,
+      count: s => (_isProd(s) && _employed(s)>0) ? 1 : 0,
+      place: (f,i,n)=>{
+        f.position.set(-6.5, 0, 4.5);
+        f.rotation.y = Math.PI * 0.85;
+      } },
+
+    // — Port : dockers en va-et-vient sur le quai (patrol) —
+    { zone:'Port · Marché mondial', role:'docker', type:'ouvrier', anim:'walk', max:6,
+      count: s => _hasBld(s,'port') ? Math.max(2, Math.min(6, 3 + ((s.cycle||0)%2))) : 0,
+      place: (f,i,n)=>{
+        const zOff = 5 + (i%2)*1.4;
+        const per  = 12 + (i%3)*2;
+        if(!f.userData.patrol){
+          f.userData.patrol = { ax:-7, az:zOff, bx:7, bz:zOff, period:per };
+          f.userData.patrolT = Math.random() * per;
+        } else {
+          f.userData.patrol.az = zOff;
+          f.userData.patrol.bz = zOff;
+          f.userData.patrol.period = per;
+        }
+      } },
+
+    // — Port : désœuvrés au bord de l'eau (chomeur assis) —
+    { zone:'Port · Marché mondial', role:'desoeuvre', type:'chomeur', anim:'sit', max:4,
+      count: s => _hasBld(s,'port')
+        ? Math.min(4, Math.round(_chomeursN(s) * 0.30))
+        : 0,
+      place: (f,i,n)=>{
+        f.position.set(-9 + i*2.3, 0, -7.2);
+        f.rotation.y = 0;
+        f.userData.patrol = null;
+      } },
+
+    // — Marché de vente : 3 marchands DERRIÈRE la rangée sud des étals.
+    //   La place a 2 rangées d'étals (z=-1.5 nord, z=+3.5 sud), table
+    //   profonde 1.8 (z=±0.9), AUVENT incliné 3×2.0 (z=±1.0) à y=2.10.
+    //   Le marchand se tient au-DELÀ de l'auvent côté sud (z=+5.0,
+    //   donc 0.5 m derrière le bord sud de l'auvent à z=+4.5), tourné
+    //   vers l'allée client (face nord → rotation.y = π). Sol pavé
+    //   à y=0.15 : pieds posés DESSUS, pas encastrés dans le soubassement.
+    { zone:'Marché de vente', role:'marchand', type:'ouvriere', anim:'sell', max:3,
+      tint:0x6b3d44,
+      count: s => 3,
+      place: (f,i,n)=>{
+        f.position.set(-5 + i*5, 0.15, 5.0); // dégagé de l'auvent
+        f.rotation.y = Math.PI;              // tourné vers l'allée client
+        f.userData.patrol = null;
+      } },
+
+    // — Marché de vente : clientèle ∝ taux de vente.
+    //   Clients dans l'allée centrale entre les deux rangées d'étals
+    //   (z ≈ +1, face sud à la rangée sud), pas dans la rue dehors.
+    { zone:'Marché de vente', role:'client', type:'bourgeois', anim:'idle', max:5,
+      count: s => {
+        if(s.d && s.d.declenche) return 0;
+        const tv = (s.d && s.d.tauxVente!=null) ? s.d.tauxVente : 0.7;
+        return Math.round(5 * Math.max(0, Math.min(1, tv)));
+      },
+      place: (f,i,n)=>{
+        f.position.set(-5 + i*2.6, 0.15, 1.0 + (i%2)*0.8);
+        f.rotation.y = 0;                    // regarde la rangée sud (vers +Z)
+        f.userData.patrol = null;
+      } },
+
+    // — Marché des moyens (HALLE BALTARD) : 2 marchands DERRIÈRE leurs
+    //   étals. La halle a 3 stands en ligne (x=-4.5, 0, +4.5, z=-1),
+    //   table profonde 1.8, AUVENT 3×2.2 (z=±1.1) à y=2.10. Les
+    //   marchandises (sacs, charbon, chariot) sont au SUD des stands → là
+    //   que circulent les clients. Marchand au NORD de l'AUVENT (z=-2.8,
+    //   donc 0.7 m derrière le bord nord à z=-2.1) : pas dans le poteau
+    //   arrière à z=-1.9, pas sous la toile inclinée. Tourné vers le sud
+    //   (rotation.y = 0). Sol pavé de la halle à y=0.55 : pieds DESSUS,
+    //   plus encastrés dans le soubassement+plinthe en pierre.
+    { zone:'Marché des moyens', role:'marchand', type:'ouvrier', anim:'sell', max:2,
+      tint:0x7a5a3a,
+      count: s => 2,
+      place: (f,i,n)=>{
+        f.position.set(-4.5 + i*9, 0.55, -2.8); // dos aux stands 1 (-4.5) et 3 (+4.5)
+        f.rotation.y = 0;                       // face au sud, vers l'allée client
+        f.userData.patrol = null;
+      } },
+
+    // — Marché du travail : file de chômeurs (∝ chômage réel).
+    //   Devant le bureau d'embauche (guichet à z≈+0.05, face sud),
+    //   2 rangées tournées vers le guichet (face nord = rotation.y = π).
+    { zone:'Marché du travail', role:'file-chomeurs', type:'chomeur', anim:'idle', max:14,
+      count: s => Math.min(14, _chomeursN(s)),
+      place: (f,i,n)=>{
+        const col = i % 6, row = Math.floor(i/6);
+        f.position.set(-5 + col*1.6, 0, 3.0 + row*1.6);
+        f.rotation.y = Math.PI + (i%2 ? 0.10 : -0.10);
+        f.userData.patrol = null;
+      } },
+
+    // — Bourse : capitalistes au parvis (∝ capital) —
+    { zone:'Bourse', role:'capitaliste-parvis', type:'capitaliste', anim:'watch', max:5,
+      count: s => _hasBld(s,'bourse')
+        ? Math.min(5, Math.max(1, 1 + Math.floor(_capitalAcc(s)/700)))
+        : 0,
+      place: (f,i,n)=>{
+        const dx = (n>1 ? (i/(n-1) - 0.5) : 0) * 11;
+        f.position.set(dx, 0, 9.0);
+        f.rotation.y = Math.PI + (i%2 ? 0.12 : -0.12);
+        f.userData.patrol = null;
+      } },
+
+    // — Bourse : bourgeois en flânerie (∝ capital, plus discret) —
+    { zone:'Bourse', role:'bourgeois-parvis', type:'bourgeois', anim:'stroll', max:4,
+      count: s => _hasBld(s,'bourse')
+        ? Math.min(4, Math.max(0, Math.floor(_capitalAcc(s)/1100)))
+        : 0,
+      place: (f,i,n)=>{
+        const per = 24 + i*3;
+        if(!f.userData.patrol){
+          f.userData.patrol = { ax:-6, az:7.4 + (i%2)*0.8, bx:6, bz:8.4 - (i%2)*0.8, period:per };
+          f.userData.patrolT = Math.random() * per;
+        }
+      } },
+
+    // — Banque : bourgeois sur le perron (∝ argent) —
+    { zone:'Banque', role:'bourgeois-banque', type:'bourgeois', anim:'stroll', max:3,
+      count: s => Math.min(3, Math.max(0, Math.floor((s.argent||0) / 600))),
+      place: (f,i,n)=>{
+        const per = 26 + i*3;
+        if(!f.userData.patrol){
+          f.userData.patrol = { ax:-5, az:7.0 + (i%2)*0.6, bx:5, bz:8.0 - (i%2)*0.6, period:per };
+          f.userData.patrolT = Math.random() * per;
+        }
+      } },
+
+    // — Quartier ouvrier : densité ∝ emploi + niveau quartier (extensible) —
+    { zone:'Quartier ouvrier', role:'ouvriere-rue', type:'ouvriere', anim:'idle', max:6,
+      count: s => _hasBld(s,'quartier')
+        ? Math.min(6, Math.max(2, Math.round(_employed(s)*0.35 + (s.buildings.quartier||0))))
+        : 0,
+      place: (f,i,n)=>{
+        const col = i % 3, row = Math.floor(i/3);
+        f.position.set(-6 + col*3.5, 0, -4 + row*1.6);
+        f.rotation.y = (col%2) ? Math.PI*0.40 : -Math.PI*0.40;
+        f.userData.patrol = null;
+      } },
+
+    // — Quartier ouvrier : 2 passants en patrouille (vie sociale visible) —
+    { zone:'Quartier ouvrier', role:'ouvrier-passant', type:'ouvrier', anim:'walk', max:2,
+      count: s => (_hasBld(s,'quartier') && _employed(s) > 0) ? 2 : 0,
+      place: (f,i,n)=>{
+        if(!f.userData.patrol){
+          f.userData.patrol = (i===0)
+            ? { ax:-9, az:5,  bx:9, bz:5.4, period:18 }
+            : { ax: 8, az:7,  bx:-8, bz:7.4, period:22 };
+          f.userData.patrolT = Math.random() * f.userData.patrol.period;
+        }
+      } },
+
+    // — Usine : attroupement de grève (anim angry, au-dessus du seuil colère) —
+    { zone:'Usine', role:'attroup', type:'ouvrier', anim:'angry', max:7,
+      count: s => _colere(s) > 0.40
+        ? Math.min(7, 3 + Math.floor((_colere(s) - 0.40) * 10))
+        : 0,
+      place: (f,i,n)=>{
+        const a = (n>1 ? (i/(n-1) - 0.5) : 0) * Math.PI * 0.7;
+        f.position.set(Math.sin(a)*7, 0, 11 + Math.cos(a)*1.8);
+        f.rotation.y = Math.PI;
+        f.userData.patrol = null;
+      } },
+
+    // — Usine : gendarmes (apparaissent quand l'attroupement déborde) —
+    { zone:'Usine', role:'gendarmes', type:'fonctionnaire', anim:'angry', max:4,
+      count: s => _colere(s) > 0.55
+        ? Math.min(4, 1 + Math.floor((_colere(s) - 0.55) * 6))
+        : 0,
+      place: (f,i,n)=>{
+        f.position.set(-3 + i*2.0, 0, 13.6);
+        f.rotation.y = 0;                         // face nord, vers les ouvriers
+        f.userData.patrol = null;
+      } },
+  ];
+
+  function _slot(spec){
+    const k = spec.zone + '|' + spec.role;
+    let s = _slots.get(k);
+    if(!s){ s = { figs:[], spec }; _slots.set(k, s); }
+    return s;
+  }
+
+  function _grow(slot, n){
+    const zg = (typeof zoneGroups !== 'undefined') ? zoneGroups[slot.spec.zone] : null;
+    if(!zg) return false;
+    while(slot.figs.length < n && slot.figs.length < slot.spec.max){
+      const f = Peuple.spawnFigure({
+        type: slot.spec.type,
+        anim: slot.spec.anim,
+        tint: slot.spec.tint,
+      });
+      f.visible = false;
+      f.userData._popRole = slot.spec.role;
+      f.userData._popZone = slot.spec.zone;
+      zg.add(f);
+      slot.figs.push(f);
+    }
+    return true;
+  }
+
+  function _refresh(slot, n){
+    n = Math.max(0, Math.min(n|0, slot.spec.max));
+    if(!_grow(slot, n)) return;
+    const pool = slot.figs, spec = slot.spec;
+    for(let i = 0; i < pool.length; i++){
+      const f = pool[i];
+      if(i < n){
+        if(!f.visible) f.visible = true;
+        if(spec.place) spec.place(f, i, n);
+        if(spec.anim && f.userData.anim !== spec.anim){
+          // les patrouilles imposent 'walk' ; ne pas casser leur cadence.
+          if(!f.userData.patrol) f.userData.anim = spec.anim;
+        }
+      } else if(f.visible){
+        f.visible = false;
+      }
+    }
+  }
+
+  function update(dt){
+    if(!_ready) return;
+    _t += dt;
+    if(_t < THROTTLE) return;
+    _t = 0;
+    if(!_phaseGate()){
+      // précapital : tout planquer, ne rien rafraîchir.
+      for(const [, slot] of _slots)
+        for(const f of slot.figs) if(f.visible) f.visible = false;
+      return;
+    }
+    const s = _safeS();
+    if(!s) return;
+    for(const spec of SPECS){
+      if(typeof zoneGroups === 'undefined' || !zoneGroups[spec.zone]) continue;
+      _refresh(_slot(spec), spec.count(s));
+    }
+  }
+
+  function init(){
+    if(_ready) return;
+    _slots = new Map();
+    _ready = true;
+    _t = THROTTLE + 1;
+    update(0);
+    console.info('[M-Peuple/Pop] prêt ·', SPECS.length, 'rôles · pool pré-alloué, ZÉRO alloc/frame');
+  }
+
+  function debug(){
+    const out = {};
+    if(!_slots) return out;
+    for(const [k, s] of _slots){
+      out[k] = {
+        live: s.figs.reduce((a,f)=>a + (f.visible?1:0), 0),
+        pool: s.figs.length,
+        max:  s.spec.max,
+      };
+    }
+    return out;
+  }
+
+  return { init, update, debug, SPECS };
+})();
+if(typeof window!=='undefined') window.__peuplePop = PeuplePop;
 
 
 
@@ -14005,6 +14306,7 @@ function loop(){
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
+  PeuplePop.update(dt);               // M-Peuple : effectifs ∝ état réel
   Peuple.update(dt);                  // M-Peuple : figures de classe animées
   updateInteractiveProps(dt);
   updateFx();
