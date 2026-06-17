@@ -10131,22 +10131,83 @@ const Peuple = (function(){
   // Les couleurs viennent de COLORSCRIPT (palette froide bleu-encre /
   // contrastes chauds pour les outils et la peau).
   // -----------------------------------------------------------------
+  // M-Peuple-détail :
+  //   Chaque classe = silhouette + posture + costume en VOLUMES superposés.
+  //   - cloth / pants : matière principale
+  //   - vest : panneau frontal sur torse {col, w, h, dy} (gilet, tablier)
+  //   - belt : ceinture/cordon, fine bande au bas du torse
+  //   - coat : redingote longue (pans descendant sous la taille)
+  //   - collar : col clair visible à la base du cou
+  //   - whiskers : favoris (petits volumes mat sombres sur la mâchoire)
+  //   - beard : barbe (petit volume sous le menton)
+  //   - shoeColor / shoeBig : couleur et taille des chaussures/bottes
+  //   - headSlump : fait pencher la tête (chomeur affaissé)
   const CLASS_DEFS = {
     ouvrier:       { cloth:0x4d5f70, pants:0x2a241c, hat:'casquette',
-                     tool:'pelle',     tilt: 0.12, sleevesRoll:true },
+                     tool:'pelle',     tilt: 0.12, sleevesRoll:true,
+                     vest:{col:0x3a4858,w:0.36,h:0.42,dy:0.22},     // tablier
+                     belt:0x231a12,
+                     shoeColor:0x16100c, shoeBig:true },
     ouvriere:      { cloth:0x445064, pants:0x33291d, hat:'fichu',
-                     tool:'panier',    tilt: 0.05, skirt:true },
+                     tool:'panier',    tilt: 0.05, skirt:true,
+                     apron:{col:0xc9b78c,w:0.30,h:0.30,dy:0.16},    // tablier clair
+                     shoeColor:0x2a201a },
     chomeur:       { cloth:0x5b5346, pants:0x3a3128, hat:'casquette',
-                     hatColor:0x2a261f, tool:null,  tilt: 0.18 },
-    capitaliste:   { cloth:0x2a2a33, pants:0x16161a, hat:'cylindre',
-                     tool:'canne',     tilt:-0.05 },
-    bourgeois:     { cloth:0x8a8d96, pants:0x4a4d56, hat:'melon',
-                     tool:'journal',   tilt: 0.00 },
+                     hatColor:0x2a261f, tool:null,  tilt: 0.22,
+                     belt:0x2a2018, headSlump:true,
+                     scarf:0x6b3d33,                                // foulard misère
+                     shoeColor:0x18120e },
+    capitaliste:   { cloth:0x222229, pants:0x16161a, hat:'cylindre',
+                     tool:'canne',     tilt:-0.06,
+                     coat:{col:0x222229,len:0.55,w:0.44},           // redingote longue
+                     vest:{col:0xc9a85e,w:0.26,h:0.30,dy:0.16},     // gilet doré
+                     collar:0xe2dabd, whiskers:true,
+                     shoeColor:0x0a0808, shoeBig:true },
+    bourgeois:     { cloth:0x6e6e7a, pants:0x3e3a36, hat:'melon',
+                     tool:'journal',   tilt: 0.00,
+                     vest:{col:0xc4b691,w:0.24,h:0.28,dy:0.14},     // gilet beige
+                     collar:0xe2dabd, whiskers:true,
+                     shoeColor:0x1a1410 },
     mineur:        { cloth:0x3a342e, pants:0x2a2622, hat:'casque-mineur',
-                     tool:'pelle',     tilt: 0.15 },
+                     tool:'pelle',     tilt: 0.15, sleevesRoll:true,
+                     vest:{col:0x261f1a,w:0.30,h:0.34,dy:0.18},     // veste sale
+                     belt:0x141008,
+                     shoeColor:0x0c0805, shoeBig:true },
     fonctionnaire: { cloth:0x2a3140, pants:0x1a1f28, hat:'kepi',
-                     tool:null,        tilt:-0.02 },
+                     tool:null,        tilt:-0.02,
+                     vest:{col:0xa8812c,w:0.06,h:0.40,dy:0.08},     // bandoulière dorée
+                     belt:0x0a0d12, collar:0xb8b09a,
+                     shoeColor:0x080808 },
+    // — NOUVELLES CLASSES —
+    paysan:        { cloth:0x8a7a52, pants:0x4a3826, hat:'paille',
+                     tool:'faux',      tilt: 0.18, sleevesRoll:true,
+                     belt:0x5a4220, beard:0x5a4030,
+                     shoeColor:0x4a3625, shoeBig:true },           // sabots
+    marchand:      { cloth:0x6b513a, pants:0x3a2618, hat:'calot',
+                     tool:null,        tilt: 0.04, sleevesRoll:true,
+                     apron:{col:0xb0a07a,w:0.34,h:0.38,dy:0.18},   // tablier de commerce
+                     belt:0x4a3a26,
+                     shoeColor:0x2a1f15 },
   };
+
+  // Petites variations PAR INSTANCE (pas deux ouvriers identiques).
+  // 3 nuances proches par classe — partagées via _matCache, ZÉRO alloc.
+  const _CLOTH_VARIANTS = {
+    ouvrier:    [0x4d5f70, 0x42566a, 0x556678],
+    ouvriere:   [0x445064, 0x3c4a5e, 0x4c5870],
+    chomeur:    [0x5b5346, 0x5a4d44, 0x4f4738],
+    capitaliste:[0x222229, 0x1c1c22, 0x2c2a34],
+    bourgeois:  [0x6e6e7a, 0x666673, 0x767584],
+    mineur:     [0x3a342e, 0x342f29, 0x40382f],
+    fonctionnaire:[0x2a3140, 0x222936, 0x303849],
+    paysan:     [0x8a7a52, 0x8b7b4a, 0x826f48],
+    marchand:   [0x6b513a, 0x715838, 0x624a36],
+  };
+  function _pickCloth(type, def, opts){
+    if(opts && opts.tint != null) return opts.tint;     // override par firme
+    const vs = _CLOTH_VARIANTS[type];
+    return vs ? vs[(Math.random()*vs.length)|0] : def.cloth;
+  }
 
   // -----------------------------------------------------------------
   // Matériaux & géométries partagés. ZÉRO allocation par frame.
@@ -10211,7 +10272,7 @@ const Peuple = (function(){
     upper.userData = { fore, hand };
     return upper;
   }
-  function _makeLeg(pantsHex){
+  function _makeLeg(pantsHex, shoeHex, shoeBig){
     const thigh = new THREE.Group();
     const thighMesh = new THREE.Mesh(
       _g('leg_thigh', ()=> new THREE.BoxGeometry(0.14, 0.40, 0.14)),
@@ -10225,11 +10286,21 @@ const Peuple = (function(){
       _mat(pantsHex));
     shinMesh.position.y = -0.19;
     shin.add(shinMesh);
-    const shoe = new THREE.Mesh(
-      _g('shoe', ()=> new THREE.BoxGeometry(0.16, 0.07, 0.22)),
-      _mat(0x1a1612));
-    shoe.position.set(0, -0.41, 0.04);
+    // M-Peuple-détail : chaussure normale OU grosse botte/sabot.
+    const shoeGeo = shoeBig
+      ? _g('shoe_big', ()=> new THREE.BoxGeometry(0.19, 0.10, 0.24))
+      : _g('shoe',     ()=> new THREE.BoxGeometry(0.16, 0.07, 0.22));
+    const shoe = new THREE.Mesh(shoeGeo, _mat(shoeHex != null ? shoeHex : 0x1a1612));
+    shoe.position.set(0, shoeBig ? -0.40 : -0.41, 0.04);
     shin.add(shoe);
+    // Suggestion de talon : bandeau fin plus sombre à l'arrière.
+    if(shoeBig){
+      const heel = new THREE.Mesh(
+        _g('shoe_heel', ()=> new THREE.BoxGeometry(0.19, 0.05, 0.07)),
+        _mat(0x0a0805));
+      heel.position.set(0, -0.42, -0.06);
+      shin.add(heel);
+    }
     thigh.add(shin);
     thigh.userData = { shin };
     return thigh;
@@ -10308,6 +10379,26 @@ const Peuple = (function(){
         _emiMat(0xffd9a0, COLORSCRIPT.gasLight));
       lampe.position.set(0, 0.22, 0.15);
       g.add(dome); g.add(lampe);
+    } else if(kind==='paille'){
+      // CHAPEAU DE PAILLE — cône bas large clair (paysan).
+      const col = hatColor || 0xc9a85e;
+      const cone = new THREE.Mesh(
+        _g('straw_cone', ()=> new THREE.ConeGeometry(0.24, 0.12, 12)),
+        _mat(col));
+      cone.position.y = 0.27;
+      const ribbon = new THREE.Mesh(
+        _g('straw_ribbon', ()=> new THREE.CylinderGeometry(0.13, 0.13, 0.025, 12)),
+        _mat(0x6b4f30));
+      ribbon.position.y = 0.24;
+      g.add(cone); g.add(ribbon);
+    } else if(kind==='calot'){
+      // CALOT de commerce / petit chapeau plat sans bord (marchand).
+      const col = hatColor || 0x4a3a26;
+      const calotte = new THREE.Mesh(
+        _g('calot_top', ()=> new THREE.CylinderGeometry(0.130, 0.135, 0.075, 10)),
+        _mat(col));
+      calotte.position.y = 0.27;
+      g.add(calotte);
     }
     return g;
   }
@@ -10352,6 +10443,19 @@ const Peuple = (function(){
       paper.position.y = -0.15;
       paper.rotation.x = 0.4;
       g.add(paper);
+    } else if(kind==='faux'){
+      // FAUX — long manche brun + lame courbe en biais (paysan).
+      const stick = new THREE.Mesh(
+        _g('scythe_stick', ()=> new THREE.BoxGeometry(0.035, 0.85, 0.035)),
+        _mat(0x6b4f30));
+      stick.position.y = -0.36;
+      stick.rotation.z = 0.10;
+      const blade = new THREE.Mesh(
+        _g('scythe_blade', ()=> new THREE.BoxGeometry(0.04, 0.06, 0.45)),
+        _mat(0x9ca5ad));
+      blade.position.set(0.06, -0.78, 0.22);
+      blade.rotation.x = -0.55;
+      g.add(stick); g.add(blade);
     }
     return g;
   }
@@ -10359,10 +10463,13 @@ const Peuple = (function(){
   // -----------------------------------------------------------------
   // buildFigure(type) — assemble le perso. Pieds à y=0, ~1.80 u.
   // userData expose les pivots animables.
+  // M-Peuple-détail : silhouette enrichie en VOLUMES superposés
+  //   (épaules-yoke, cou, vest/tablier/redingote, ceinture, col,
+  //   favoris/barbe), variantes de teinte par instance, sabots/bottes.
   // -----------------------------------------------------------------
   function buildFigure(type, opts){
     const def = CLASS_DEFS[type] || CLASS_DEFS.ouvrier;
-    const cloth = (opts && opts.tint != null) ? opts.tint : def.cloth;
+    const cloth = _pickCloth(type, def, opts);          // variante d'instance
     const root = new THREE.Group();
     root.name = 'Peuple:' + type;
 
@@ -10382,19 +10489,110 @@ const Peuple = (function(){
       _mat(cloth));
     torsoMesh.position.y = 0.28;
     torso.add(torsoMesh);
+
+    // ÉPAULES-YOKE — bandeau plat plus large que le torse, en haut.
+    //   Donne du caractère à la silhouette (épaules marquées low-poly).
+    const yoke = new THREE.Mesh(
+      _g('yoke', ()=> new THREE.BoxGeometry(0.52, 0.07, 0.28)),
+      _mat(cloth));
+    yoke.position.y = 0.53;
+    torso.add(yoke);
+
+    // CEINTURE — bande horizontale fine au bas du torse.
+    if(def.belt != null){
+      const belt = new THREE.Mesh(
+        _g('belt', ()=> new THREE.BoxGeometry(0.46, 0.05, 0.28)),
+        _mat(def.belt));
+      belt.position.y = 0.03;
+      torso.add(belt);
+    }
+
+    // GILET / TABLIER / BANDOULIÈRE — panneau frontal en sur-volume.
+    //   Posé sur le torse, légèrement avant (+Z) pour lever le z-fighting.
+    //   Géométrie UNITAIRE partagée (1×1×0.04), scale par mesh : ZÉRO
+    //   géo créée par instance.
+    const panel = def.vest || def.apron;
+    if(panel){
+      const front = new THREE.Mesh(
+        _g('panel_unit', ()=> new THREE.BoxGeometry(1, 1, 0.04)),
+        _mat(panel.col));
+      front.scale.set(panel.w, panel.h, 1);
+      front.position.set(0, panel.dy, 0.145);
+      torso.add(front);
+    }
+
+    // REDINGOTE — pans longs qui descendent sous la taille (capitaliste).
+    //   Volume qui prolonge le torse, indépendant des jambes (donc reste
+    //   immobile pendant la marche — assumé, le bourgeois "glisse").
+    //   Géométrie unitaire partagée, scale par mesh.
+    if(def.coat){
+      const tail = new THREE.Mesh(
+        _g('coat_unit', ()=> new THREE.BoxGeometry(1, 1, 0.20)),
+        _mat(def.coat.col));
+      tail.scale.set(def.coat.w, def.coat.len, 1);
+      tail.position.set(0, -def.coat.len*0.5 + 0.02, -0.02);
+      torso.add(tail);
+    }
+
+    // COL CLAIR — petit liseré sous le menton.
+    if(def.collar != null){
+      const collar = new THREE.Mesh(
+        _g('collar', ()=> new THREE.BoxGeometry(0.20, 0.05, 0.20)),
+        _mat(def.collar));
+      collar.position.y = 0.59;
+      torso.add(collar);
+    }
+
+    // COU — petit volume entre torse et tête.
+    const neck = new THREE.Mesh(
+      _g('neck', ()=> new THREE.BoxGeometry(0.10, 0.07, 0.10)),
+      _mat(SKIN));
+    neck.position.y = 0.59;
+    torso.add(neck);
+
+    // FOULARD (chomeur) — bandeau coloré autour du cou, posture misère.
+    if(def.scarf != null){
+      const scarf = new THREE.Mesh(
+        _g('scarf', ()=> new THREE.BoxGeometry(0.22, 0.06, 0.18)),
+        _mat(def.scarf));
+      scarf.position.y = 0.57;
+      torso.add(scarf);
+    }
+
     root.add(torso);
 
-    // TÊTE (ovoïde, pas de visage).
+    // TÊTE (ovoïde, pas de visage). Chomeur affaissé : tête plus basse.
     const head = new THREE.Group();
-    head.position.y = 0.62;
+    head.position.y = def.headSlump ? 0.58 : 0.62;
     const headMesh = new THREE.Mesh(
       _g('head', ()=> new THREE.SphereGeometry(0.13, 10, 8)),
       _mat(SKIN));
     headMesh.scale.set(1, 1.15, 0.95);
     headMesh.position.y = 0.08;
     head.add(headMesh);
+    if(def.headSlump) head.rotation.x = 0.20;            // menton bas
     torso.add(head);
     if(def.hat) head.add(_makeHat(def.hat, def.hatColor));
+
+    // FAVORIS — deux petits volumes mat sombres collés à la mâchoire.
+    if(def.whiskers){
+      const wc = 0x3a2f24;
+      for(const sx of [-1, 1]){
+        const w = new THREE.Mesh(
+          _g('whisker', ()=> new THREE.BoxGeometry(0.05, 0.07, 0.07)),
+          _mat(wc));
+        w.position.set(sx*0.12, 0.04, 0.04);
+        head.add(w);
+      }
+    }
+    // BARBE (paysan) — petit volume sous le menton.
+    if(def.beard != null){
+      const beard = new THREE.Mesh(
+        _g('beard', ()=> new THREE.BoxGeometry(0.13, 0.07, 0.05)),
+        _mat(def.beard));
+      beard.position.set(0, 0.01, 0.10);
+      head.add(beard);
+    }
 
     // BRAS — pivots aux épaules (suivent le tilt du buste).
     const armL = _makeArm(cloth, def.sleevesRoll);
@@ -10411,10 +10609,10 @@ const Peuple = (function(){
     }
 
     // JAMBES — sur le root (indépendantes du tilt du buste).
-    const legL = _makeLeg(def.pants);
+    const legL = _makeLeg(def.pants, def.shoeColor, def.shoeBig);
     legL.position.set(-0.10, 0.85, 0);
     root.add(legL);
-    const legR = _makeLeg(def.pants);
+    const legR = _makeLeg(def.pants, def.shoeColor, def.shoeBig);
     legR.position.set( 0.10, 0.85, 0);
     root.add(legR);
 
@@ -10777,8 +10975,9 @@ const PeuplePop = (function(){
   //   / fig.rotation / fig.userData.patrol). N'alloue rien.
   const SPECS = [
     // — Terres communes : paysans qui diminuent avec l'enclosure —
-    { zone:'Terres communes', role:'paysan', type:'ouvrier', anim:'farm',
-      tint:0x6b5a3a, max:6,
+    //   M-Peuple-détail : type 'paysan' = chapeau paille + faux + sabots.
+    { zone:'Terres communes', role:'paysan', type:'paysan', anim:'farm',
+      max:6,
       count: s => Math.round( Math.max(0, 6 * (1 - _enclosure(s))) ),
       place: (f,i,n)=>{
         const col = i % 3, row = Math.floor(i/3);
@@ -10850,8 +11049,7 @@ const PeuplePop = (function(){
     //   donc 0.5 m derrière le bord sud de l'auvent à z=+4.5), tourné
     //   vers l'allée client (face nord → rotation.y = π). Sol pavé
     //   à y=0.15 : pieds posés DESSUS, pas encastrés dans le soubassement.
-    { zone:'Marché de vente', role:'marchand', type:'ouvriere', anim:'sell', max:3,
-      tint:0x6b3d44,
+    { zone:'Marché de vente', role:'marchand', type:'marchand', anim:'sell', max:3,
       count: s => 3,
       place: (f,i,n)=>{
         f.position.set(-5 + i*5, 0.15, 5.0); // dégagé de l'auvent
@@ -10883,8 +11081,7 @@ const PeuplePop = (function(){
     //   arrière à z=-1.9, pas sous la toile inclinée. Tourné vers le sud
     //   (rotation.y = 0). Sol pavé de la halle à y=0.55 : pieds DESSUS,
     //   plus encastrés dans le soubassement+plinthe en pierre.
-    { zone:'Marché des moyens', role:'marchand', type:'ouvrier', anim:'sell', max:2,
-      tint:0x7a5a3a,
+    { zone:'Marché des moyens', role:'marchand', type:'marchand', anim:'sell', max:2,
       count: s => 2,
       place: (f,i,n)=>{
         f.position.set(-4.5 + i*9, 0.55, -2.8); // dos aux stands 1 (-4.5) et 3 (+4.5)
