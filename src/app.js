@@ -646,6 +646,10 @@ const log     = new EventLog();
 let cycleCooldown=0, lastLogLen=log.entries.length, flashTimer=0;
 
 function runCycle(){
+  // M-Cinéma — snapshot AVANT le cycle pour mesurer les deltas (zone qui
+  //   a le plus changé). La séquence joue APRÈS le cycle si un delta
+  //   significatif existe et qu'aucun modal n'est ouvert.
+  if(typeof CinemaSequences !== 'undefined') CinemaSequences.snapshotCycle();
   snapshotHUD();            // v47 : photo des valeurs affichées -> les ▲▼ du HUD comparent cycle à cycle
   circuit.cycle();
   log.chroniquer(state);
@@ -656,6 +660,14 @@ function runCycle(){
   updateHUD(); updateMarx(); renderLeviers();
   if(typeof LivingWorld!=='undefined') LivingWorld.onCycle();
   if(gameMode==='guided' && gamePhase==='circuit' && state.cycle>=1) pendingEnterSF=true;
+  // Séquence de bouclage : panoramique sur la zone qui a le plus changé.
+  //   Garde-fou : pas de cinéma si une modale est ouverte (lecture confort
+  //   prioritaire) et pas avant le cycle 2 (laisse les premières actions
+  //   se faire sans interruption).
+  if(typeof CinemaSequences !== 'undefined' && state.cycle >= 2
+     && !(typeof anyModalOpen==='function' && anyModalOpen())){
+    CinemaSequences.playCycle();
+  }
 }
 
 // MiniCircuit garde son nom (la 3D l'appelle deja) mais PILOTE le vrai moteur.
@@ -5338,6 +5350,194 @@ const CinemaMode = (function(){
   return { begin, skip, end, update, isActive, getTimeScale };
 })();
 if(typeof window !== 'undefined') window.__cinema = CinemaMode;
+
+/* =====================================================================
+   M-Cinéma — SÉQUENCES SCRIPTÉES (déclenchées par la simulation).
+   Chacune lit l'état réel pour adapter le focus / la durée. JAMAIS
+   d'écriture dans state ; jamais de blocage du joueur (skip permanent).
+
+     • playIntro()  — au lancement : travelling lent sur la ville à
+                      l'aube/crépuscule, fin sur le chariot.
+     • playCycle()  — à chaque A→A' réussi : panoramique sur la zone
+                      qui a le plus changé depuis le dernier cycle.
+     • playCrise()  — quand la colère franchit le seuil 0.65 : plan
+                      grave, ralenti, sur l'attroupement devant l'usine.
+     • playEnd(outcome) — hook commenté pour la condition de fin.
+   ===================================================================== */
+const CinemaSequences = (function(){
+  let _introPlayed = false;
+  let _lastColere  = 0;
+  let _cycleSnapshot = null;
+  let _crisisCooldown = 0;        // s — anti-rejouage trop fréquent
+  // marqueurs des dernières valeurs pour détecter les deltas
+  function _zonePosSafe(name){
+    if(typeof zonePos !== 'function') return new THREE.Vector3();
+    const p = zonePos(name); return new THREE.Vector3(p.x, 0, p.z);
+  }
+  function _snapState(){
+    return {
+      argent:        state.argent || 0,
+      profitCumule:  state.profitCumule || 0,
+      travailleurs:  state.travailleurs || 0,
+      niveauVille:   state.niveauVille || 0,
+      niveauMachine: state.niveauMachine || 0,
+      bUsine:        (state.buildings && state.buildings.usine) || 0,
+      bQuartier:     (state.buildings && state.buildings.quartier) || 0,
+      bBourse:       (state.buildings && state.buildings.bourse) || 0,
+      bPort:         (state.buildings && state.buildings.port) || 0,
+    };
+  }
+  function _biggestChange(prev){
+    if(!prev) return null;
+    const now = _snapState();
+    // chaque candidat = { zone, weight }
+    const candidates = [
+      { zone:'Usine',                weight: (now.niveauMachine - prev.niveauMachine)*1.8 + (now.bUsine - prev.bUsine)*2.0 },
+      { zone:'Quartier ouvrier',     weight: (now.bQuartier - prev.bQuartier)*2.0 + Math.max(0, now.travailleurs - prev.travailleurs)*0.30 },
+      { zone:'Bourse',               weight: (now.bBourse - prev.bBourse)*2.0 + Math.max(0, (now.argent - prev.argent))/600 },
+      { zone:'Port · Marché mondial', weight: (now.bPort - prev.bPort)*2.5 },
+    ];
+    candidates.sort((a,b)=>b.weight - a.weight);
+    return (candidates[0].weight > 0.3) ? candidates[0].zone : null;
+  }
+
+  function playIntro(){
+    if(_introPlayed) return false;
+    if(typeof CinemaMode==='undefined' || CinemaMode.isActive()) return false;
+    _introPlayed = true;
+    // Travelling lent en hauteur sur la ville : ouest → est → finit au chariot.
+    const vx = (typeof Vehicle!=='undefined' && Vehicle.pos) ? Vehicle.pos.x : -95;
+    const vz = (typeof Vehicle!=='undefined' && Vehicle.pos) ? Vehicle.pos.z : 2;
+    return CinemaMode.begin({
+      camPath: [
+        new THREE.Vector3(-90, 36,  60),
+        new THREE.Vector3(-30, 42,  10),
+        new THREE.Vector3( 40, 38,  -8),
+        new THREE.Vector3( 85, 26,  20),
+        new THREE.Vector3( vx - 18, 6.0, vz + 14),
+        new THREE.Vector3( vx - 8,  3.5, vz + 6),
+      ],
+      targetPath: [
+        new THREE.Vector3(-30, 8,  0),
+        new THREE.Vector3(-15, 8, 30),
+        new THREE.Vector3(  0, 6, 30),
+        new THREE.Vector3(  0, 4, 60),
+        new THREE.Vector3( vx, 1.8, vz),
+        new THREE.Vector3( vx, 1.6, vz),
+      ],
+      duration: 11.5,
+      title: 'La Veille du Capital',
+      timeScale: 0.30,
+      fov: 50,
+    });
+  }
+
+  function snapshotCycle(){
+    _cycleSnapshot = _snapState();
+  }
+  function playCycle(){
+    if(typeof CinemaMode==='undefined' || CinemaMode.isActive()) return false;
+    const zoneName = _biggestChange(_cycleSnapshot);
+    _cycleSnapshot = null;
+    if(!zoneName) return false;
+    const z = _zonePosSafe(zoneName);
+    // panoramique 6-8s : approche en orbite puis cadrage haut sur la zone.
+    const dur = 6.5 + Math.random()*1.5;
+    const titles = {
+      'Usine':                'L’usine a grandi',
+      'Quartier ouvrier':     'Le quartier s’est densifié',
+      'Bourse':               'La Bourse brille plus fort',
+      'Port · Marché mondial': 'Le port s’ouvre au monde',
+    };
+    return CinemaMode.begin({
+      camPath: [
+        new THREE.Vector3(z.x - 22, 8, z.z + 18),
+        new THREE.Vector3(z.x + 4,  16, z.z + 22),
+        new THREE.Vector3(z.x + 20, 12, z.z - 4),
+        new THREE.Vector3(z.x - 6,  18, z.z - 18),
+      ],
+      targetPath: [
+        new THREE.Vector3(z.x, 4, z.z),
+        new THREE.Vector3(z.x, 5, z.z),
+        new THREE.Vector3(z.x, 5, z.z),
+        new THREE.Vector3(z.x, 6, z.z),
+      ],
+      duration: dur,
+      title: titles[zoneName] || zoneName,
+      timeScale: 0.35,
+      fov: 46,
+    });
+  }
+
+  function playCrise(){
+    if(typeof CinemaMode==='undefined' || CinemaMode.isActive()) return false;
+    if(_crisisCooldown > 0) return false;
+    _crisisCooldown = 35;       // anti-rejouage : 35 s mini entre 2 crises
+    const z = _zonePosSafe('Usine');
+    // Plan grave, ralenti marqué (0.20), focus sur l'attroupement (z+11).
+    return CinemaMode.begin({
+      camPath: [
+        new THREE.Vector3(z.x - 6,  3.5, z.z + 22),
+        new THREE.Vector3(z.x + 0,  2.8, z.z + 17),
+        new THREE.Vector3(z.x + 4,  3.6, z.z + 14),
+      ],
+      targetPath: [
+        new THREE.Vector3(z.x, 1.6, z.z + 11),
+        new THREE.Vector3(z.x, 1.7, z.z + 11),
+        new THREE.Vector3(z.x, 1.7, z.z + 11),
+      ],
+      duration: 5.5,
+      title: 'La colère monte',
+      timeScale: 0.20,
+      fov: 38,
+    });
+  }
+
+  // playEnd(outcome) — HOOK COMMENTÉ. Pas de condition de fin formalisée
+  //   aujourd'hui dans la sim ; cf. state.d.declenche pour la crise et
+  //   state.cyclesProfitables pour l'accumulation. À brancher quand la
+  //   condition de victoire/effondrement existera dans le moteur.
+  /*
+  function playEnd(outcome){
+    const isWin = outcome === 'accumulation';
+    const z = _zonePosSafe(isWin ? 'Bourse' : 'Quartier ouvrier');
+    return CinemaMode.begin({
+      camPath: [...], targetPath: [...],
+      duration: 9, timeScale: 0.18, fov: 42,
+      title: isWin ? 'L’accumulation triomphante' : 'L’effondrement',
+    });
+  }
+  */
+
+  let _introTimer = 0;
+  // Hook frame-by-frame :
+  //   • intro lancée une seule fois, ~2 s après que l'overlay HTML
+  //     IntroCinematic se soit refermé (ou directement si absent) ;
+  //   • détection de franchissement de seuil colère (0.65 = 'colere2').
+  function tick(dt){
+    _introTimer += dt;
+    if(_crisisCooldown > 0) _crisisCooldown = Math.max(0, _crisisCooldown - dt);
+    // INTRO — guard : HTML intro fermée, aucun modal, ≥ 2 s depuis le boot.
+    if(!_introPlayed && _introTimer > 2.0){
+      const htmlActive = (typeof IntroCinematic!=='undefined' && IntroCinematic.active);
+      const modalOpen  = (typeof anyModalOpen==='function' && anyModalOpen());
+      if(!htmlActive && !modalOpen){ playIntro(); }
+    }
+    if(typeof state === 'undefined' || !state) return;
+    const c = state.colere || 0;
+    const SEUIL = 0.65;
+    if(_lastColere < SEUIL && c >= SEUIL){
+      // Évite de cinématiser pendant une modale ouverte.
+      if(!(typeof anyModalOpen==='function' && anyModalOpen())) playCrise();
+    }
+    _lastColere = c;
+  }
+
+  function debug(){ return { introPlayed:_introPlayed, crisisCooldown:+_crisisCooldown.toFixed(1) }; }
+
+  return { playIntro, playCycle, playCrise, snapshotCycle, tick, debug };
+})();
+if(typeof window !== 'undefined') window.__sequences = CinemaSequences;
 
 /* M-POV — INDICATEUR DE BORD D'ÉCRAN pour l'objectif.
    Visible uniquement en mode 'shoulder' ou 'immersion' (la vue Carte
@@ -15438,6 +15638,7 @@ function loop(){
   const tScale = cinemaActive ? CinemaMode.getTimeScale() : 1;
   const dt = rawDt * tScale;
   CinemaMode.update(rawDt);   // moteur cinéma (caméra + DoF + grain)
+  if(typeof CinemaSequences !== 'undefined') CinemaSequences.tick(rawDt);
   _coachTick+=dt; if(_coachTick>0.35){ _coachTick=0; tutorialCoachRefresh(); }
   // Pendant le cinéma le chariot reste immobile (les inputs sont ignorés
   // par Vehicle.speed=0 et le timeScale réduit toute dérive éventuelle).
