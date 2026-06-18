@@ -4841,33 +4841,44 @@ function buildWaterEast(){
       varying vec3  vNrm;
       varying float vSeaMix;     // 0 près du quai → 1 au grand large
       void main(){
-        // M-Mer/A : HOULE par superposition de 4 sinus. Amplitudes calmes
-        //   près du quai (vSeaMix→0), forte au large (vSeaMix→1) : la zone
-        //   d'amarrage reste lisible, le grand large vit. Coût : un dot et
-        //   un smoothstep par vertex (négligeable).
+        // M-Mer/A + correctif-clapot : HOULE par superposition de 4 sinus
+        //   modulés par seaMix (calmes près du quai, fortes au large) +
+        //   un 5e sinus CLAPOT haute fréquence à AMPLITUDE CONSTANTE,
+        //   appliqué partout sans atténuation → garantit qu'AUCUNE zone
+        //   d'eau n'est figée, même contre la berge ou le quai.
+        //   Plancher de gain remonté à 0.50 (au lieu de 0.30) pour que
+        //   la houle reste lisible jusqu'au rivage.
         vec3 p = position;
         // worldX provisoire (pour gradient calme→large). La plane est en XY
         //   local ; le modelMatrix la pose au sol et la translate à x=305.
         float worldX = (modelMatrix * vec4(p, 1.0)).x;
         float seaMix = smoothstep(115.0, 165.0, worldX);   // 0..1 sur ~50 m
-        // 4 sinus : 2 longs (houle), 1 oblique, 1 court (clapot).
+        // 4 sinus de houle : 2 longs, 1 oblique, 1 court.
         float w1 = sin(p.x*0.40 + uTime*0.65) * 0.20;
         float w2 = sin(p.y*0.18 + uTime*0.43) * 0.26;
         float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.14;
         float w4 = sin(p.x*1.10 - p.y*0.70 + uTime*1.30) * 0.06;
-        // amplitude gradient : facteur calme→large appliqué uniformément
-        float gain = mix(0.30, 1.10, seaMix);
-        p.z += (w1 + w2 + w3 + w4) * gain;
+        // amplitude gradient : floor 0.50 au rivage, 1.10 au large
+        float gain = mix(0.50, 1.10, seaMix);
+        // 5e sinus — CLAPOT HF : amplitude constante 5 cm, NON atténué.
+        //   Période ~11m (freq 0.55) bien échantillonnée par la grille
+        //   80×140, phase rapide → surface ondule visiblement partout,
+        //   y compris quai et rivage.
+        float w5 = sin(p.x*0.55 + p.y*0.25 + uTime*1.85) * 0.05;
+        p.z += (w1 + w2 + w3 + w4) * gain + w5;
         vec4 wp = modelMatrix * vec4(p, 1.0);
         vWorldPos = wp.xyz;
         vSeaMix = seaMix;
-        // normales analytiques (dérivées des sinus) — toujours valides après
-        //   le gain, multiplie par gain pour cohérence pente.
+        // normales analytiques (dérivées des sinus). Les 4 premières
+        //   héritent du gain ; w5 contribue à amplitude PLEINE → reflets
+        //   ondulent partout, même au rivage.
         float dx = (cos(p.x*0.40 + uTime*0.65)*0.40*0.20
                  +  cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.14
-                 +  cos(p.x*1.10 - p.y*0.70 + uTime*1.30)*1.10*0.06) * gain;
+                 +  cos(p.x*1.10 - p.y*0.70 + uTime*1.30)*1.10*0.06) * gain
+                 + cos(p.x*0.55 + p.y*0.25 + uTime*1.85)*0.55*0.05;
         float dz = (cos(p.y*0.18 + uTime*0.43)*0.18*0.26
-                 +  cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.14) * gain;
+                 +  cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.14) * gain
+                 + cos(p.x*0.55 + p.y*0.25 + uTime*1.85)*0.25*0.05;
         vNrm = normalize(vec3(-dx, 1.0, -dz));
         gl_Position = projectionMatrix * viewMatrix * wp;
       }`,
@@ -4968,13 +4979,12 @@ function buildWaterEast(){
         gl_FragColor = vec4(col, alpha);
       }`,
   });
-  // M-Mer/A : plan d'eau ÉTENDU jusqu'à la brume. Le bord est passe
-  //   bien au-delà du fog far (260) : x ∈ [110, 500], z ∈ [-260, 260].
-  //   À grande distance, la couleur de l'eau est mangée par le fog et
-  //   se fond dans le ciel/brume — sensation de grand large sans arête.
-  //   Segments 40 × 100 → ~4100 verts pour bien porter les vagues sur
-  //   toute la longueur. Coût négligeable (vertex shader cheap).
-  const waterGeo=new THREE.PlaneGeometry(390, 520, 40, 100);
+  // M-Mer/A + correctif-clapot : plan d'eau ÉTENDU jusqu'à la brume.
+  //   x ∈ [110, 500], z ∈ [-260, 260]. À grande distance, la couleur
+  //   de l'eau est mangée par le fog et se fond dans le ciel/brume.
+  //   Segments 80 × 140 (≈11 300 verts) — densifiés pour bien échantillonner
+  //   le clapot HF (période ~11m → spacing 4.9m). Coût vertex shader trivial.
+  const waterGeo=new THREE.PlaneGeometry(390, 520, 80, 140);
   const water=new THREE.Mesh(waterGeo, _M6_waterMaterial);
   water.rotation.x=-Math.PI/2;
   water.position.set(305, 0.012, 0);   // centré entre 110 et 500
