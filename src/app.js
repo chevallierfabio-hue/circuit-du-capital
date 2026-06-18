@@ -8293,6 +8293,9 @@ export function init(opts={}){
   PuffTrains.init();       // v63 : bouffées de cheminées
   // M4 — groupage des vitres par zone, liaison flaques↔lampes (lit PUDDLES de M3).
   M4.init(); M4.afterWorld();
+  // M-Polish/A — particules & atmosphère (sparks, motes, steam, brume sol).
+  //   Initialisé APRÈS M4.afterWorld() : les motes lisent gasLamps[].worldPos.
+  try{ M_Polish.init(); }catch(e){ console.warn('[M-Polish/A] init :', e&&e.message||e); }
   // le son démarre au premier geste (politique d'autoplay des navigateurs)
   const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
   addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
@@ -13764,6 +13767,291 @@ const PuffTrains={
   }
 };
 
+/* =====================================================================
+   M-Polish · LOT A — particules & atmosphère.
+   Système MUTUALISÉ à pools pré-alloués, sprites ADDITIFS (+ quads pour
+   la brume au sol). ZÉRO allocation par frame. Cap mesuré < 2 ms.
+
+   Pools :
+     • sparks  : 30 escarbilles orangées montant des cheminées proches
+                 (intensité ∝ production active).
+     • motes   : 30 motes de poussière en suspension près des lampes M4
+                 (opacité modulée par proximité + facteur nuit).
+     • steam   : 12 jets courts de vapeur basse (usine + port).
+     • fog     : 5 nappes rasantes nocturnes (Terres communes + bord d'eau).
+
+   Pilotage qualité (GRAPHICS_QUALITY) :
+     low    → tout caché.
+     medium → budget pool * 0.7.
+     high   → 100 %.
+   ===================================================================== */
+const M_Polish = (function(){
+  let ready = false;
+  let _scene = null;
+  const sparks = [];
+  const motes  = [];
+  const steam  = [];
+  const fog    = [];
+  let _texDot=null, _texCloud=null, _texFog=null;
+  let _budgetMs = 0;
+  const _tmpV = new THREE.Vector3();
+
+  function _mkDotTex(){
+    if(_texDot) return _texDot;
+    const c=document.createElement('canvas'); c.width=c.height=64;
+    const x=c.getContext('2d');
+    const g=x.createRadialGradient(32,32,1,32,32,30);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(0.5,'rgba(255,255,255,0.55)');
+    g.addColorStop(1,'rgba(255,255,255,0)');
+    x.fillStyle=g; x.fillRect(0,0,64,64);
+    return _texDot = new THREE.CanvasTexture(c);
+  }
+  function _mkCloudTex(){
+    if(_texCloud) return _texCloud;
+    const c=document.createElement('canvas'); c.width=c.height=128;
+    const x=c.getContext('2d');
+    const g=x.createRadialGradient(64,72,4,64,72,60);
+    g.addColorStop(0,'rgba(255,255,255,0.85)');
+    g.addColorStop(0.45,'rgba(255,255,255,0.35)');
+    g.addColorStop(1,'rgba(255,255,255,0)');
+    x.fillStyle=g; x.fillRect(0,0,128,128);
+    return _texCloud = new THREE.CanvasTexture(c);
+  }
+  function _mkFogTex(){
+    if(_texFog) return _texFog;
+    const c=document.createElement('canvas'); c.width=c.height=256;
+    const x=c.getContext('2d');
+    const g=x.createRadialGradient(128,128,2,128,128,120);
+    g.addColorStop(0,'rgba(190,200,215,0.55)');
+    g.addColorStop(0.5,'rgba(190,200,215,0.18)');
+    g.addColorStop(1,'rgba(190,200,215,0)');
+    x.fillStyle=g; x.fillRect(0,0,256,256);
+    return _texFog = new THREE.CanvasTexture(c);
+  }
+
+  function init(){
+    if(ready) return;
+    if(typeof scene === 'undefined' || !scene) return;
+    _scene = scene;
+    // SPARKS : sprites additifs, orange COLORSCRIPT forge.
+    const sparkBase = new THREE.SpriteMaterial({
+      map:_mkDotTex(), color:0xff7a30,
+      transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, fog:false,
+    });
+    for(let i=0;i<30;i++){
+      const s = new THREE.Sprite(sparkBase.clone());
+      s.scale.set(0.22, 0.22, 1); s.visible = false;
+      _scene.add(s);
+      sparks.push({obj:s, life:0, t0:-9, vx:0, vy:0, vz:0});
+    }
+    // MOTES : sprites additifs en gas-light (ambre).
+    const moteBase = new THREE.SpriteMaterial({
+      map:_mkDotTex(), color:0xffb45e,
+      transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, fog:false,
+      opacity:0,
+    });
+    for(let i=0;i<30;i++){
+      const m = new THREE.Sprite(moteBase.clone());
+      m.scale.set(0.12, 0.12, 1); m.visible = false;
+      _scene.add(m);
+      motes.push({obj:m, lamp:null, ox:0, oy:0, oz:0, ph:Math.random()*6.28});
+    }
+    // STEAM : sprites additifs gris-clair, prennent le fog (s'estompent au loin).
+    const steamBase = new THREE.SpriteMaterial({
+      map:_mkCloudTex(), color:0xc8c8d0,
+      transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, fog:true,
+      opacity:0,
+    });
+    for(let i=0;i<12;i++){
+      const s = new THREE.Sprite(steamBase.clone());
+      s.scale.set(1.2, 1.2, 1); s.visible = false;
+      _scene.add(s);
+      steam.push({obj:s, t0:-9, life:2.2});
+    }
+    // GROUND FOG : quads horizontaux, opacity modulée par nuit, fog:true.
+    const fogMat = new THREE.MeshBasicMaterial({
+      map:_mkFogTex(), color:0xbcc4d0,
+      transparent:true, depthWrite:false, fog:true,
+      opacity:0, side:THREE.DoubleSide,
+    });
+    const fogSpots = [
+      {x:-103, z:-30, r:14}, {x:-110, z:-22, r:11},   // Terres communes
+      {x: 100, z:  4, r:13}, {x: 104, z: 14, r:11},   // port / bord d'eau
+      {x:  98, z:-12, r:10},
+    ];
+    for(const sp of fogSpots){
+      const f = new THREE.Mesh(new THREE.PlaneGeometry(sp.r*2, sp.r*2), fogMat);
+      f.rotation.x = -Math.PI/2;
+      f.position.set(sp.x, 0.08, sp.z);
+      f.visible = false;
+      _scene.add(f);
+      fog.push({obj:f, x:sp.x, z:sp.z, ph:Math.random()*6.28});
+    }
+    // Lier chaque mote à une lampe à gaz (worldPos posée par M4.afterWorld).
+    if(typeof gasLamps !== 'undefined' && gasLamps.length){
+      for(let i=0;i<motes.length;i++){
+        const lamp = gasLamps[i % gasLamps.length];
+        motes[i].lamp = lamp;
+        motes[i].ox = (Math.random()-0.5)*2.2;
+        motes[i].oy = 1.0 + Math.random()*2.0;
+        motes[i].oz = (Math.random()-0.5)*2.2;
+      }
+    }
+    ready = true;
+    console.info('[M-Polish/A] prêt · sparks:'+sparks.length+
+      ' motes:'+motes.length+' steam:'+steam.length+' fog:'+fog.length);
+  }
+
+  function _qualFactor(){
+    if(typeof GRAPHICS_QUALITY === 'undefined') return 1;
+    if(GRAPHICS_QUALITY === 'low') return 0;
+    if(GRAPHICS_QUALITY === 'medium') return 0.7;
+    return 1.0;
+  }
+
+  function update(dt){
+    if(!ready) return;
+    const t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    const qf = _qualFactor();
+    if(qf <= 0){
+      for(const s of sparks) if(s.obj.visible) s.obj.visible = false;
+      for(const m of motes)  if(m.obj.visible) m.obj.visible = false;
+      for(const s of steam)  if(s.obj.visible) s.obj.visible = false;
+      for(const f of fog)    if(f.obj.visible) f.obj.visible = false;
+      return;
+    }
+    const T = (typeof t !== 'undefined') ? t : 0;
+    const cam = (typeof camera !== 'undefined') ? camera : null;
+    const camx = cam ? cam.position.x : 0;
+    const camz = cam ? cam.position.z : 0;
+    const nightF = (typeof DayCycle !== 'undefined')
+      ? Math.max(0, Math.min(1, 1 - DayCycle.kDay*1.7)) : 0.5;
+
+    // — SPARKS — émission depuis cheminées (réutilise la liste scannée
+    //   par PuffTrains : pas de double scan). Intensité ∝ production.
+    const sparkBudget = Math.round(sparks.length * qf);
+    const prodActive = (typeof state !== 'undefined' && state && state.productionActive);
+    const emitRate = prodActive ? 14 : 4;     // spawns / s
+    const chimneys = (typeof PuffTrains !== 'undefined' && PuffTrains.emitters) ? PuffTrains.emitters : null;
+    if(chimneys && chimneys.length && Math.random() < emitRate * dt){
+      // chercher une cheminée proche caméra (cheap : random + distance check).
+      let pick=null, bestD2=140*140;
+      for(let k=0;k<3;k++){
+        const c = chimneys[(Math.random()*chimneys.length)|0];
+        c.getWorldPosition(_tmpV);
+        const dx=_tmpV.x-camx, dz=_tmpV.z-camz, d2=dx*dx+dz*dz;
+        if(d2<bestD2){ pick=c; bestD2=d2; }
+      }
+      if(pick){
+        for(let i=0;i<sparkBudget;i++){
+          const s = sparks[i];
+          if(s.life<=0 || T-s.t0 > s.life){
+            pick.getWorldPosition(_tmpV);
+            s.obj.position.set(_tmpV.x, _tmpV.y + 0.5 + Math.random()*0.7, _tmpV.z);
+            s.t0 = T; s.life = 1.6 + Math.random()*1.0;
+            s.vx = 0.6 + (Math.random()-0.5)*0.4;     // vent d'ouest cohérent
+            s.vy = 1.4 + Math.random()*0.8;
+            s.vz = (Math.random()-0.5)*0.3;
+            s.obj.material.opacity = 1.0;
+            s.obj.visible = true;
+            break;
+          }
+        }
+      }
+    }
+    for(let i=0;i<sparks.length;i++){
+      const s = sparks[i];
+      if(!s.obj.visible) continue;
+      const age = (T - s.t0) / s.life;
+      if(age >= 1 || i >= sparkBudget){ s.obj.visible = false; continue; }
+      s.obj.position.x += s.vx * dt;
+      s.obj.position.y += s.vy * dt;
+      s.obj.position.z += s.vz * dt;
+      s.obj.material.opacity = (1 - age) * (1 - age*0.4);
+      s.obj.scale.setScalar(0.20 + age*0.18);
+    }
+
+    // — MOTES — poussière dans les cônes M4. Activée la nuit, proximité caméra.
+    const motesBudget = Math.round(motes.length * qf);
+    for(let i=0;i<motes.length;i++){
+      const m = motes[i];
+      if(i >= motesBudget || !m.lamp || !m.lamp.worldPos){
+        if(m.obj.visible) m.obj.visible = false; continue;
+      }
+      const dx = m.lamp.worldPos.x - camx;
+      const dz = m.lamp.worldPos.z - camz;
+      const d2 = dx*dx + dz*dz;
+      const target = (d2 < 60*60) ? nightF * 0.50 * (1 - d2/(60*60)) : 0;
+      if(target <= 0.005){
+        if(m.obj.visible) m.obj.visible = false; continue;
+      }
+      m.obj.visible = true;
+      m.obj.position.set(
+        m.lamp.worldPos.x + m.ox + Math.sin(T*0.6 + m.ph)*0.10,
+        m.lamp.worldPos.y - 1.5 + m.oy + Math.cos(T*0.4 + m.ph)*0.05,
+        m.lamp.worldPos.z + m.oz + Math.sin(T*0.5 + m.ph + 1)*0.10
+      );
+      m.obj.material.opacity = target;
+    }
+
+    // — STEAM — jets courts près usine + port. Dérive douce + vent d'ouest.
+    const steamBudget = Math.round(steam.length * qf);
+    const STEAM_SRC = [
+      {x: -10,  y: 1.4, z: 30},     // usine grille avant
+      {x: -20,  y: 1.4, z: 26},     // usine grille arrière
+      {x: 102,  y: 1.2, z:  4},     // port quai
+    ];
+    if(Math.random() < 6 * dt){
+      for(let i=0;i<steamBudget;i++){
+        const s = steam[i];
+        if(T - s.t0 > s.life){
+          const src = STEAM_SRC[(Math.random()*STEAM_SRC.length)|0];
+          s.obj.position.set(src.x + (Math.random()-0.5)*1.2, src.y, src.z + (Math.random()-0.5)*1.2);
+          s.t0 = T; s.life = 2.0 + Math.random()*1.0;
+          s.obj.visible = true;
+          break;
+        }
+      }
+    }
+    for(let i=0;i<steam.length;i++){
+      const s = steam[i];
+      if(!s.obj.visible) continue;
+      const age = (T - s.t0) / s.life;
+      if(age >= 1 || i >= steamBudget){ s.obj.visible = false; continue; }
+      s.obj.position.y += dt * 0.80;
+      s.obj.position.x += dt * 0.35;
+      s.obj.scale.setScalar(0.9 + age*1.8);
+      s.obj.material.opacity = 0.30 * (1 - age) * (1 - age*0.4);
+    }
+
+    // — GROUND FOG — nappe basse subtile, modulée par nuit.
+    const fogTarget = nightF * 0.55;
+    const fogOn = fogTarget > 0.02;
+    for(const f of fog){
+      f.obj.visible = fogOn;
+      if(!fogOn) continue;
+      f.obj.material.opacity = fogTarget;
+      f.obj.position.y = 0.08 + Math.sin(T*0.30 + f.ph)*0.02;
+    }
+
+    if(t0) _budgetMs = _budgetMs*0.9 + (performance.now()-t0)*0.1;
+  }
+
+  function debug(){
+    return {
+      ready, budgetMs:+_budgetMs.toFixed(2),
+      sparks: sparks.filter(s=>s.obj.visible).length+'/'+sparks.length,
+      motes:  motes.filter(m=>m.obj.visible).length+'/'+motes.length,
+      steam:  steam.filter(s=>s.obj.visible).length+'/'+steam.length,
+      fog:    fog.filter(f=>f.obj.visible).length+'/'+fog.length,
+    };
+  }
+
+  return { init, update, debug };
+})();
+if(typeof window !== 'undefined') window.__mpolish = M_Polish;
+
 /* v58 — LE PAYSAGE SONORE. Tout est synthétisé (aucun fichier) et mixé par
    PROXIMITÉ : un vent doux partout (souffle filtré, lentement modulé), des
    mouettes près de l'eau, le ronron grave des machines près des usines en
@@ -14611,6 +14899,7 @@ function loop(){
   updateWindowGlow();                 // v62 + M4 : fenêtres + lampes + cônes
   Atmosphere.update(dt);              // v58 : brume + position du soleil
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
+  M_Polish.update(dt);                // M-Polish/A : sparks, motes, steam, fog
   updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
   updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
   _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
