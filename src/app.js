@@ -3836,14 +3836,12 @@ function _M6_updateCranes(){
 }
 
 /* =====================================================================
-   M-Mer/B — PHARE & FAISCEAU TOURNANT.
-   Tour low-poly à bandes (stone / blanc) sur un môle au sud du port.
-   Lanterne sommitale émissive (sous le seuil bloom). Cône additif qui
-   balaie l'horizon mer en rotation continue ~6 s/tour : intense la nuit
-   (kNight pilote l'opacité), atténué le jour. depthWrite=false,
-   blending=Additive — pas de cube blanchi par over-bloom.
+   M-Mer/B — PHARE.
+   Tour low-poly à bandes (pierre claire / bande rouge / pierre claire)
+   sur un môle au sud du port. Lanterne sommitale émissive (sous le
+   seuil bloom) + halo source. Le faisceau tournant a été retiré : la
+   silhouette du phare avec sa lanterne suffit à signaler le port.
    ===================================================================== */
-let _M_Mer_phareBeam = null;   // groupe pivot du faisceau
 let _M_Mer_phareLantern = null; // material émissif (modulation jour/nuit)
 let _M_Mer_phareHalo = null;    // sprite halo (modulation jour/nuit)
 function buildLighthouse(){
@@ -3930,91 +3928,19 @@ function buildLighthouse(){
   root.add(halo);
   _M_Mer_phareHalo = halo;
 
-  // --- faisceau (pinceau diffus, ShaderMaterial) ---
-  //   Cône LONG et FIN (60 m, rayon base 2.6 → demi-angle ~2.5°). Apex
-  //   solidaire de la lanterne. ShaderMaterial : alpha dégradé le long
-  //   (1 à l'apex → 0 à la pointe), alpha radial (1 au centre → 0 au
-  //   bord du cône), additif, depthWrite=false. Couleur warm-white pâle
-  //   (gasLight très désaturé). Léger battement temporel. Aucune zone
-  //   plate, jamais d'aplat orange.
-  const beamLen = 60.0;
-  const beamR   = 2.6;
-  const beamGeo = new THREE.ConeGeometry(beamR, beamLen, 20, 1, true);
-  beamGeo.translate(0, -beamLen/2, 0);   // apex à l'origine, base à y=-beamLen
-  beamGeo.rotateX(Math.PI/2);            // couche le cône le long de -Z
-  const beamMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTime:    { value: 0 },
-      uColor:   { value: new THREE.Color(0xffefd0) },  // warm-white pâle, gasLight très désaturé
-      uOpacity: { value: 0.0 },                         // pilotée par _M_Mer_updateLighthouse
-    },
-    transparent: true, depthWrite: false, fog: false,   // custom shader gère son propre fondu via uOpacity et aLength
-    blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
-    vertexShader: `
-      varying vec2 vUv;
-      void main(){
-        vUv = uv;       // ConeGeometry : uv.y = 0 à l'apex, 1 à la base
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: `
-      uniform float uTime;
-      uniform float uOpacity;
-      uniform vec3  uColor;
-      varying vec2  vUv;
-      void main(){
-        // axial : 0 = apex (lanterne), 1 = pointe lointaine. Fade quadratique.
-        float along = vUv.y;
-        // alpha le long : intense près de la lanterne, s'estompe vers le large
-        float aLength = pow(1.0 - along, 1.7);
-        // radial : uv.x ∈ [0,1] = position angulaire (sans info radiale dans le
-        //   cône ouvert). On utilise une bande douce sur la circonférence pour
-        //   masquer les bords latéraux (le faisceau a l'air d'un noyau central).
-        //   bord-fade : 1 au centre angulaire, 0 aux extrémités du cône (vu de profil)
-        //   On laisse 1.0 par défaut — le cône ouvert sans cap donne déjà l'effet
-        //   « voile diffuse ». Si on veut accentuer, on peut moduler ici.
-        float aBase = aLength;
-        // léger battement (gas-light vacille à peine)
-        float pulse = 0.92 + 0.08 * sin(uTime * 2.4);
-        float alpha = aBase * uOpacity * pulse;
-        gl_FragColor = vec4(uColor, alpha);
-      }`,
-  });
-  _M_Mer_phareLantern.userData.beamMat = beamMat;
-  const beam = new THREE.Mesh(beamGeo, beamMat);
-  const pivot = new THREE.Group();
-  pivot.position.set(0, lantY, 0);
-  pivot.add(beam);
-  // pitch léger vers le bas : le faisceau balaie la mer plutôt que le ciel.
-  //   tilt 0.10 rad → base ≈ 6 m sous l'apex à 60 m → effleure la surface.
-  beam.rotation.x = 0.10;
-  root.add(pivot);
-  _M_Mer_phareBeam = pivot;
   scene.add(root);
 
   // barrière invisible : on n'entre pas dans le môle
   obstacles.push({pos:new THREE.Vector2(baseX, baseZ), radius:3.5});
 }
 function _M_Mer_updateLighthouse(){
-  if(!_M_Mer_phareBeam) return;
-  // rotation lente continue ~8 s/tour (balayage tranquille du large)
-  _M_Mer_phareBeam.rotation.y = t * (Math.PI*2 / 8.0);
+  if(!_M_Mer_phareLantern) return;
   // intensité jour/nuit : kNight pilote (kDay≈0 nuit ; on veut l'inverse).
   const kNight = (typeof DayCycle!=='undefined' && typeof DayCycle.kDay==='number')
     ? Math.max(0, Math.min(1, 1 - DayCycle.kDay)) : 0.5;
   // émissive lanterne : sous le seuil bloom même la nuit (intensité 0.75 max,
   //   couleur déjà gasLight chaude — luminance ~0.7).
-  if(_M_Mer_phareLantern){
-    _M_Mer_phareLantern.emissiveIntensity = 0.10 + 0.65 * kNight;
-    const bm = _M_Mer_phareLantern.userData.beamMat;
-    if(bm){
-      // pinceau quasi invisible le jour, doux la nuit. uOpacity est le
-      //   plafond multiplicatif ; le shader applique en plus aLength
-      //   (fade quadratique apex→pointe) et pulse — alpha effectif max
-      //   ≈ uOpacity * 1.0 à l'apex, ~0 à la pointe.
-      bm.uniforms.uOpacity.value = 0.04 + 0.36 * kNight;   // 0.04 jour, 0.40 nuit
-      bm.uniforms.uTime.value = t;
-    }
-  }
+  _M_Mer_phareLantern.emissiveIntensity = 0.10 + 0.65 * kNight;
   if(_M_Mer_phareHalo){
     // halo source : pulse doux à peine perceptible
     const pulse = 0.92 + 0.08 * Math.sin(t * 2.1);
