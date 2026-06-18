@@ -709,6 +709,33 @@ const zoneGroups = {};   // name -> THREE.Group (pour les conséquences visibles
 const obstacles = [];    // {pos, radius} pour collisions simples
 const HALF = 120;        // v49 : monde élargi mais compact — les quartiers d'entreprise s'insèrent ENTRE les institutions partagées
 
+// M-Peaufinage/D : registre des marqueurs de zone (panneaux £/P/A'/…
+//   et grands panneaux nominatifs). Chaque frame, leur opacité est
+//   modulée par la distance au chariot — invisibles de très près
+//   (pour ne pas masquer la scène), pleins de loin (fonction de repère
+//   conservée). L'interaction de zone (handleZones) reste inchangée :
+//   on ne touche que material.opacity.
+const _zoneSigns = [];
+const _M_PEAUFINAGE_signWP = new THREE.Vector3();
+function updateZoneSignsFade(){
+  if(!_zoneSigns.length) return;
+  if(typeof Vehicle==='undefined' || !Vehicle.pos) return;
+  const vx = Vehicle.pos.x, vz = Vehicle.pos.z;
+  for(let i=0;i<_zoneSigns.length;i++){
+    const sp = _zoneSigns[i];
+    if(!sp || !sp.parent || !sp.material) continue;
+    sp.getWorldPosition(_M_PEAUFINAGE_signWP);
+    const dx = _M_PEAUFINAGE_signWP.x - vx, dz = _M_PEAUFINAGE_signWP.z - vz;
+    const d = Math.hypot(dx, dz);
+    // Courbe : < 6 m → 0.10 (discret) ; 6..18 m → ramp ; > 18 m → 1.0.
+    let k;
+    if(d < 6) k = 0.10;
+    else if(d > 18) k = 1.0;
+    else k = 0.10 + 0.90 * ((d - 6) / 12);
+    sp.material.opacity = k;
+  }
+}
+
 function makeLabel(text){
   const c=document.createElement('canvas'); c.width=640; c.height=160;
   const x=c.getContext('2d');
@@ -854,7 +881,11 @@ function defineZone(name,x,z,color,key,builder){
   builder(group,color);
   _M4_currentZone=null;
   group.children.forEach(m=>{ if(m.userData) m.userData.base=true; });  // structure de base (masquable)
-  const label=makeLabel(key?`${key} — ${name}`:name); label.position.set(0,8,0); group.add(label);
+  const label=makeLabel(key?`${key} — ${name}`:name); label.position.set(0,8,0);
+  // M-Peaufinage/D : tag pour le fade-par-distance (lisible de loin,
+  //   discret de près pour ne pas masquer la scène quand on est sur place).
+  label.userData.zoneSign = true; _zoneSigns.push(label);
+  group.add(label);
   // halo au sol
   const halo=new THREE.Mesh(new THREE.RingGeometry(7.4,8.2,40),
     new THREE.MeshBasicMaterial({color,transparent:true,opacity:.35,side:THREE.DoubleSide}));
@@ -9622,7 +9653,13 @@ function createRoof(type,w,d,c=0x46393b){ const g=new THREE.Group();
       const gl=box(w/n*0.62,1.7,d*0.98,0x33414c,x+w/n*0.18,1.05,0,false); gl.rotation.z=-0.66; gl.material.emissive=new THREE.Color(0x14222c); g.add(gl); } }
   else { g.add(box(w,0.32,d,c,0,0.16,0,false)); }
   return g; }
-function createSign(text){ const lab=makeLabel(text); lab.scale.set(6,1.5,1); return lab; }
+function createSign(text){
+  const lab=makeLabel(text); lab.scale.set(6,1.5,1);
+  // M-Peaufinage/D : tous les signes £, P, A', M, M', Ft, ÉTAT, numéros
+  //   d'arches… deviennent transparents quand on s'en approche.
+  lab.userData.zoneSign = true; _zoneSigns.push(lab);
+  return lab;
+}
 function createAwning(w=4,c=COL.rouge){ const g=new THREE.Group();
   const a=box(w,0.18,2.2,c,0,0,0,false); a.rotation.x=0.2; g.add(a);
   for(let i=0;i<Math.max(2,Math.floor(w));i++){ const s=new THREE.Mesh(new THREE.ConeGeometry(0.34,0.5,3),stdMat(c));
@@ -16025,6 +16062,7 @@ function loop(){
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
   M_Polish.update(dt);                // M-Polish/A : sparks, motes, steam, fog
   M_Life.update(dt);                  // M-Polish/B : oiseaux V, chat, linge, fanions, fumées
+  updateZoneSignsFade();              // M-Peaufinage/D : marqueurs £ discrets à proximité
   updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
   updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
   _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
