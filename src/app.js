@@ -14186,11 +14186,26 @@ function buildSky(){
       void main(){
         vec3 d = normalize(vWorldDir);
         float h = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);          // 0 horizon-bas → 1 zénith
-        // dégradé vertical en 3 arrêts (horizon → mid → zénith)
-        float hHor = pow(1.0 - h, uHorizonExp);              // poids horizon
-        float hZen = pow(h, uMidExp);                        // poids zénith
-        float hMid = clamp(1.0 - hHor - hZen, 0.0, 1.0);     // résidu = mid
-        vec3 vert = uHorizon*hHor + uMid*hMid + uZenith*hZen;
+        // M-Peaufinage/E : dégradé à 4 PALIERS avec interpolations
+        //   smoothstep — supprime les kinks de la version pow() précédente
+        //   (qui laissait apparaître une « marche » près du zénith où le
+        //   poids hMid clampait à 0). Le nouveau dégradé est nettement plus
+        //   doux ; la perception du zénith est continue.
+        //     c0 = horizon (0..0.18)
+        //     c1 = mid bas (0.18..0.45)
+        //     c2 = mid haut = mix(uMid, uZenith, 0.55) (0.45..0.78)
+        //     c3 = zenith (0.78..1.0)
+        vec3 c0 = uHorizon;
+        vec3 c1 = uMid;
+        vec3 c2 = mix(uMid, uZenith, 0.55);
+        vec3 c3 = uZenith;
+        float k01 = smoothstep(0.00, 0.18, h);
+        float k12 = smoothstep(0.18, 0.45, h);
+        float k23 = smoothstep(0.45, 0.78, h);
+        vec3 vert = c0;
+        vert = mix(vert, c1, k01);
+        vert = mix(vert, c2, k12);
+        vert = mix(vert, c3, k23);
 
         // BIAIS DIRECTIONNEL — embrasement à l'OUEST, refroidissement à l'EST.
         // westFactor positif vers l'ouest, négatif vers l'est. Cantonné au bas du ciel.
