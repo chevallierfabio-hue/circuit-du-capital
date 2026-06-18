@@ -868,6 +868,7 @@ function buildWorld(){
   buildGroundDebris(); // M3 — papiers / éclats / pierres en InstancedMesh
   buildWaterEast();    // v56/M6 : littoral — eau étendue jusqu'à l'horizon (M6-bord)
   buildLighthouse();   // M-Mer/B : phare + faisceau tournant sur môle pierre
+  buildMaritimeTraffic();// M-Mer/C : voiliers + vapeur en patrouille (sillages, fumée)
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
   buildClosingHorizon();// M6-bord : ferme le monde par géographie naturelle (collines, estran, voiliers distants)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
@@ -3971,6 +3972,222 @@ function _M_Mer_updateLighthouse(){
     if(bm) bm.opacity = 0.08 + 0.32 * kNight;   // 0.08 jour, 0.40 nuit
   }
   if(_M_Mer_phareHalo) _M_Mer_phareHalo.material.opacity = 0.12 + 0.55 * kNight;
+}
+
+/* =====================================================================
+   M-Mer/C — BATEAUX ANIMÉS.
+   3 embarcations qui patrouillent la mer : 2 voiliers sur boucles
+   fermées, 1 vapeur cargo sur ligne nord-sud avec cheminée fumante.
+   Chacun a un PATH (waypoints), une vitesse et un sillage (trail de
+   plans semi-transparents qui se réinjectent par anneau circulaire,
+   coût constant).
+   ===================================================================== */
+const _M_Mer_traffic = [];          // {obj, path, p, speed, tangage, smokeStack, wake, isSteamer}
+
+function _M_Mer_createSteamer(){
+  // Petit vapeur cargo d'époque : coque plus longue, cabine arrière,
+  //   cheminée fumante au centre, cale ouverte au pont avant.
+  const g = new THREE.Group();
+  const matCoque   = new THREE.MeshStandardMaterial({color:0x3a2f24, roughness:0.85, metalness:0.05, flatShading:true});
+  const matCoqueB  = new THREE.MeshStandardMaterial({color:0x1a1612, roughness:0.95, metalness:0.05, flatShading:true});
+  const matPont    = new THREE.MeshStandardMaterial({color:0x6a5840, roughness:0.95, metalness:0.0,  flatShading:true});
+  const matCabine  = new THREE.MeshStandardMaterial({color:0x8a7a56, roughness:0.85, metalness:0.0,  flatShading:true});
+  const matToit    = new THREE.MeshStandardMaterial({color:0x4a2618, roughness:0.85, metalness:0.0,  flatShading:true});
+  const matMetal   = new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5,  metalness:0.7,  flatShading:true});
+  const matFanal   = new THREE.MeshStandardMaterial({
+    color:0xffd9a4, emissive:new THREE.Color(0xffb45e), emissiveIntensity:0.30,
+    roughness:0.5, metalness:0.3, flatShading:true,
+  });
+  // coque
+  const coque = new THREE.Mesh(new THREE.BoxGeometry(2.8, 1.0, 8.5), matCoque);
+  coque.position.y = 0.50; g.add(coque);
+  // bande sombre en bas
+  g.add((m=>{ m.position.set(0, 0.10, 0); return m; })(new THREE.Mesh(new THREE.BoxGeometry(2.9, 0.20, 8.5), matCoqueB)));
+  // proue effilée
+  const proue = new THREE.Mesh(new THREE.ConeGeometry(1.4, 1.4, 6), matCoque);
+  proue.rotation.x = Math.PI/2;
+  proue.rotation.z = Math.PI;
+  proue.position.set(0, 0.50, 4.95); g.add(proue);
+  // pont
+  const pont = new THREE.Mesh(new THREE.BoxGeometry(2.4, 0.18, 8.0), matPont);
+  pont.position.y = 1.05; g.add(pont);
+  // cale ouverte (rectangle creusé) avant — simple cube sombre dessous
+  const cale = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.10, 2.4), matCoqueB);
+  cale.position.set(0, 1.05, 2.4); g.add(cale);
+  // cabine arrière (timonerie)
+  const cabine = new THREE.Mesh(new THREE.BoxGeometry(2.0, 1.0, 2.2), matCabine);
+  cabine.position.set(0, 1.65, -2.4); g.add(cabine);
+  const toit = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.14, 2.4), matToit);
+  toit.position.set(0, 2.20, -2.4); g.add(toit);
+  // mât bas
+  const mat = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.6, 6), matMetal);
+  mat.position.set(0, 2.5, 1.5); g.add(mat);
+  // cheminée (centre coque)
+  const stack = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.32, 1.9, 8), matCoqueB);
+  stack.position.set(0, 2.35, -0.6); g.add(stack);
+  // anneau métal en haut cheminée
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.06, 4, 8), matMetal);
+  ring.rotation.x = Math.PI/2; ring.position.set(0, 3.20, -0.6); g.add(ring);
+  // fanal arrière (petit globe émissif sous le seuil bloom)
+  const fanal = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 6), matFanal);
+  fanal.position.set(0, 2.60, -3.5); g.add(fanal);
+  // tag : la cheminée est le point d'ancrage de la fumée
+  g.userData.stackPos = new THREE.Vector3(0, 3.20, -0.6);
+  return g;
+}
+
+function _M_Mer_buildWakeTrail(parent){
+  // Sillage : 8 plans semi-transparents disposés derrière le bateau, l'un
+  //   après l'autre. Chaque plan vit dans le repère MONDE (pas dans le
+  //   bateau) : on les réinjecte derrière le bateau à intervalle régulier.
+  const trail = [];
+  const tex = (() => {
+    const c = document.createElement('canvas'); c.width=64; c.height=32;
+    const x = c.getContext('2d');
+    const g = x.createLinearGradient(0,0,64,0);
+    g.addColorStop(0,'rgba(255,255,255,0)');
+    g.addColorStop(0.4,'rgba(240,240,240,0.55)');
+    g.addColorStop(1,'rgba(220,220,220,0)');
+    x.fillStyle = g; x.fillRect(0,0,64,32);
+    return new THREE.CanvasTexture(c);
+  })();
+  for(let i=0; i<8; i++){
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.5),
+      new THREE.MeshBasicMaterial({map:tex, transparent:true, opacity:0,
+        depthWrite:false, fog:true}));
+    m.rotation.x = -Math.PI/2;
+    m.position.y = 0.05;
+    scene.add(m);
+    trail.push({obj:m, age: 1});
+  }
+  return trail;
+}
+
+function _M_Mer_buildSmokeStack(boat){
+  // Panache de fumée d'un vapeur : 5 sprites montant + dérivant à l'est.
+  const tex = _smokeTexture();   // partagé avec la skyline (déjà créé)
+  const puffs = [];
+  for(let i=0; i<5; i++){
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: tex, color: 0x6a6660, transparent: true, opacity: 0,
+      depthWrite: false, fog: true,
+    }));
+    sp.scale.set(2.0, 2.0, 1);
+    scene.add(sp);
+    puffs.push({obj: sp, phase: i/5, age: i/5});
+  }
+  return puffs;
+}
+
+function buildMaritimeTraffic(){
+  // 3 trajectoires : 2 voiliers en boucle, 1 vapeur en aller-retour N-S.
+  const paths = [
+    // voilier 1 — boucle large autour du large
+    { kind:'voilier', speed:1.6, path:[
+      [150, 0,  90], [200, 0,  60], [230, 0,   0], [220, 0, -70],
+      [180, 0,-120], [140, 0,-100], [125, 0, -40], [130, 0,  40],
+    ]},
+    // voilier 2 — boucle plus rapprochée, sens contraire
+    { kind:'voilier', speed:1.1, path:[
+      [140, 0,-150], [175, 0,-180], [205, 0,-150], [215, 0, -90],
+      [195, 0, -30], [160, 0,   0], [135, 0, -50], [128, 0,-110],
+    ]},
+    // vapeur — ligne N-S, aller-retour
+    { kind:'steamer', speed:2.2, path:[
+      [165, 0, -180], [175, 0,  -90], [180, 0,   0], [175, 0,  90], [165, 0, 180],
+      [160, 0, 90],  [158, 0,   0], [160, 0, -90],   // retour pour fermer la boucle
+    ]},
+  ];
+  for(let i=0; i<paths.length; i++){
+    const cfg = paths[i];
+    const obj = (cfg.kind === 'steamer') ? _M_Mer_createSteamer() : createBoat();
+    scene.add(obj);
+    const trail = _M_Mer_buildWakeTrail(obj);
+    const smoke = (cfg.kind === 'steamer') ? _M_Mer_buildSmokeStack(obj) : null;
+    _M_Mer_traffic.push({
+      obj, kind: cfg.kind, path: cfg.path, p: Math.random(), speed: cfg.speed,
+      trail, trailIdx: 0, trailTimer: 0,
+      smoke, smokeTimer: 0,
+      tangagePhase: Math.random()*6.28,
+    });
+  }
+}
+
+const _M_Mer_pathPos = new THREE.Vector3();
+const _M_Mer_pathPosNext = new THREE.Vector3();
+function _M_Mer_pathSample(path, t01){
+  // Échantillonne une polyligne fermée par t01 ∈ [0,1].
+  const n = path.length;
+  const tt = t01 * n;
+  const i = Math.floor(tt) % n;
+  const j = (i + 1) % n;
+  const f = tt - Math.floor(tt);
+  const a = path[i], b = path[j];
+  _M_Mer_pathPos.set(
+    a[0] + (b[0]-a[0])*f,
+    a[1] + (b[1]-a[1])*f,
+    a[2] + (b[2]-a[2])*f,
+  );
+  _M_Mer_pathPosNext.set(b[0]-a[0], 0, b[2]-a[2]).normalize();
+  return _M_Mer_pathPos;
+}
+function _M_Mer_updateTraffic(dt){
+  if(!_M_Mer_traffic.length) return;
+  for(const b of _M_Mer_traffic){
+    // distance parcourue (longueur estimée du path : on simplifie en disant
+    //   qu'une boucle complète ≈ 800 unités → vitesse 1.0 = 1/800 par s).
+    b.p = (b.p + dt * b.speed / 800) % 1;
+    const pos = _M_Mer_pathSample(b.path, b.p);
+    // tangage / roulis selon les vagues : sin sur Y, sin sur Z (roulis)
+    const ph = b.tangagePhase;
+    const tang = Math.sin(t*1.05 + ph) * 0.10;
+    const roul = Math.sin(t*0.80 + ph + 1.7) * 0.045;
+    b.obj.position.set(pos.x, tang, pos.z);
+    // orientation : tangent au path (Y world = atan2 du vecteur tangent xz)
+    const heading = Math.atan2(_M_Mer_pathPosNext.x, _M_Mer_pathPosNext.z);
+    b.obj.rotation.y = heading;
+    b.obj.rotation.z = roul;
+    b.obj.rotation.x = Math.sin(t*0.6 + ph + 3.1) * 0.025;
+    // sillage : ré-injecte un plan à la poupe toutes les 0.4 s
+    b.trailTimer += dt;
+    if(b.trailTimer > 0.4){
+      b.trailTimer = 0;
+      const back = b.trail[b.trailIdx];
+      back.obj.position.set(
+        pos.x - _M_Mer_pathPosNext.x * 2.2,
+        0.05,
+        pos.z - _M_Mer_pathPosNext.z * 2.2,
+      );
+      back.obj.rotation.z = heading;   // orienté selon la coque
+      back.age = 0;
+      b.trailIdx = (b.trailIdx + 1) % b.trail.length;
+    }
+    for(const tr of b.trail){
+      tr.age = Math.min(1, tr.age + dt * 0.42);
+      const a = tr.age;
+      tr.obj.material.opacity = (1 - a) * 0.55;
+      tr.obj.scale.set(1 + a*4.5, 1 + a*1.6, 1);
+    }
+    // fumée vapeur
+    if(b.smoke){
+      for(const p of b.smoke){
+        p.age += dt * 0.20;             // ~5 s cycle
+        if(p.age >= 1) p.age -= 1;
+        const a = p.age;
+        // anchor world : position bateau + offset cheminée (transformé par rotation y)
+        const sp = b.obj.userData.stackPos;
+        const cy = Math.cos(heading), sy = Math.sin(heading);
+        const wx = pos.x + sp.x*cy + sp.z*sy;
+        const wz = pos.z - sp.x*sy + sp.z*cy;
+        const wy = sp.y + tang;
+        // monte de 0 à +9, dérive est, dilatation
+        p.obj.position.set(wx + a*4, wy + a*9, wz);
+        const s = 1.8 + a*4;
+        p.obj.scale.set(s, s, 1);
+        p.obj.material.opacity = Math.sin(a*Math.PI) * 0.40;
+      }
+    }
+  }
 }
 function buildBourse(g){             // « le phare du capital » — verticale, rayonnante
   const pierre=pierreDeTailleTexture('clair');
@@ -16248,6 +16465,7 @@ function loop(){
   _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
   _M6_updateCranes();                 // M6 : pivot lent des grues du port
   _M_Mer_updateLighthouse();          // M-Mer/B : rotation faisceau, intensité jour/nuit
+  _M_Mer_updateTraffic(dt);           // M-Mer/C : bateaux, sillages, fumée vapeur
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
