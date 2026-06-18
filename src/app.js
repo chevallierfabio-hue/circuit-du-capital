@@ -4206,31 +4206,45 @@ function buildWaterEast(){
     uAstreColor:{ value: new THREE.Color(COLORSCRIPT.skyHorizon) },
     uAstreUp:   { value: 0.20 },                           // élévation [0..1]
     uIsMoon:    { value: 0.0 },                            // 0=jour, 1=nuit
+    uFogColor:  { value: new THREE.Color(0x5a5560) },      // synchronisé avec scene.fog
+    uFogNear:   { value: 90.0 },
+    uFogFar:    { value: 260.0 },
   };
   _M6_waterMaterial=new THREE.ShaderMaterial({
     uniforms, transparent: true, depthWrite: false, fog: false,
     vertexShader:`
       uniform float uTime;
-      varying vec3 vWorldPos;
-      varying vec3 vNrm;
+      varying vec3  vWorldPos;
+      varying vec3  vNrm;
+      varying float vSeaMix;     // 0 près du quai → 1 au grand large
       void main(){
-        // M-Peaufinage/B : amplitudes des vagues + lisibles (×1.45 env)
-        //   pour que l'eau ne paraisse JAMAIS plate. Le surcoût reste nul
-        //   (mêmes opérations, juste des constantes plus hautes).
+        // M-Mer/A : HOULE par superposition de 4 sinus. Amplitudes calmes
+        //   près du quai (vSeaMix→0), forte au large (vSeaMix→1) : la zone
+        //   d'amarrage reste lisible, le grand large vit. Coût : un dot et
+        //   un smoothstep par vertex (négligeable).
         vec3 p = position;
-        float w1 = sin(p.x*0.40 + uTime*0.65) * 0.16;
-        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.22;
-        float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.10;
-        // petite oscillation chaotique haute fréquence pour casser la régularité
-        float w4 = sin(p.x*1.10 - p.y*0.70 + uTime*1.30) * 0.04;
-        p.z += w1 + w2 + w3 + w4;
+        // worldX provisoire (pour gradient calme→large). La plane est en XY
+        //   local ; le modelMatrix la pose au sol et la translate à x=305.
+        float worldX = (modelMatrix * vec4(p, 1.0)).x;
+        float seaMix = smoothstep(115.0, 165.0, worldX);   // 0..1 sur ~50 m
+        // 4 sinus : 2 longs (houle), 1 oblique, 1 court (clapot).
+        float w1 = sin(p.x*0.40 + uTime*0.65) * 0.20;
+        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.26;
+        float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.14;
+        float w4 = sin(p.x*1.10 - p.y*0.70 + uTime*1.30) * 0.06;
+        // amplitude gradient : facteur calme→large appliqué uniformément
+        float gain = mix(0.30, 1.10, seaMix);
+        p.z += (w1 + w2 + w3 + w4) * gain;
         vec4 wp = modelMatrix * vec4(p, 1.0);
         vWorldPos = wp.xyz;
-        float dx = cos(p.x*0.40 + uTime*0.65)*0.40*0.16
-                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.10
-                 + cos(p.x*1.10 - p.y*0.70 + uTime*1.30)*1.10*0.04;
-        float dz = cos(p.y*0.18 + uTime*0.43)*0.18*0.22
-                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.10;
+        vSeaMix = seaMix;
+        // normales analytiques (dérivées des sinus) — toujours valides après
+        //   le gain, multiplie par gain pour cohérence pente.
+        float dx = (cos(p.x*0.40 + uTime*0.65)*0.40*0.20
+                 +  cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.14
+                 +  cos(p.x*1.10 - p.y*0.70 + uTime*1.30)*1.10*0.06) * gain;
+        float dz = (cos(p.y*0.18 + uTime*0.43)*0.18*0.26
+                 +  cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.14) * gain;
         vNrm = normalize(vec3(-dx, 1.0, -dz));
         gl_Position = projectionMatrix * viewMatrix * wp;
       }`,
@@ -4244,12 +4258,16 @@ function buildWaterEast(){
       uniform vec3  uFanal3;
       uniform vec3  uFanal4;
       uniform vec3  uFanal5;
+      uniform vec3  uFogColor;
+      uniform float uFogNear;
+      uniform float uFogFar;
       uniform vec2  uAstreDir;
       uniform vec3  uAstreColor;
       uniform float uAstreUp;
       uniform float uIsMoon;
       varying vec3  vWorldPos;
       varying vec3  vNrm;
+      varying float vSeaMix;
       // M-Peaufinage/B : helper réflexe-fanal (compacte le code, mêmes
       //   coefficients que l'original 0.55 / 0.85 / 0.15).
       float reflexFanal(vec2 wp, vec3 f, float phase){
@@ -4300,21 +4318,38 @@ function buildWaterEast(){
         float rSum = r0 + r1 + r2 + r3 + r4 + r5;
         col += vec3(1.0, 0.78, 0.42) * rSum * 0.50 * (0.30 + uIsMoon*0.70);
 
-        // écume sur les crêtes (normales inclinées) — un peu plus marquée
-        float foam = smoothstep(0.30, 0.85, (1.0 - vNrm.y) * 5.0);
-        col += vec3(0.46) * foam * 0.42;
-        gl_FragColor = vec4(col, 0.92);
+        // M-Mer/A : ÉCUME sur les crêtes — gradient amplitude par seaMix.
+        //   Près du quai : crêtes lisses, faible foam. Au large : crêtes
+        //   marquées, foam visible (chaque crête se relève, le blanc apparaît
+        //   quand la normale s'incline). Reste sous le seuil bloom (0.82).
+        float foam = smoothstep(0.25, 0.85, (1.0 - vNrm.y) * 5.0);
+        float foamAmp = mix(0.18, 0.62, vSeaMix);   // près quai 0.18 / au large 0.62
+        col += vec3(0.55) * foam * foamAmp;
+        // micro-scintillement de crête (sous le bloom) : 2 nappes de bruit
+        //   modulées par la pente. Discret, donne le frémissement de l'eau
+        //   sous une brise — toujours sous 0.5 de luminance.
+        float sparkle = sin(vWorldPos.x*1.6 + uTime*1.7) * sin(vWorldPos.z*1.9 - uTime*1.2);
+        sparkle = max(0.0, sparkle - 0.75) * foam * vSeaMix;
+        col += vec3(0.65, 0.72, 0.78) * sparkle * 0.45;
+        // M-Mer/A : FONDU FOG manuel — le plan ignore le fog scene (transparent),
+        //   on simule la brume pour fondre l'horizon mer-ciel.
+        float dCam = length(cameraPosition - vWorldPos);
+        float fogF = smoothstep(uFogNear, uFogFar, dCam);
+        col = mix(col, uFogColor, fogF * 0.95);
+        float alpha = mix(0.92, 0.55, fogF);   // s'efface au loin pour rejoindre le ciel
+        gl_FragColor = vec4(col, alpha);
       }`,
   });
-  // M6-bord : plan d'eau étendu très largement vers l'est/sud — couvre tout
-  // l'horizon côté mer pour rejoindre la brume dorée. Empêche toute arête
-  // visible au-delà du jouable.
-  //   plane 110 × 400  (x ∈ [110, 220], z ∈ [-200, 200])
-  //   segments 22 × 80 → ~1800 verts, suffisant pour les vagues à grande échelle
-  const waterGeo=new THREE.PlaneGeometry(110, 400, 22, 80);
+  // M-Mer/A : plan d'eau ÉTENDU jusqu'à la brume. Le bord est passe
+  //   bien au-delà du fog far (260) : x ∈ [110, 500], z ∈ [-260, 260].
+  //   À grande distance, la couleur de l'eau est mangée par le fog et
+  //   se fond dans le ciel/brume — sensation de grand large sans arête.
+  //   Segments 40 × 100 → ~4100 verts pour bien porter les vagues sur
+  //   toute la longueur. Coût négligeable (vertex shader cheap).
+  const waterGeo=new THREE.PlaneGeometry(390, 520, 40, 100);
   const water=new THREE.Mesh(waterGeo, _M6_waterMaterial);
   water.rotation.x=-Math.PI/2;
-  water.position.set(165, 0.012, 0);
+  water.position.set(305, 0.012, 0);   // centré entre 110 et 500
   water.receiveShadow=false;
   scene.add(water);
   // M-Polish/C : berge SUPPRIMÉE — c'était un liseré rectiligne sombre
@@ -4342,6 +4377,13 @@ function _M6_updateWater(){
   const upY = SunState.dominantIsMoon ? SunState.moonDir.y : SunState.sunDir.y;
   u.uAstreUp.value = Math.max(0, upY);
   u.uIsMoon.value = SunState.dominantIsMoon ? 1.0 : 0.0;
+  // M-Mer/A : suit la teinte du fog scene (DayCycle l'anime). Garde l'eau
+  //   fondue dans le ciel à l'horizon, même au crépuscule.
+  if(scene.fog){
+    u.uFogColor.value.copy(scene.fog.color);
+    u.uFogNear.value = scene.fog.near;
+    u.uFogFar.value  = scene.fog.far;
+  }
 }
 
 /* =====================================================================
