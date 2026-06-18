@@ -4893,10 +4893,25 @@ const Vehicle = {
     this.lampPool=new THREE.Mesh(new THREE.PlaneGeometry(7,9),
       new THREE.MeshBasicMaterial({map:haloTex,transparent:true,opacity:0,depthWrite:false}));
     this.lampPool.rotation.x=-Math.PI/2; this.lampPool.position.set(0,0.03,-5.2); g.add(this.lampPool);
-    // M-Peuple-d : le conducteur est une figure GLTF animée (rôle sitting
-    // = SittingIdle, donne l'illusion d'être posté au levier).
-    const drv = spawnFigure({ type:'ouvrier', anim:'idle', tint:0x8a3b2a });
-    drv.position.set(0,0.42,1.55); drv.rotation.y=Math.PI;
+    // M-Peuple-détail-b : COCHER du chariot — figure procédurale animée
+    //   en 'drive' (bras tendus en avant tenant les rênes, légère
+    //   oscillation idle). Posé à l'avant-motion du chariot (local z=+1.55).
+    //   PARENTÉ au chariot via g.add(drv) : il suit position et rotation
+    //   EXACTEMENT, ne glisse pas, ne tremble pas. Échelle réduite (0.85)
+    //   pour ne pas masquer la lanterne ni l'UI. Visible dans toutes les
+    //   caméras (Carte, Épaule, Immersion).
+    //   baseY mis à jour APRÈS positionnement : sinon _animate écraserait
+    //   fig.position.y à 0 chaque frame (bug de sautillement).
+    //   ORIENTATION : la marche du chariot suit (sin(heading), cos(heading))
+    //   qui correspond au LOCAL +Z une fois group.rotation.y = heading
+    //   appliqué. Or buildFigure fait regarder vers +Z à rotation.y = 0
+    //   (visière de casquette au +Z). → rotation.y = 0 pour que le cocher
+    //   fasse FACE à la route ; son dos est alors tourné vers la caméra
+    //   de suivi (placée derrière à pos - (dx, dz)*back).
+    const drv = spawnFigure({ type:'ouvrier', anim:'drive', tint:0x8a3b2a });
+    drv.position.set(0,0.42,1.55); drv.rotation.y=0;
+    drv.scale.setScalar(0.85);
+    drv.userData.baseY = 0.42;
     g.add(drv); this.driver=drv;
 
     // --- les trois cargaisons (une seule visible à la fois) ---
@@ -10144,49 +10159,50 @@ const Peuple = (function(){
   //   - headSlump : fait pencher la tête (chomeur affaissé)
   const CLASS_DEFS = {
     ouvrier:       { cloth:0x4d5f70, pants:0x2a241c, hat:'casquette',
-                     tool:'pelle',     tilt: 0.12, sleevesRoll:true,
-                     vest:{col:0x3a4858,w:0.36,h:0.42,dy:0.22},     // tablier
-                     belt:0x231a12,
+                     tool:'pelle',     tilt: 0.14, sleevesRoll:true,    // voûté
+                     vest:{col:0x3a4858,w:0.36,h:0.42,dy:0.22},
+                     belt:0x231a12, capLow:true,                       // casquette qui ombre le visage
                      shoeColor:0x16100c, shoeBig:true },
     ouvriere:      { cloth:0x445064, pants:0x33291d, hat:'fichu',
-                     tool:'panier',    tilt: 0.05, skirt:true,
-                     apron:{col:0xc9b78c,w:0.30,h:0.30,dy:0.16},    // tablier clair
+                     tool:'panier',    tilt: 0.05, skirt:true, skirtFlared:true,
+                     apron:{col:0xc9b78c,w:0.30,h:0.30,dy:0.16},
+                     hairBack:0x3a2a1c,                                // mèche derrière le fichu
                      shoeColor:0x2a201a },
     chomeur:       { cloth:0x5b5346, pants:0x3a3128, hat:'casquette',
-                     hatColor:0x2a261f, tool:null,  tilt: 0.22,
-                     belt:0x2a2018, headSlump:true,
-                     scarf:0x6b3d33,                                // foulard misère
+                     hatColor:0x2a261f, tool:null,  tilt: 0.24,         // épaules tombantes
+                     belt:0x2a2018, headSlump:true, capLow:true,
+                     scarf:0x6b3d33,
                      shoeColor:0x18120e },
     capitaliste:   { cloth:0x222229, pants:0x16161a, hat:'cylindre',
-                     tool:'canne',     tilt:-0.06,
-                     coat:{col:0x222229,len:0.55,w:0.44},           // redingote longue
-                     vest:{col:0xc9a85e,w:0.26,h:0.30,dy:0.16},     // gilet doré
-                     collar:0xe2dabd, whiskers:true,
+                     tool:'canne',     tilt:-0.10,                      // cambré : torse en arrière
+                     coat:{col:0x222229,len:0.55,w:0.44},
+                     vest:{col:0xc9a85e,w:0.26,h:0.30,dy:0.16},
+                     collar:0xe2dabd, whiskers:true, mustache:0x2a221c,
                      shoeColor:0x0a0808, shoeBig:true },
     bourgeois:     { cloth:0x6e6e7a, pants:0x3e3a36, hat:'melon',
                      tool:'journal',   tilt: 0.00,
-                     vest:{col:0xc4b691,w:0.24,h:0.28,dy:0.14},     // gilet beige
-                     collar:0xe2dabd, whiskers:true,
+                     vest:{col:0xc4b691,w:0.24,h:0.28,dy:0.14},
+                     collar:0xe2dabd, whiskers:true, mustache:0x3a2f24,
                      shoeColor:0x1a1410 },
     mineur:        { cloth:0x3a342e, pants:0x2a2622, hat:'casque-mineur',
-                     tool:'pelle',     tilt: 0.15, sleevesRoll:true,
-                     vest:{col:0x261f1a,w:0.30,h:0.34,dy:0.18},     // veste sale
+                     tool:'pioche',    tilt: 0.16, sleevesRoll:true,    // pioche !
+                     vest:{col:0x261f1a,w:0.30,h:0.34,dy:0.18},
                      belt:0x141008,
                      shoeColor:0x0c0805, shoeBig:true },
     fonctionnaire: { cloth:0x2a3140, pants:0x1a1f28, hat:'kepi',
-                     tool:null,        tilt:-0.02,
-                     vest:{col:0xa8812c,w:0.06,h:0.40,dy:0.08},     // bandoulière dorée
+                     tool:null,        tilt:-0.04,                      // raide, légèrement cambré
+                     vest:{col:0xa8812c,w:0.06,h:0.40,dy:0.08},
                      belt:0x0a0d12, collar:0xb8b09a,
                      shoeColor:0x080808 },
-    // — NOUVELLES CLASSES —
     paysan:        { cloth:0x8a7a52, pants:0x4a3826, hat:'paille',
                      tool:'faux',      tilt: 0.18, sleevesRoll:true,
-                     belt:0x5a4220, beard:0x5a4030,
-                     shoeColor:0x4a3625, shoeBig:true },           // sabots
+                     belt:0x5a4220, beard:0x5a4030, mustache:0x5a4030,
+                     shoeColor:0x4a3625, shoeBig:true },
     marchand:      { cloth:0x6b513a, pants:0x3a2618, hat:'calot',
                      tool:null,        tilt: 0.04, sleevesRoll:true,
-                     apron:{col:0xb0a07a,w:0.34,h:0.38,dy:0.18},   // tablier de commerce
+                     apron:{col:0xb0a07a,w:0.34,h:0.38,dy:0.18},
                      belt:0x4a3a26,
+                     cuffs:0xc9b78c,                                    // manchettes claires
                      shoeColor:0x2a1f15 },
   };
 
@@ -10247,7 +10263,7 @@ const Peuple = (function(){
   // -----------------------------------------------------------------
   // Pièces de corps. Pieds à y=0, hauteur totale ~1.80 u.
   // -----------------------------------------------------------------
-  function _makeArm(clothHex, sleevesRoll){
+  function _makeArm(clothHex, sleevesRoll, cuffHex){
     // upper = pivot épaule ; fore = pivot coude ; hand = pivot poignet.
     const upper = new THREE.Group();
     const upperMesh = new THREE.Mesh(
@@ -10263,6 +10279,14 @@ const Peuple = (function(){
       _mat(foreColor));
     foreMesh.position.y = -0.16;
     fore.add(foreMesh);
+    // MANCHETTES — petit volume contrastant au poignet (marchand).
+    if(cuffHex != null){
+      const cuff = new THREE.Mesh(
+        _g('cuff', ()=> new THREE.BoxGeometry(0.105, 0.05, 0.105)),
+        _mat(cuffHex));
+      cuff.position.y = -0.30;
+      fore.add(cuff);
+    }
     const hand = new THREE.Mesh(
       _g('hand', ()=> new THREE.BoxGeometry(0.10, 0.09, 0.10)),
       _mat(SKIN));
@@ -10456,6 +10480,22 @@ const Peuple = (function(){
       blade.position.set(0.06, -0.78, 0.22);
       blade.rotation.x = -0.55;
       g.add(stick); g.add(blade);
+    } else if(kind==='pioche'){
+      // PIOCHE — manche court + tête en T perpendiculaire (mineur).
+      const stick = new THREE.Mesh(
+        _g('pick_stick', ()=> new THREE.BoxGeometry(0.035, 0.55, 0.035)),
+        _mat(0x6b4f30));
+      stick.position.y = -0.26;
+      const head = new THREE.Mesh(
+        _g('pick_head', ()=> new THREE.BoxGeometry(0.40, 0.06, 0.07)),
+        _mat(0x3a342e));
+      head.position.y = -0.52;
+      // pointe affûtée d'un côté
+      const tip = new THREE.Mesh(
+        _g('pick_tip', ()=> new THREE.BoxGeometry(0.06, 0.05, 0.06)),
+        _mat(0x4a4338));
+      tip.position.set(0.22, -0.52, 0);
+      g.add(stick); g.add(head); g.add(tip);
     }
     return g;
   }
@@ -10561,18 +10601,48 @@ const Peuple = (function(){
 
     root.add(torso);
 
-    // TÊTE (ovoïde, pas de visage). Chomeur affaissé : tête plus basse.
+    // TÊTE — crâne ovoïde FACETTÉ (8×6 segs, flatShading) + traits
+    //   stylisés (yeux/nez/bouche) en petits volumes mats. Chomeur
+    //   affaissé : tête plus basse. PAS de visage réaliste — juste des
+    //   suggestions low-poly qui donnent du caractère sans rompre l'unité.
     const head = new THREE.Group();
     head.position.y = def.headSlump ? 0.58 : 0.62;
     const headMesh = new THREE.Mesh(
-      _g('head', ()=> new THREE.SphereGeometry(0.13, 10, 8)),
+      _g('head', ()=> new THREE.SphereGeometry(0.13, 8, 6)),    // moins lisse → facettes visibles
       _mat(SKIN));
-    headMesh.scale.set(1, 1.15, 0.95);
+    headMesh.scale.set(1.0, 1.18, 0.95);
     headMesh.position.y = 0.08;
     head.add(headMesh);
+
+    // YEUX — deux petits cubes mats sombres incrustés dans la face.
+    const EYE_DARK = 0x1a1612;
+    for(const sx of [-1, 1]){
+      const eye = new THREE.Mesh(
+        _g('eye', ()=> new THREE.BoxGeometry(0.028, 0.028, 0.020)),
+        _mat(EYE_DARK));
+      eye.position.set(sx*0.045, 0.10, 0.110);
+      head.add(eye);
+    }
+    // NEZ — petit volume sortant (la pointe la plus en avant).
+    const nose = new THREE.Mesh(
+      _g('nose', ()=> new THREE.BoxGeometry(0.030, 0.045, 0.040)),
+      _mat(SKIN));
+    nose.position.set(0, 0.065, 0.135);
+    head.add(nose);
+    // BOUCHE — fine bande sombre, posée sur le devant.
+    const mouth = new THREE.Mesh(
+      _g('mouth', ()=> new THREE.BoxGeometry(0.050, 0.012, 0.020)),
+      _mat(0x3a261c));
+    mouth.position.set(0, 0.005, 0.118);
+    head.add(mouth);
     if(def.headSlump) head.rotation.x = 0.20;            // menton bas
     torso.add(head);
-    if(def.hat) head.add(_makeHat(def.hat, def.hatColor));
+    if(def.hat){
+      const hatGroup = _makeHat(def.hat, def.hatColor);
+      // CASQUETTE BAISSÉE — visière qui plonge, ombre le visage (ouvrier/chomeur).
+      if(def.capLow) hatGroup.rotation.x = -0.22;
+      head.add(hatGroup);
+    }
 
     // FAVORIS — deux petits volumes mat sombres collés à la mâchoire.
     if(def.whiskers){
@@ -10585,6 +10655,15 @@ const Peuple = (function(){
         head.add(w);
       }
     }
+    // MOUSTACHE — petit volume horizontal sous le nez (bourgeois, capitaliste,
+    // paysan). Largeur < favoris, posé sur le devant du visage.
+    if(def.mustache != null){
+      const must = new THREE.Mesh(
+        _g('mustache', ()=> new THREE.BoxGeometry(0.10, 0.025, 0.04)),
+        _mat(def.mustache));
+      must.position.set(0, 0.045, 0.115);
+      head.add(must);
+    }
     // BARBE (paysan) — petit volume sous le menton.
     if(def.beard != null){
       const beard = new THREE.Mesh(
@@ -10593,12 +10672,20 @@ const Peuple = (function(){
       beard.position.set(0, 0.01, 0.10);
       head.add(beard);
     }
+    // MÈCHE DERRIÈRE LE FICHU (ouvrière) — petit chignon visible à l'arrière.
+    if(def.hairBack != null){
+      const hair = new THREE.Mesh(
+        _g('hair_back', ()=> new THREE.BoxGeometry(0.18, 0.10, 0.08)),
+        _mat(def.hairBack));
+      hair.position.set(0, 0.04, -0.10);
+      head.add(hair);
+    }
 
     // BRAS — pivots aux épaules (suivent le tilt du buste).
-    const armL = _makeArm(cloth, def.sleevesRoll);
+    const armL = _makeArm(cloth, def.sleevesRoll, def.cuffs);
     armL.position.set(-0.26, 0.55, 0);
     torso.add(armL);
-    const armR = _makeArm(cloth, def.sleevesRoll);
+    const armR = _makeArm(cloth, def.sleevesRoll, def.cuffs);
     armR.position.set( 0.26, 0.55, 0);
     torso.add(armR);
 
@@ -10616,12 +10703,15 @@ const Peuple = (function(){
     legR.position.set( 0.10, 0.85, 0);
     root.add(legR);
 
-    // JUPE (ouvriere) — drape sur les cuisses, mollets visibles.
+    // JUPE / ROBE (ouvrière) — drape évasée sur les cuisses, mollets
+    // visibles. skirtFlared : robe plus longue et plus large à la base.
     if(def.skirt){
       const skirt = new THREE.Mesh(
-        _g('skirt', ()=> new THREE.CylinderGeometry(0.22, 0.32, 0.55, 12, 1, true)),
+        def.skirtFlared
+          ? _g('skirt_flared', ()=> new THREE.CylinderGeometry(0.22, 0.40, 0.65, 12, 1, true))
+          : _g('skirt',        ()=> new THREE.CylinderGeometry(0.22, 0.32, 0.55, 12, 1, true)),
         _mat(cloth));
-      skirt.position.y = 0.60;
+      skirt.position.y = def.skirtFlared ? 0.55 : 0.60;
       root.add(skirt);
     }
 
@@ -10770,6 +10860,24 @@ const Peuple = (function(){
       u.torso.rotation.y = 0;
       u.head.rotation.y = Math.sin(t * 0.4 + u.idleLook) * 0.22;
       fig.position.y = u.baseY + Math.abs(Math.cos(w)) * 0.025;
+    } else if(anim === 'drive'){
+      // M-Peuple-détail-b : COCHER — assis/debout à l'avant du chariot,
+      //   deux mains tenant les rênes/la barre, léger balancement.
+      const w = t * 1.1 + ph;
+      u.torso.rotation.x = tiltBase + 0.05;
+      u.torso.rotation.y = Math.sin(w) * 0.025;
+      u.torso.rotation.z = 0;
+      // bras tendus en avant à hauteur de poitrine, mains côte à côte.
+      u.armR.rotation.x = -1.25 + Math.sin(w * 0.7) * 0.04;
+      u.armR.rotation.z = -0.15;
+      u.foreR.rotation.x = -0.55;
+      u.armL.rotation.x = -1.25 + Math.sin(w * 0.7 + 0.4) * 0.04;
+      u.armL.rotation.z =  0.15;
+      u.foreL.rotation.x = -0.55;
+      u.legL.rotation.x = 0; u.legR.rotation.x = 0;
+      u.shinL.rotation.x = 0; u.shinR.rotation.x = 0;
+      u.head.rotation.y = Math.sin(w * 0.5) * 0.05;
+      fig.position.y = u.baseY;
     } else if(anim === 'sit'){
       // chomeur oisif — assis au bord de l'eau, buste penché.
       u.torso.rotation.x = tiltBase + 0.28;
@@ -11219,6 +11327,13 @@ const PeuplePop = (function(){
       if(i < n){
         if(!f.visible) f.visible = true;
         if(spec.place) spec.place(f, i, n);
+        // M-Peuple-détail-b : la pos Y posée par place() devient le baseY
+        // de référence des animations procédurales. Sans cela, _animate
+        // ré-écrit `fig.position.y = u.baseY` (=0) à chaque frame, alors
+        // que _refresh ré-écrit le y posé toutes les 0.4 s → sautillement
+        // de la figure entre y posé (pavé) et y=0 (sol). Bug visible au
+        // marché de vente (sol pavé y=0.15) et à la halle (y=0.55).
+        f.userData.baseY = f.position.y;
         if(spec.anim && f.userData.anim !== spec.anim){
           // les patrouilles imposent 'walk' ; ne pas casser leur cadence.
           if(!f.userData.patrol) f.userData.anim = spec.anim;
