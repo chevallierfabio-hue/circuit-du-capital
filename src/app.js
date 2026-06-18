@@ -4243,10 +4243,12 @@ function buildWaterEast(){
   water.position.set(165, 0.012, 0);
   water.receiveShadow=false;
   scene.add(water);
-  // berge : liseré sombre côté terre (la limite playable reste à x ≈ 110.7)
-  const berge=new THREE.Mesh(new THREE.PlaneGeometry(0.7, 240),
-    new THREE.MeshBasicMaterial({color:0x241f17, transparent:true, opacity:0.55, depthWrite:false}));
-  berge.rotation.x=-Math.PI/2; berge.position.set(110.7, 0.02, 0); scene.add(berge);
+  // M-Polish/C : berge SUPPRIMÉE — c'était un liseré rectiligne sombre
+  //   (PlaneGeometry 0.7×240) qui dessinait une arête trop nette le long
+  //   de la côte, visible au premier plan. La transition terre/eau passe
+  //   désormais par l'estran bruité (_M6_buildEstran) : bords ondulants,
+  //   bosses de sable. La limite playable reste assurée par la barrière
+  //   invisible des obstacles à x=111.5 (cf. ligne suivante).
   // deux bateaux à quai (tangage doux via WorldBeauty)
   for(const [bx, bz, r] of [[114, -8, 0.4], [114.5, 14, -0.5]]){
     const b=createBoat(); b.position.set(bx, 0, bz); b.rotation.y=r;
@@ -4404,21 +4406,36 @@ function _M6_buildDistantTrees(){
   }
 }
 function _M6_buildEstran(){
-  // bande sableuse humide entre la berge (x≈111) et l'eau (x≈110).
-  // Plage qui PLONGE dans l'eau (légère pente Y négative à l'est) pour
-  // éliminer toute cassure.
-  const w=4.0, d=240;
-  const segX=8, segZ=40;
+  // M-Polish/C : ESTRAN IRRÉGULARISÉ. L'ancienne grille était trop régulière
+  // (la côte ressemblait à un trait géométrique). Ici on bruite :
+  //   - l'abscisse x à chaque colonne (mélange 2 sinusoïdes longues → bord
+  //     ondulant et non rectiligne, terre comme mer),
+  //   - la hauteur y avec petites bosses de sable/galets,
+  //   - la pente x→y reste cohérente (la plage plonge sous la mer).
+  const d=240;
+  const segX=10, segZ=60;
   const verts=[], idx=[], uvs=[];
+  // bruit déterministe : variations basses fréquences sur z pour un littoral organique.
+  const noiseX = (z, freqA, freqB, phase) =>
+    Math.sin(z*freqA + phase)*0.70 + Math.sin(z*freqB + phase*1.7)*0.40;
   for(let iz=0; iz<=segZ; iz++){
+    const z = -d/2 + (iz/segZ)*d;
+    // bords irréguliers : le bord-TERRE serpente entre x=108.0 et x=109.7,
+    // le bord-EAU entre x=112.5 et x=113.8 — la côte n'est plus une ligne.
+    const xLand  = 108.7 + noiseX(z, 0.045, 0.11, 0.0) * 0.55;   // ±~0.85
+    const xWater = 113.3 + noiseX(z, 0.038, 0.09, 1.7) * 0.45;   // ±~0.65
     for(let ix=0; ix<=segX; ix++){
-      const x=109 + (ix/segX)*w;                     // de x=109 (terre) à x=113 (entre dans l'eau)
-      const z=-d/2 + (iz/segZ)*d;
-      // pente : y descend de 0.03 (terre) à -0.05 (plonge sous la mer à y=0.012)
-      const tt=ix/segX;
-      const y=0.030 - tt*0.080;
+      const tt = ix/segX;
+      const x = xLand + tt*(xWater - xLand);
+      // pente : y descend de 0.04 (terre) à -0.06 (plonge sous la mer à y=0.012)
+      let y = 0.040 - tt*0.100;
+      // petites bosses au milieu (sable/galets) — bruit haute fréquence amorti
+      // sur les bords (pour ne pas laisser de pic visible sur la rupture).
+      const edgeAmp = Math.sin(tt*Math.PI);    // 0 aux extrémités, 1 au centre
+      y += edgeAmp * (Math.sin(z*0.31 + ix*0.7)*0.020
+                    + Math.sin(z*0.83 - ix*0.4)*0.012);
       verts.push(x, y, z);
-      uvs.push(ix/segX*1.5, iz/segZ*16);
+      uvs.push(tt*1.5, iz/segZ*16);
     }
   }
   for(let iz=0; iz<segZ; iz++){
@@ -4744,22 +4761,43 @@ function buildPuddles(){
     // Rue : pluie récente — caniveau qui déborde
     {x:-40, z:3.5, r:1.8}, {x:24, z:-3.2, r:1.6},
   ];
+  // M-Polish/C : flaques bien plus IRRÉGULIÈRES. L'ancienne version
+  //   utilisait SEG fixe (22) et le même bruit (0.22+0.13+0.08) avec un
+  //   seed légèrement décalé → motif répétitif visible d'une flaque à
+  //   l'autre. On vient :
+  //     - faire varier le nombre de segments par flaque (16..30),
+  //     - varier l'orientation initiale (theta0),
+  //     - augmenter l'amplitude du bruit + ajouter une harmonique aléatoire,
+  //     - varier légèrement la position du centre (excentricité).
   const pos=[], uv=[], idx=[]; let off=0; let seed=13;
-  const SEG=22;
   for(const s of sites){
-    pos.push(s.x, 0, s.z); uv.push(0.5,0.5);
+    seed += 7 + Math.floor(Math.abs(s.x*1.3 + s.z*0.7)) % 13;
+    const SEG = 16 + (Math.floor(Math.abs(Math.sin(seed*0.3))*15)) % 15;   // 16..30 segs
+    const theta0 = (seed * 0.137) % (Math.PI*2);
+    const A1 = 0.30 + (Math.abs(Math.sin(seed*0.7))*0.18);                  // ~0.30..0.48
+    const A2 = 0.15 + (Math.abs(Math.cos(seed*0.5))*0.10);
+    const A3 = 0.06 + (Math.abs(Math.sin(seed*1.2))*0.06);
+    const F1 = 3 + Math.floor(Math.abs(Math.sin(seed*0.4))*3);              // 3..5
+    const F2 = 5 + Math.floor(Math.abs(Math.cos(seed*0.6))*4);
+    const F3 = 7 + Math.floor(Math.abs(Math.sin(seed*0.9))*5);
+    // léger décentrage (chaque flaque n'est plus parfaitement circulaire)
+    const cx = s.x + Math.sin(seed*0.21) * s.r * 0.06;
+    const cz = s.z + Math.cos(seed*0.17) * s.r * 0.06;
+    pos.push(cx, 0, cz); uv.push(0.5,0.5);
     for(let i=0;i<SEG;i++){
-      const a=(i/SEG)*Math.PI*2;
-      const noise=1 + 0.22*Math.sin(a*3+seed) + 0.13*Math.sin(a*5+seed*1.7) + 0.08*Math.sin(a*7+seed*0.3);
-      const r=s.r*noise;
-      pos.push(s.x+Math.cos(a)*r, 0, s.z+Math.sin(a)*r);
+      const a = theta0 + (i/SEG)*Math.PI*2;
+      const noise = 1
+        + A1*Math.sin(a*F1 + seed)
+        + A2*Math.sin(a*F2 + seed*1.7)
+        + A3*Math.sin(a*F3 + seed*0.3);
+      const r = s.r*Math.max(0.55, noise);
+      pos.push(cx+Math.cos(a)*r, 0, cz+Math.sin(a)*r);
       uv.push(0.5+0.5*Math.cos(a), 0.5+0.5*Math.sin(a));
     }
-    // winding inverse : normale vers +Y (face visible du dessus, reflète le ciel).
+    // winding inverse : normale vers +Y (reflète le ciel).
     for(let i=0;i<SEG;i++) idx.push(off, off+1+((i+1)%SEG), off+1+i);
-    off+=SEG+1;
-    PUDDLES.push({x:s.x, z:s.z, r:s.r});
-    seed+=7;
+    off += SEG+1;
+    PUDDLES.push({x:cx, z:cz, r:s.r});
   }
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
