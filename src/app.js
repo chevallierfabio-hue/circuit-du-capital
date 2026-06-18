@@ -869,6 +869,7 @@ function buildWorld(){
   buildWaterEast();    // v56/M6 : littoral — eau étendue jusqu'à l'horizon (M6-bord)
   buildLighthouse();   // M-Mer/B : phare + faisceau tournant sur môle pierre
   buildMaritimeTraffic();// M-Mer/C : voiliers + vapeur en patrouille (sillages, fumée)
+  buildSeaFauna();     // M-Mer/D : crabes, mouettes, bouées, banc de poissons
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
   buildClosingHorizon();// M6-bord : ferme le monde par géographie naturelle (collines, estran, voiliers distants)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
@@ -4110,6 +4111,237 @@ function buildMaritimeTraffic(){
       smoke, smokeTimer: 0,
       tangagePhase: Math.random()*6.28,
     });
+  }
+}
+
+/* =====================================================================
+   M-Mer/D — FAUNE & DÉTAILS.
+   - Crabes : 4-5 figurines low-poly sur l'estran, marche latérale
+     (déplacement perpendiculaire à l'orientation), pauses aléatoires.
+   - Mouettes : 4 sprites qui planent au-dessus de la mer (orbites
+     basses), parfois posées sur les bittes du quai (statique).
+   - Bouées : 3 sphères rouges/blanches ballottées au large.
+   - Banc de poissons : reflet argenté furtif sous la surface, scintille
+     par à-coups (sprite additif court).
+   ===================================================================== */
+const _M_Mer_crabs = [];     // {obj, baseX, baseZ, dirZ, speed, pauseT, walkPhase}
+const _M_Mer_gulls = [];     // {obj, cx, cz, r, y, a, v, ph}
+const _M_Mer_buoys = [];     // {obj, baseX, baseZ, phase}
+const _M_Mer_fishGlints = [];// {obj, baseX, baseZ, life}
+
+function _M_Mer_createCrab(){
+  // Low-poly : corps ovale plat, 2 yeux, 2 pinces, 8 pattes (2 fines barres).
+  const g = new THREE.Group();
+  const matCarap = new THREE.MeshStandardMaterial({color:0x7a2a1c, roughness:0.9, metalness:0.0, flatShading:true});
+  const matCarapD= new THREE.MeshStandardMaterial({color:0x4a1810, roughness:0.95, metalness:0.0, flatShading:true});
+  const matOeil  = new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.0, flatShading:true});
+  // carapace (sphère écrasée)
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 6), matCarap);
+  body.scale.set(1.15, 0.45, 1.0);
+  body.position.y = 0.15; g.add(body);
+  // sous-ventre
+  const belly = new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.10, 0.36), matCarapD);
+  belly.position.y = 0.06; g.add(belly);
+  // 2 yeux sur tiges
+  for(const sx of [-0.10, 0.10]){
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.10, 4), matCarapD);
+    stem.position.set(sx, 0.27, 0.18); g.add(stem);
+    const oeil = new THREE.Mesh(new THREE.SphereGeometry(0.04, 6, 4), matOeil);
+    oeil.position.set(sx, 0.34, 0.20); g.add(oeil);
+  }
+  // 2 pinces (boxes)
+  for(const sx of [-0.30, 0.30]){
+    const pince = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.18), matCarap);
+    pince.position.set(sx, 0.13, 0.16); g.add(pince);
+  }
+  // pattes (barres fines, 4 par côté représentées par 2 box plats)
+  for(const sx of [-1, 1]){
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.04, 0.04), matCarapD);
+    leg.position.set(sx*0.28, 0.08, 0); g.add(leg);
+    const leg2 = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.04, 0.04), matCarapD);
+    leg2.position.set(sx*0.26, 0.08, -0.12); g.add(leg2);
+  }
+  return g;
+}
+
+function _M_Mer_createGull(){
+  // Mouette : silhouette en V (2 ailes), corps blanc cassé.
+  const g = new THREE.Group();
+  const matCorps = new THREE.MeshStandardMaterial({color:0xe8e2d0, roughness:0.9, metalness:0.0, flatShading:true});
+  const matAile  = new THREE.MeshStandardMaterial({color:0xc8b8a0, roughness:0.95, metalness:0.0, flatShading:true});
+  const corps = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.10, 0.55), matCorps);
+  g.add(corps);
+  const w1 = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.04, 0.22), matAile);
+  w1.position.set(-0.52, 0.02, 0); g.add(w1);
+  const w2 = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.04, 0.22), matAile);
+  w2.position.set( 0.52, 0.02, 0); g.add(w2);
+  g.userData.w1 = w1; g.userData.w2 = w2;
+  return g;
+}
+
+function _M_Mer_createBuoy(){
+  // Bouée : sphère rouge en haut + cylindre blanc bande + ancrage
+  const g = new THREE.Group();
+  const matRouge = new THREE.MeshStandardMaterial({color:0x8a2a1c, roughness:0.85, metalness:0.05, flatShading:true});
+  const matBlanc = new THREE.MeshStandardMaterial({color:0xe0d8c4, roughness:0.95, metalness:0.0, flatShading:true});
+  const matMetal = new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.5, metalness:0.6, flatShading:true});
+  const haut = new THREE.Mesh(new THREE.SphereGeometry(0.30, 8, 6), matRouge);
+  haut.position.y = 0.50; g.add(haut);
+  const corps = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.30, 0.45, 8), matBlanc);
+  corps.position.y = 0.22; g.add(corps);
+  // ceinture
+  const cein = new THREE.Mesh(new THREE.TorusGeometry(0.30, 0.04, 4, 10), matMetal);
+  cein.rotation.x = Math.PI/2; cein.position.y = 0.22; g.add(cein);
+  return g;
+}
+
+function buildSeaFauna(){
+  // --- CRABES sur l'estran (x ≈ 109-112 selon noiseEstran). 5 emplacements
+  //   dispersés en z, hors voie principale du port.
+  const crabSpots = [
+    [110.0,  35], [110.5,  18], [109.8, -20], [110.2, -55], [111.0,  62],
+  ];
+  for(const [bx, bz] of crabSpots){
+    const c = _M_Mer_createCrab();
+    c.position.set(bx, 0.02, bz);
+    scene.add(c);
+    _M_Mer_crabs.push({
+      obj: c, baseX: bx, baseZ: bz,
+      dirZ: (Math.random() < 0.5 ? 1 : -1),
+      speed: 0.22 + Math.random()*0.20,
+      pauseT: Math.random() * 4,
+      walkPhase: Math.random() * 6.28,
+    });
+  }
+  // --- MOUETTES qui planent au-dessus de la mer (4 orbites basses)
+  for(let i=0; i<4; i++){
+    const g = _M_Mer_createGull();
+    scene.add(g);
+    _M_Mer_gulls.push({
+      obj: g,
+      cx: 150 + Math.random()*60,         // centre orbite à l'est
+      cz: -80 + Math.random()*160,
+      r: 14 + Math.random()*12,
+      y: 9 + Math.random()*6,
+      a: Math.random() * 6.28,
+      v: 0.32 + Math.random()*0.18,
+      ph: Math.random() * 6.28,
+    });
+  }
+  // 2 mouettes posées sur les bittes du quai (statiques, légèrement
+  //   tournées). Bittes : world (-2 + i*3.6, 0.75, -7.5) pour i ∈ {0..5}
+  //   → port zone center (102, 2) → world x = 100 + i*3.6, z = -5.5
+  for(const [bxw, bzw, ry] of [[103.6, -5.5, -0.6], [107.2, -5.5, 0.4]]){
+    const g = _M_Mer_createGull();
+    g.position.set(bxw, 1.5, bzw);
+    g.rotation.y = ry;
+    g.scale.set(0.85, 0.85, 0.85);
+    scene.add(g);
+    // pas d'entrée dans _M_Mer_gulls (mouette posée, on n'anime pas)
+  }
+  // --- BOUÉES flottantes au large (3 positions calmes, ballottement)
+  const buoySpots = [
+    [128, 22], [135, -36], [142, 60],
+  ];
+  for(const [bx, bz] of buoySpots){
+    const b = _M_Mer_createBuoy();
+    b.position.set(bx, 0, bz);
+    scene.add(b);
+    _M_Mer_buoys.push({obj: b, baseX: bx, baseZ: bz, phase: Math.random()*6.28});
+  }
+  // --- BANC DE POISSONS suggéré : 4 sprites argentés furtifs sous la
+  //   surface, scintillent par à-coups (vie courte, réapparition aléatoire).
+  const glintCv = document.createElement('canvas'); glintCv.width=glintCv.height=64;
+  const gctx = glintCv.getContext('2d');
+  for(let i=0; i<8; i++){
+    const rx = 20 + Math.random()*22, ry = 20 + Math.random()*22;
+    gctx.fillStyle = `rgba(220,230,255,${0.20 + Math.random()*0.25})`;
+    gctx.fillRect(rx, ry, 2, 6);
+  }
+  const glintTex = new THREE.CanvasTexture(glintCv);
+  for(let i=0; i<4; i++){
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glintTex, color: 0xc8d8ff, transparent: true, opacity: 0,
+      depthWrite: false, blending: THREE.AdditiveBlending, fog: true,
+    }));
+    sp.scale.set(2.5, 2.5, 1);
+    scene.add(sp);
+    _M_Mer_fishGlints.push({
+      obj: sp,
+      baseX: 130 + Math.random()*40,
+      baseZ: -90 + Math.random()*180,
+      life: -Math.random() * 6,    // démarrage décalé
+    });
+  }
+}
+
+function _M_Mer_updateFauna(dt){
+  const kd = (typeof DayCycle!=='undefined' && typeof DayCycle.kDay==='number') ? DayCycle.kDay : 1;
+  // CRABES : marche latérale (axe Z), pauses ; réoriente vers le sens de marche
+  for(const c of _M_Mer_crabs){
+    c.pauseT -= dt;
+    if(c.pauseT > 0){
+      // immobile : oscille à peine, agite les pattes
+      c.walkPhase += dt * 4;
+      c.obj.position.y = 0.02 + Math.abs(Math.sin(c.walkPhase*0.4)) * 0.005;
+    } else {
+      c.walkPhase += dt * 8;
+      c.obj.position.z += c.dirZ * c.speed * dt;
+      // démarche : petit bobbing
+      c.obj.position.y = 0.02 + Math.abs(Math.sin(c.walkPhase)) * 0.015;
+      // demi-tour aux bornes (±2.2 m de la base)
+      const off = c.obj.position.z - c.baseZ;
+      if(Math.abs(off) > 2.2){
+        c.dirZ *= -1;
+        c.pauseT = 1 + Math.random() * 3;
+        c.obj.rotation.y = c.dirZ > 0 ? Math.PI/2 : -Math.PI/2;
+      }
+      // orient : tête vers le sens de marche
+      c.obj.rotation.y = c.dirZ > 0 ? Math.PI/2 : -Math.PI/2;
+    }
+  }
+  // MOUETTES en orbite (cachées la nuit)
+  for(const g of _M_Mer_gulls){
+    g.obj.visible = kd > 0.20;
+    if(!g.obj.visible) continue;
+    g.a += g.v * dt;
+    g.obj.position.set(
+      g.cx + Math.cos(g.a)*g.r,
+      g.y + Math.sin(t*2 + g.ph) * 0.7,
+      g.cz + Math.sin(g.a)*g.r,
+    );
+    g.obj.rotation.y = -g.a + Math.PI/2;
+    const f = Math.sin(t*8 + g.ph) * 0.45;
+    if(g.obj.userData.w1){
+      g.obj.userData.w1.rotation.z = f;
+      g.obj.userData.w2.rotation.z = -f;
+    }
+  }
+  // BOUÉES : ballottement comme les vagues (sinusoïdes sur Y et rotation Z)
+  for(const b of _M_Mer_buoys){
+    b.obj.position.y = Math.sin(t*1.1 + b.phase) * 0.18;
+    b.obj.rotation.z = Math.sin(t*0.9 + b.phase + 0.6) * 0.10;
+    b.obj.rotation.x = Math.cos(t*1.05 + b.phase + 1.3) * 0.07;
+  }
+  // BANC DE POISSONS : scintille par à-coups, vie courte
+  for(const f of _M_Mer_fishGlints){
+    f.life += dt;
+    if(f.life < 0){
+      f.obj.material.opacity = 0;
+      continue;
+    }
+    if(f.life > 2.5){
+      // disparaît, repositionne et attend
+      f.life = -Math.random() * 8 - 2;
+      f.baseX = 130 + Math.random()*45;
+      f.baseZ = -90 + Math.random()*180;
+      f.obj.material.opacity = 0;
+      continue;
+    }
+    f.obj.position.set(f.baseX, 0.015, f.baseZ);
+    const a = f.life / 2.5;
+    f.obj.material.opacity = Math.sin(a*Math.PI) * 0.42;
+    f.obj.scale.set(2.5 + a*1.4, 2.5 + a*1.4, 1);
   }
 }
 
@@ -16466,6 +16698,7 @@ function loop(){
   _M6_updateCranes();                 // M6 : pivot lent des grues du port
   _M_Mer_updateLighthouse();          // M-Mer/B : rotation faisceau, intensité jour/nuit
   _M_Mer_updateTraffic(dt);           // M-Mer/C : bateaux, sillages, fumée vapeur
+  _M_Mer_updateFauna(dt);             // M-Mer/D : crabes, mouettes, bouées, poissons
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
