@@ -4948,6 +4948,11 @@ const Vehicle = {
   pos:new THREE.Vector3(-95,0,2), heading:Math.PI/2, speed:0,   // v52 : on arrive de la campagne, par la rue
   build(){
     const g=new THREE.Group();
+    // M-Peaufinage/C : matériaux partagés (utilisés à plusieurs endroits :
+    //   caisse, cargaisons, cerclages des roues). Déclarés ici en haut
+    //   pour éviter tout TDZ — ils sont créés UNE fois.
+    const matCerclage=new THREE.MeshStandardMaterial({color:0x1a1410, metalness:.6, roughness:.4, flatShading:true});
+    const matPlanche=new THREE.MeshStandardMaterial({color:0x4a382a, roughness:0.95, flatShading:true});
     // --- plateforme / châssis ---
     g.add(box(3.2,0.3,4.8,COL.encre,0,0.45,0,false));     // dessous de châssis
     const plateau=box(3,0.5,4.6,0x3a332a,0,0.78,0); addOutline(plateau); g.add(plateau);              // plateau
@@ -4996,42 +5001,162 @@ const Vehicle = {
     g.add(drv); this.driver=drv;
 
     // --- les trois cargaisons (une seule visible à la fois) ---
+    //   M-Peaufinage/C : marchandises mieux modelées (cerclages, piles
+    //   de pièces, charbon en tas, sacs plus crédibles).
     const bY=1.1, bZ=-0.3;
     const argent=new THREE.Group();
     const ingot=(x,z)=>argent.add(box(0.95,0.34,0.62,COL.or,x,bY+0.17,bZ+z));
     ingot(-0.5,-0.5);ingot(0.5,-0.5);ingot(0,0.35);
-    argent.add(box(0.95,0.34,0.62,0xc9a85e,0,0.17+bY+0.34,bZ-0.5)); // lingot empilé
-    [[-0.55,0.7],[0.6,0.6]].forEach(([x,z])=>{ const s=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,6),
-      new THREE.MeshStandardMaterial({color:0xb9a06a,flatShading:true}));
-      s.scale.set(1,0.85,1); s.position.set(x,bY+0.42,bZ+z); argent.add(s); });   // sacs
+    argent.add(box(0.95,0.34,0.62,0xc9a85e,0,0.17+bY+0.34,bZ-0.5));               // lingot empilé
+    // pile de PIÈCES (4 fins disques empilés) — la valeur s'incarne
+    const matCoin = new THREE.MeshStandardMaterial({color:COL.or, metalness:.55, roughness:.30, flatShading:true});
+    for(let i=0;i<4;i++){
+      const c=new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.05, 14), matCoin);
+      c.position.set(0.40, bY+0.05 + i*0.05, bZ+0.95);
+      argent.add(c);
+    }
+    // sacs (deux dômes aplatis)
+    [[-0.55,0.7],[0.6,0.6]].forEach(([x,z])=>{
+      const s=new THREE.Mesh(new THREE.SphereGeometry(0.5,8,6),
+        new THREE.MeshStandardMaterial({color:0xb9a06a,flatShading:true}));
+      s.scale.set(1,0.85,1); s.position.set(x,bY+0.42,bZ+z); argent.add(s);
+    });
 
     const moyens=new THREE.Group();
-    const coal=new THREE.Mesh(new THREE.ConeGeometry(0.95,1.05,7),
-      new THREE.MeshStandardMaterial({color:COL.charbon,flatShading:true}));
-    coal.position.set(-0.55,bY+0.5,bZ-0.4); moyens.add(coal);                     // charbon
-    moyens.add(box(0.95,0.95,0.95,0x8a6b49,0.6,bY+0.48,bZ-0.3));                   // caisse matière
-    moyens.add(box(0.95,0.9,0.95,0xcdbd9a,0.5,bY+0.45,bZ+0.8));                    // balle de coton
-    moyens.add(box(0.85,0.8,0.85,0x8a8076,-0.6,bY+0.4,bZ+0.85));                   // fer
+    // charbon en TAS : un cône principal + 4 morceaux noirs autour
+    const matCharbon = new THREE.MeshStandardMaterial({color:COL.charbon, roughness:1, flatShading:true});
+    const coal=new THREE.Mesh(new THREE.ConeGeometry(0.95, 1.05, 7), matCharbon);
+    coal.position.set(-0.55,bY+0.5,bZ-0.4); moyens.add(coal);
+    for(let i=0;i<4;i++){
+      const a=i*Math.PI/2 + 0.5;
+      const chunk=new THREE.Mesh(new THREE.IcosahedronGeometry(0.18+Math.random()*0.10, 0), matCharbon);
+      chunk.position.set(-0.55+Math.cos(a)*0.55, bY+0.18, bZ-0.4+Math.sin(a)*0.45);
+      moyens.add(chunk);
+    }
+    // caisse matière avec cerclages
+    const matBoisCaisse=new THREE.MeshStandardMaterial({color:0x8a6b49, roughness:0.95, flatShading:true});
+    const caisse1=new THREE.Mesh(new THREE.BoxGeometry(0.95,0.95,0.95), matBoisCaisse);
+    caisse1.position.set(0.6, bY+0.48, bZ-0.3); moyens.add(caisse1);
+    for(const dy of [-0.36, 0.36]){
+      const band=new THREE.Mesh(new THREE.BoxGeometry(0.99, 0.06, 0.99), matCerclage);
+      band.position.set(0.6, bY+0.48+dy, bZ-0.3); moyens.add(band);
+    }
+    // balle de coton (texture moelleuse — sphère un peu écrasée)
+    const cotton=new THREE.Mesh(new THREE.SphereGeometry(0.48, 8, 6),
+      new THREE.MeshStandardMaterial({color:0xcdbd9a, roughness:0.95, flatShading:true}));
+    cotton.scale.set(1, 0.85, 1.1);
+    cotton.position.set(0.5, bY+0.46, bZ+0.8); moyens.add(cotton);
+    moyens.add(box(0.85,0.8,0.85,0x8a8076, -0.6, bY+0.4, bZ+0.85));                // fer brut
 
     const march=new THREE.Group();
-    const crate=(x,z,y)=>{ march.add(box(0.88,0.86,0.88,0x9a5a3e,x,bY+0.43+y,bZ+z));
-      march.add(box(0.9,0.13,0.9,0x7a4530,x,bY+0.85+y,bZ+z,false)); };            // caisses + cerclage
+    const crate=(x,z,y)=>{
+      // caisse en planches : corps + 2 cerclages + nervures
+      const body=new THREE.Mesh(new THREE.BoxGeometry(0.88, 0.86, 0.88), matBoisCaisse);
+      body.position.set(x, bY+0.43+y, bZ+z); march.add(body);
+      march.add(box(0.9, 0.13, 0.9, 0x7a4530, x, bY+0.85+y, bZ+z, false));        // couvercle
+      // cerclages fer
+      for(const dy of [-0.30, 0.30]){
+        const band=new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.05, 0.92), matCerclage);
+        band.position.set(x, bY+0.43+y+dy, bZ+z); march.add(band);
+      }
+    };
     crate(-0.5,-0.45,0);crate(0.5,-0.45,0);crate(-0.5,0.5,0);crate(0.5,0.5,0);crate(0,0.02,0.95);
     this.cargoGroups={argent,moyens,marchandises:march};
     Object.values(this.cargoGroups).forEach(grp=>g.add(grp));
 
-    // --- roues : jante + moyeu + rayons, grandes à l'arrière ---
+    // --- roues : jante + moyeu + 8 rayons + ferrures, grandes à l'arrière ---
+    //   M-Peaufinage/C : 8 rayons au lieu de 4, ferrures (boulons) sur la
+    //   jante, jante un peu plus fine — silhouette nettement plus riche
+    //   sans changer le rayon ni le pivot (les roues continuent de tourner
+    //   correctement via wheels[].rotation.x).
     const wmat=new THREE.MeshStandardMaterial({color:0x201c16,flatShading:true});
     const hubMat=new THREE.MeshStandardMaterial({color:COL.fer,metalness:.4,roughness:.5,flatShading:true});
-    const addWheel=(x,z,r)=>{ const tire=new THREE.Mesh(new THREE.CylinderGeometry(r,r,0.4,16),wmat);
-      const hub=new THREE.Mesh(new THREE.CylinderGeometry(r*0.34,r*0.34,0.46,12),hubMat); tire.add(hub);
-      for(let i=0;i<4;i++){ const sp=box(r*1.7,0.09,0.12,0x3a342a,0,0,0,false); sp.rotation.y=i*Math.PI/4; tire.add(sp); }
-      tire.rotation.z=Math.PI/2; tire.position.set(x,r,z); g.add(tire); this.wheels.push(tire); };
+    const boltMat=new THREE.MeshStandardMaterial({color:0x4a4236,metalness:.6,roughness:.4,flatShading:true});
+    const addWheel=(x,z,r)=>{
+      const tire=new THREE.Mesh(new THREE.CylinderGeometry(r,r,0.40,18), wmat);
+      // moyeu en fer + rondelle
+      const hub=new THREE.Mesh(new THREE.CylinderGeometry(r*0.34, r*0.34, 0.46, 12), hubMat);
+      tire.add(hub);
+      const ring=new THREE.Mesh(new THREE.CylinderGeometry(r*0.42, r*0.42, 0.10, 14), boltMat);
+      tire.add(ring);
+      // 8 rayons (au lieu de 4) — 4 par moitié → silhouette dense
+      for(let i=0;i<8;i++){
+        const sp=new THREE.Mesh(new THREE.BoxGeometry(r*1.65, 0.06, 0.09), wmat);
+        sp.rotation.y=i*Math.PI/8;
+        tire.add(sp);
+      }
+      // 6 ferrures (boulons en fer) sur la face de la jante
+      for(let i=0;i<6;i++){
+        const a=i*Math.PI/3;
+        const bolt=new THREE.Mesh(new THREE.CylinderGeometry(0.045,0.045,0.10,6), boltMat);
+        bolt.position.set(0, 0, 0);
+        bolt.rotation.x=0;
+        // décale en (x,z) dans le plan de la jante (tire est orienté autour de Y local AVANT rotation finale)
+        bolt.position.x=Math.cos(a)*r*0.78;
+        bolt.position.z=Math.sin(a)*r*0.78;
+        tire.add(bolt);
+      }
+      tire.rotation.z=Math.PI/2; tire.position.set(x,r,z); g.add(tire); this.wheels.push(tire);
+    };
     addWheel(-1.6,1.7,0.8); addWheel(1.6,1.7,0.8);        // arrière
     addWheel(-1.45,-1.7,0.54); addWheel(1.45,-1.7,0.54);  // avant
     // essieux + garde-boue
     for(const z of[1.7,-1.7]){ const ax=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,3.4,8),hubMat); ax.rotation.z=Math.PI/2; ax.position.set(0,z>0?0.8:0.54,z); g.add(ax); }
     for(const x of[-1.6,1.6]) g.add(box(1.5,0.18,0.5,0x2f2a22,x,1.55,1.7,false));   // garde-boue arrière
+
+    // --- M-Peaufinage/C : CAISSE EN PLANCHES (clous + cerclages fer)
+    //   sur les flancs de la caisse. Donne le toucher de menuiserie au
+    //   chariot, en restant low-poly (boxes fines superposées).
+    //   matPlanche/matCerclage déclarés en haut de build().
+    // 5 planches verticales sur chaque flanc, légèrement décalées en x.
+    for(const sx of [-1, 1]){
+      for(let k=0;k<5;k++){
+        const px = -2.0 + k*0.92;          // -2.0..+1.68
+        const pl=new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.62, 0.03), matPlanche);
+        pl.position.set(sx*1.51, 1.30, px);
+        pl.rotation.y=sx>0 ? -Math.PI/2 : Math.PI/2;
+        g.add(pl);
+      }
+      // 2 cerclages fer horizontaux (haut/bas)
+      for(const py of [1.05, 1.55]){
+        const cz=new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.07, 4.0), matCerclage);
+        cz.position.set(sx*1.55, py, 0);
+        g.add(cz);
+      }
+      // clous (4 par flanc — décoratif)
+      for(let i=0;i<4;i++){
+        const py = i<2 ? 1.05 : 1.55;
+        const pz = -1.6 + (i%2)*3.2;
+        const cl=new THREE.Mesh(new THREE.SphereGeometry(0.04, 6, 4), matCerclage);
+        cl.position.set(sx*1.56, py, pz);
+        g.add(cl);
+      }
+    }
+
+    // --- M-Peuple/C : CHAUDIÈRE À VAPEUR au-dessus du bloc moteur ---
+    //   Cylindre horizontal en fer (le « moteur du capital »), petit
+    //   manomètre, cheminée déjà présente. Ce volume rappelle visuellement
+    //   que le chariot est une MACHINE — qu'il tourne, qu'il chauffe.
+    const matChaudiere=new THREE.MeshStandardMaterial({color:0x46362a, metalness:.35, roughness:.55, flatShading:true});
+    const matIronShiny=new THREE.MeshStandardMaterial({color:0x6b6155, metalness:.7, roughness:.35, flatShading:true});
+    const chaudiere=new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 1.6, 12), matChaudiere);
+    chaudiere.rotation.z=Math.PI/2;
+    chaudiere.position.set(0, 2.20, 2.10); g.add(chaudiere);
+    // 3 cerclages fer brillant
+    for(const cx of [-0.55, 0, 0.55]){
+      const band=new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.46, 0.06, 12), matIronShiny);
+      band.rotation.z=Math.PI/2;
+      band.position.set(cx, 2.20, 2.10); g.add(band);
+    }
+    // petit manomètre rond (juste devant la chaudière)
+    const dial=new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 0.04, 10), matIronShiny);
+    dial.rotation.x=Math.PI/2;
+    dial.position.set(0.62, 2.20, 1.30); g.add(dial);
+    // valve (petite molette en haut de la chaudière)
+    const valve=new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.20, 8), matIronShiny);
+    valve.position.set(0, 2.55, 2.10); g.add(valve);
+    const handle=new THREE.Mesh(new THREE.TorusGeometry(0.10, 0.025, 4, 12), matIronShiny);
+    handle.position.set(0, 2.66, 2.10); handle.rotation.x=Math.PI/2; g.add(handle);
 
     // lanterne avant (le capital éclaire sa propre route)
     this.lantern=new THREE.Mesh(new THREE.SphereGeometry(0.34,10,10),
