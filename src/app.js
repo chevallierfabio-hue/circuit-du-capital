@@ -870,6 +870,7 @@ function buildWorld(){
   buildLighthouse();   // M-Mer/B : phare + faisceau tournant sur môle pierre
   buildMaritimeTraffic();// M-Mer/C : voiliers + vapeur en patrouille (sillages, fumée)
   buildSeaFauna();     // M-Mer/D : crabes, mouettes, bouées, banc de poissons
+  _M_Mer_buildShoreFoam(); // M-Mer/correctif-rivage : ligne d'écume au ressac
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
   buildClosingHorizon();// M6-bord : ferme le monde par géographie naturelle (collines, estran, voiliers distants)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
@@ -3933,6 +3934,65 @@ function buildLighthouse(){
   // barrière invisible : on n'entre pas dans le môle
   obstacles.push({pos:new THREE.Vector2(baseX, baseZ), radius:3.5});
 }
+/* M-Mer/correctif-rivage — ÉCUME DU RESSAC.
+   Petits patches additifs placés sur la LIGNE DE MARÉE (intersection
+   estran ↔ surface d'eau). Position en z répartie sur toute la côte,
+   x calculé via la même fonction _M_Mer_shoreNoise → aligne exactement
+   sur la ligne de marée du mesh estran. Opacité pulsée (ressac doux)
+   et léger va-et-vient horizontal. Texture canvas additive, sous le
+   seuil de bloom. */
+let _M_Mer_shoreFoam = null;
+function _M_Mer_buildShoreFoam(){
+  // texture : bande horizontale + grains blancs
+  const cv = document.createElement('canvas'); cv.width=128; cv.height=24;
+  const x = cv.getContext('2d');
+  const g = x.createLinearGradient(0, 0, 0, 24);
+  g.addColorStop(0,'rgba(255,255,255,0)');
+  g.addColorStop(0.5,'rgba(245,250,255,0.80)');
+  g.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0,0,128,24);
+  x.fillStyle = 'rgba(255,255,255,0.85)';
+  for(let i=0;i<60;i++){
+    x.fillRect(Math.random()*128, 6 + Math.random()*12, 1+Math.random()*2, 1);
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  // patches : ~48 patches répartis sur z ∈ [-130, 130]
+  const N = 48;
+  const dZ = 260;
+  _M_Mer_shoreFoam = [];
+  for(let i=0; i<N; i++){
+    const z = -dZ/2 + (i/N)*dZ + (Math.random()-0.5)*1.6;
+    // la ligne de marée tombe à tt ≈ 0.16 sur l'estran (cf. _M6_buildEstran).
+    //   xLand + 0.16*(xWater-xLand) = 107 + n0*1.6 + 0.16*(8.5 + (n1-n0)*1.5)
+    //   approx : x_shore(z) ≈ 108.4 + _M_Mer_shoreNoise(z, 0)*1.4
+    const xShore = 108.4 + _M_Mer_shoreNoise(z, 0.0) * 1.4;
+    const m = new THREE.Mesh(
+      new THREE.PlaneGeometry(6.5, 1.1),
+      new THREE.MeshBasicMaterial({
+        map: tex, color: 0xffffff, transparent: true, opacity: 0,
+        depthWrite: false, blending: THREE.AdditiveBlending, fog: true,
+      }),
+    );
+    m.rotation.x = -Math.PI/2;
+    m.position.set(xShore, 0.025, z);
+    m.userData.baseX = xShore;
+    m.userData.phase = Math.random() * 6.28;
+    scene.add(m);
+    _M_Mer_shoreFoam.push(m);
+  }
+}
+function _M_Mer_updateShoreFoam(){
+  if(!_M_Mer_shoreFoam) return;
+  for(const m of _M_Mer_shoreFoam){
+    const ph = m.userData.phase;
+    // ressac : opacité oscille 0 → 0.55 → 0, en saccades douces
+    const pulse = 0.35 + 0.42 * Math.sin(t * 1.3 + ph);
+    m.material.opacity = Math.max(0, pulse);
+    // léger va-et-vient horizontal (±0.55 m)
+    m.position.x = m.userData.baseX + Math.sin(t * 0.7 + ph * 0.7) * 0.55;
+  }
+}
+
 function _M_Mer_updateLighthouse(){
   if(!_M_Mer_phareLantern) return;
   // intensité jour/nuit : kNight pilote (kDay≈0 nuit ; on veut l'inverse).
@@ -4900,6 +4960,11 @@ function buildWaterEast(){
         float fogF = smoothstep(uFogNear, uFogFar, dCam);
         col = mix(col, uFogColor, fogF * 0.95);
         float alpha = mix(0.92, 0.55, fogF);   // s'efface au loin pour rejoindre le ciel
+        // M-Mer/correctif-rivage : transparence accrue près du rivage pour
+        //   que l'eau ne masque pas l'estran mouillé — pas d'arête nette,
+        //   l'eau « entre » dans le sable. 0.5 au rivage, 1.0 dès 15m du bord.
+        float shoreNear = 1.0 - smoothstep(115.0, 130.0, vWorldPos.x);
+        alpha *= mix(1.0, 0.55, shoreNear);
         gl_FragColor = vec4(col, alpha);
       }`,
   });
@@ -4921,13 +4986,18 @@ function buildWaterEast(){
   //   désormais par l'estran bruité (_M6_buildEstran) : bords ondulants,
   //   bosses de sable. La limite playable reste assurée par la barrière
   //   invisible des obstacles à x=111.5 (cf. ligne suivante).
-  // deux bateaux à quai (tangage doux via WorldBeauty)
-  for(const [bx, bz, r] of [[114, -8, 0.4], [114.5, 14, -0.5]]){
+  // M-Mer/correctif-rivage : un bateau ACCOSTÉ contre le quai (face
+  //   est, contre la planche x=111) et un MOUILLÉ en eau profonde
+  //   (bien au-delà du bord de l'estran à x≈115-117). Tangage et
+  //   roulis assurés par WorldBeauty (cf. boucle de rendu).
+  for(const [bx, bz, r] of [[112.7, -3, 0.05], [123, 16, -0.45]]){
     const b=createBoat(); b.position.set(bx, 0, bz); b.rotation.y=r;
     scene.add(b); _boats.push(b);
   }
-  // barrière invisible le long de la berge
-  for(let z=-116; z<=116; z+=11) obstacles.push({pos:new THREE.Vector2(111.5, z), radius:6});
+  // barrière invisible le long de la berge — repoussée à la NOUVELLE
+  //   limite terre de l'estran (x≈105 max d'oscillation). Empêche le
+  //   chariot de descendre sur le sable.
+  for(let z=-116; z<=116; z+=11) obstacles.push({pos:new THREE.Vector2(105.5, z), radius:6});
 }
 function _M6_updateWater(){
   if(!_M6_waterMaterial) return;
@@ -5084,37 +5154,52 @@ function _M6_buildDistantTrees(){
     _M6_distantTreeGroups.push(trunks, folies);
   }
 }
+// Fonction de bruit partagée par l'estran et l'écume du rivage : garantit que
+//   les sprites d'écume s'alignent EXACTEMENT sur la ligne de marée du
+//   mesh estran. Multi-octave (3 sinusoïdes).
+function _M_Mer_shoreNoise(z, p){
+  return Math.sin(z*0.045 + p)*0.70
+       + Math.sin(z*0.105 + p*1.7)*0.40
+       + Math.sin(z*0.205 + p*0.6)*0.15;
+}
 function _M6_buildEstran(){
-  // M-Polish/C : ESTRAN IRRÉGULARISÉ. L'ancienne grille était trop régulière
-  // (la côte ressemblait à un trait géométrique). Ici on bruite :
-  //   - l'abscisse x à chaque colonne (mélange 2 sinusoïdes longues → bord
-  //     ondulant et non rectiligne, terre comme mer),
-  //   - la hauteur y avec petites bosses de sable/galets,
-  //   - la pente x→y reste cohérente (la plage plonge sous la mer).
-  const d=240;
-  const segX=10, segZ=60;
-  const verts=[], idx=[], uvs=[];
-  // bruit déterministe : variations basses fréquences sur z pour un littoral organique.
-  const noiseX = (z, freqA, freqB, phase) =>
-    Math.sin(z*freqA + phase)*0.70 + Math.sin(z*freqB + phase*1.7)*0.40;
+  // M-Mer/correctif-rivage : ESTRAN ÉLARGI et CONTRASTÉ.
+  // - bord TERRE serpente entre x ≈ 105.2 et x ≈ 108.8 (criques/avancées)
+  // - bord EAU  serpente entre x ≈ 113.7 et x ≈ 117.3
+  // - pente DOUCE : y de +0.07 (sable sec) à -0.32 (sous-marin) sur ~7-12m
+  //   La ligne de marée (y ≈ 0.012, surface de l'eau) tombe vers tt ≈ 0.16
+  //   selon noise → courbe sinueuse, jamais une ligne droite.
+  // - bumps de sable/galets plus marqués au centre.
+  // - VERTEX COLORS : sable sec côté terre, vase humide côté eau (lerp).
+  const d=270;
+  const segX=14, segZ=140;
+  const verts=[], idx=[], uvs=[], colors=[];
+  const cDry  = new THREE.Color(0x8a7458);   // sable sec doré
+  const cWet  = new THREE.Color(0x2a221a);   // vase mouillée très sombre
+  const tmpC  = new THREE.Color();
   for(let iz=0; iz<=segZ; iz++){
     const z = -d/2 + (iz/segZ)*d;
-    // bords irréguliers : le bord-TERRE serpente entre x=108.0 et x=109.7,
-    // le bord-EAU entre x=112.5 et x=113.8 — la côte n'est plus une ligne.
-    const xLand  = 108.7 + noiseX(z, 0.045, 0.11, 0.0) * 0.55;   // ±~0.85
-    const xWater = 113.3 + noiseX(z, 0.038, 0.09, 1.7) * 0.45;   // ±~0.65
+    const xLand  = 107.0 + _M_Mer_shoreNoise(z, 0.0) * 1.6;   // ±~1.8
+    const xWater = 115.5 + _M_Mer_shoreNoise(z, 1.7) * 1.5;   // ±~1.7
     for(let ix=0; ix<=segX; ix++){
       const tt = ix/segX;
       const x = xLand + tt*(xWater - xLand);
-      // pente : y descend de 0.04 (terre) à -0.06 (plonge sous la mer à y=0.012)
-      let y = 0.040 - tt*0.100;
-      // petites bosses au milieu (sable/galets) — bruit haute fréquence amorti
-      // sur les bords (pour ne pas laisser de pic visible sur la rupture).
-      const edgeAmp = Math.sin(tt*Math.PI);    // 0 aux extrémités, 1 au centre
-      y += edgeAmp * (Math.sin(z*0.31 + ix*0.7)*0.020
-                    + Math.sin(z*0.83 - ix*0.4)*0.012);
+      // pente douce : 0.07 (terre) → -0.32 (eau profonde). Croise la
+      //   surface d'eau (y=0.012) vers tt ≈ 0.15 — la marée n'est plus
+      //   une ligne droite mais une courbe sinueuse.
+      let y = 0.070 - tt*0.390;
+      // bumps de sable (bruit HF amorti aux bords)
+      const edgeAmp = Math.sin(tt*Math.PI);
+      y += edgeAmp * (Math.sin(z*0.31 + ix*0.7)*0.038
+                    + Math.sin(z*0.83 - ix*0.4)*0.022
+                    + Math.sin(z*1.45 + ix*0.2)*0.011);
       verts.push(x, y, z);
-      uvs.push(tt*1.5, iz/segZ*16);
+      uvs.push(tt*2.0, iz/segZ*24);
+      // couleur : sec → humide selon tt (les zones immergées sont sombres
+      //   et mouillées). Plus contraste fort que la version précédente.
+      const wetK = Math.min(1, Math.max(0, (tt-0.05)*1.55));
+      tmpC.copy(cDry).lerp(cWet, wetK);
+      colors.push(tmpC.r, tmpC.g, tmpC.b);
     }
   }
   for(let iz=0; iz<segZ; iz++){
@@ -5127,12 +5212,13 @@ function _M6_buildEstran(){
   const geo=new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
   geo.setAttribute('uv',       new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors, 3));
   geo.setIndex(idx); geo.computeVertexNormals();
-  // texture sable foncé humide : on prend terreTexture mais on assombrit la teinte
   const t=terreTexture();
   const mat=new THREE.MeshStandardMaterial({
-    color:0x6a5a44, map:t.map, roughnessMap:t.roughnessMap,
-    roughness:0.55, metalness:0.05,                    // bas roughness → réflexion dorée
+    map:t.map, roughnessMap:t.roughnessMap,
+    vertexColors:true,
+    roughness:0.55, metalness:0.05,
   });
   const m=new THREE.Mesh(geo, mat);
   m.receiveShadow=true; scene.add(m);
@@ -16672,6 +16758,7 @@ function loop(){
   _M_Mer_updateLighthouse();          // M-Mer/B : rotation faisceau, intensité jour/nuit
   _M_Mer_updateTraffic(dt);           // M-Mer/C : bateaux, sillages, fumée vapeur
   _M_Mer_updateFauna(dt);             // M-Mer/D : crabes, mouettes, bouées, poissons
+  _M_Mer_updateShoreFoam();           // M-Mer/correctif-rivage : ressac doux
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
