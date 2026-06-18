@@ -8296,6 +8296,8 @@ export function init(opts={}){
   // M-Polish/A — particules & atmosphère (sparks, motes, steam, brume sol).
   //   Initialisé APRÈS M4.afterWorld() : les motes lisent gasLamps[].worldPos.
   try{ M_Polish.init(); }catch(e){ console.warn('[M-Polish/A] init :', e&&e.message||e); }
+  // M-Polish/B — micro-vie. Initialisé après populateEnvironment (qui place
+  // les cordes à linge taguées) sera fait plus bas après populateEnvironment.
   // le son démarre au premier geste (politique d'autoplay des navigateurs)
   const _sndStart=()=>{ AmbientSound.start(); removeEventListener('pointerdown',_sndStart); removeEventListener('keydown',_sndStart); };
   addEventListener('pointerdown',_sndStart); addEventListener('keydown',_sndStart);
@@ -8307,6 +8309,9 @@ export function init(opts={}){
   try{ PeuplePop.init(); }catch(e){
     console.warn('[M-Peuple/Pop] init :', e&&e.message||e);
   }
+  // M-Polish/B — micro-vie. Initialisé après populateEnvironment pour
+  //   pouvoir scanner les cordes à linge taguées (userData.linge) déjà placées.
+  try{ M_Life.init(); }catch(e){ console.warn('[M-Polish/B] init :', e&&e.message||e); }
   startIntroTrailer();
   // M1c — audit one-shot des émissifs après peuplement complet (log console.table)
   try{ auditEmissiveMaterials(); }catch(_){}
@@ -9333,7 +9338,10 @@ function createMarketStall(c=COL.rouge){ const g=new THREE.Group();
   g.add(box(2.8,0.25,1.8,0x6b513a,0,1.3,0,false)); return g; }
 function createRopeLine(len=4){ const g=new THREE.Group();
   g.add(box(0.06,0.06,len,0x2a241d,0,2.4,0,false)); const cols=[0x8a3b2a,0x4d5f70,0xcdbd9a,0x6b513a];
-  for(let i=0;i<4;i++) g.add(box(0.5,0.7,0.04,cols[i%4],0,2.0,-len/2+0.6+i*((len-1.2)/3),false)); return g; }
+  // M-Polish/B : chaque pièce de linge est taguée pour le battement procédural.
+  for(let i=0;i<4;i++){ const cloth=box(0.5,0.7,0.04,cols[i%4],0,2.0,-len/2+0.6+i*((len-1.2)/3),false);
+    cloth.userData.linge=true; g.add(cloth); }
+  return g; }
 function createPosterBoard(text){ const g=new THREE.Group();
   g.add(box(0.18,2.6,0.18,COL.brun,0,1.3,0,false));
   const lab=makeLabel(text); lab.scale.set(5,1.25,1); lab.position.set(0,3,0); g.add(lab); return g; }
@@ -14052,6 +14060,298 @@ const M_Polish = (function(){
 })();
 if(typeof window !== 'undefined') window.__mpolish = M_Polish;
 
+/* =====================================================================
+   M-Polish · LOT B — MICRO-VIE.
+   Vols d'oiseaux en V (lointains), chat errant dans le quartier
+   ouvrier (clin d'œil à Stray), linge tendu qui bat au vent, fanions
+   de toit qui oscillent, fumées domestiques fines depuis quelques
+   maisons. Tout en pools fixes — ZÉRO alloc par frame.
+
+   Couplé au cycle jour/nuit (oiseaux le jour seulement).
+   Pilotage qualité : low → tout caché.
+   ===================================================================== */
+const M_Life = (function(){
+  let ready = false;
+  let _scene = null;
+
+  // ---- VOLS D'OISEAUX EN V (lointains) ----
+  // Chaque "skein" = un groupe de 5 sprites en formation V qui traverse
+  // le ciel dans la direction +X (vent d'ouest), à grande altitude.
+  const skeins = [];
+  // ---- CHAT (5 volumes low-poly, déambule entre 3 points) ----
+  let cat = null;        // { obj, head, tail, p:0..1, segIdx:0..2, sitT, state:'walk'|'sit' }
+  // ---- LINGE (quads des cordes à linge) ----
+  const linge = [];      // [{ obj, ph, baseRot }]
+  // ---- FANIONS sur toits ----
+  const fanions = [];    // [{ obj, ph }]
+  // ---- FUMÉES DOMESTIQUES (pool de puffs fins) ----
+  const homeSmoke = [];
+  let _homeT = 0;
+  let _budgetMs = 0;
+  let _texSoft = null;
+
+  function _mkSoftTex(){
+    if(_texSoft) return _texSoft;
+    const c=document.createElement('canvas'); c.width=c.height=64;
+    const x=c.getContext('2d');
+    const g=x.createRadialGradient(32,32,1,32,32,30);
+    g.addColorStop(0,'rgba(255,255,255,0.92)');
+    g.addColorStop(0.5,'rgba(255,255,255,0.40)');
+    g.addColorStop(1,'rgba(255,255,255,0)');
+    x.fillStyle=g; x.fillRect(0,0,64,64);
+    return _texSoft = new THREE.CanvasTexture(c);
+  }
+
+  // ----------- construction du CHAT low-poly --------------
+  function _buildCat(){
+    const g = new THREE.Group();
+    g.name = 'Polish:cat';
+    const FUR  = 0xb05a28;
+    const FUR2 = 0x7a3c1c;
+    const matFur  = new THREE.MeshStandardMaterial({color:FUR,  emissive:new THREE.Color(FUR),  emissiveIntensity:0.10, roughness:0.95, metalness:0, flatShading:true});
+    const matFur2 = new THREE.MeshStandardMaterial({color:FUR2, emissive:new THREE.Color(FUR2), emissiveIntensity:0.10, roughness:0.95, metalness:0, flatShading:true});
+    // corps
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.18, 0.22), matFur);
+    body.position.y = 0.20; g.add(body);
+    // tête (à l'avant +Z)
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.18, 0.20), matFur);
+    head.position.set(0, 0.24, 0.30); g.add(head);
+    // 2 petites oreilles triangulaires (cônes)
+    for(const sx of [-1, 1]){
+      const ear = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.08, 4), matFur);
+      ear.position.set(sx*0.06, 0.36, 0.30); g.add(ear);
+    }
+    // queue (penche vers le haut à l'arrière)
+    const tail = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.32), matFur2);
+    tail.position.set(0, 0.24, -0.32);
+    tail.rotation.x = -0.40; g.add(tail);
+    // 2 transversales en guise de pattes
+    const legF = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.16, 0.06), matFur2);
+    legF.position.set(0, 0.08, 0.18); g.add(legF);
+    const legB = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.16, 0.06), matFur2);
+    legB.position.set(0, 0.08, -0.18); g.add(legB);
+    return { group:g, head, tail };
+  }
+
+  function init(){
+    if(ready) return;
+    if(typeof scene === 'undefined' || !scene) return;
+    _scene = scene;
+
+    // ---- 2 SKEINS d'oiseaux en V ----
+    const birdMat = new THREE.SpriteMaterial({
+      map:_mkSoftTex(), color:0x241f17,
+      transparent:true, depthWrite:false, fog:true, opacity:0.85,
+    });
+    for(let k=0;k<2;k++){
+      const skein = { sprites:[], y:38 + k*8, z: -60 + k*120, vx: 1.6 + k*0.4, phase:Math.random()*6.28 };
+      // 5 sprites en V : (0,0), (-1,-1), (1,-1), (-2,-2), (2,-2)
+      const OFFS = [[0,0], [-1.2,-1.0], [1.2,-1.0], [-2.4,-2.0], [2.4,-2.0]];
+      for(const [ox, oz] of OFFS){
+        const s = new THREE.Sprite(birdMat.clone());
+        s.scale.set(1.2, 0.5, 1);
+        s.visible = false;
+        _scene.add(s);
+        skein.sprites.push({obj:s, ox, oz});
+      }
+      skein.x = k===0 ? -120 : -60;
+      skeins.push(skein);
+    }
+
+    // ---- CHAT ----
+    const c = _buildCat();
+    const QO = (typeof zonePos === 'function') ? zonePos('Quartier ouvrier') : {x:0, z:62};
+    c.group.position.set(QO.x - 6, 0, QO.z + 2);
+    _scene.add(c.group);
+    cat = {
+      obj: c.group, head: c.head, tail: c.tail,
+      // 3 points de déambulation autour des maisons
+      waypoints: [
+        {x: QO.x - 6, z: QO.z + 2},
+        {x: QO.x + 5, z: QO.z + 8},
+        {x: QO.x + 9, z: QO.z - 4},
+      ],
+      segIdx: 0, p: 0,
+      state: 'walk',
+      sitT: 0,
+      speed: 1.6,            // unités/sec
+      _bobPh: Math.random()*6.28,
+    };
+
+    // ---- LINGE — scan unique des cordes à linge (tag posé en init) ----
+    _scene.traverse(o=>{
+      if(o.userData && o.userData.linge){
+        linge.push({obj:o, ph:Math.random()*6.28, baseY:o.position.y, baseRotZ:o.rotation.z});
+      }
+    });
+
+    // ---- FANIONS — 3 fanions sur toits, posés en world fixe ----
+    const fanMat = new THREE.MeshStandardMaterial({color:0x8a2c1d, roughness:0.9, metalness:0, flatShading:true, side:THREE.DoubleSide});
+    const poleMat = new THREE.MeshStandardMaterial({color:0x2a241c, roughness:0.6, metalness:0.4, flatShading:true});
+    const FAN_SPOTS = [
+      {x: QO.x - 5, y: 5.0, z: QO.z + 9},
+      {x: QO.x + 4, y: 5.4, z: QO.z + 7},
+      {x: QO.x + 8, y: 5.0, z: QO.z + 10},
+    ];
+    for(const sp of FAN_SPOTS){
+      const grp = new THREE.Group();
+      const pole = new THREE.Mesh(new THREE.BoxGeometry(0.04, 1.0, 0.04), poleMat);
+      pole.position.y = 0.5; grp.add(pole);
+      const flag = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.30), fanMat);
+      flag.position.set(0.27, 0.9, 0); grp.add(flag);
+      grp.userData.flag = flag;
+      grp.position.set(sp.x, sp.y, sp.z);
+      _scene.add(grp);
+      fanions.push({obj:grp, flag, ph:Math.random()*6.28});
+    }
+
+    // ---- FUMÉES DOMESTIQUES — pool de 8 puffs ----
+    const homeMat = new THREE.SpriteMaterial({
+      map:_mkSoftTex(), color:0x8a8275,
+      transparent:true, depthWrite:false, blending:THREE.NormalBlending, fog:true, opacity:0,
+    });
+    const HOME_SRC = [
+      // 5 mitons de toit dans le quartier ouvrier (offsets relatifs aux maisons)
+      {x: QO.x - 6, y: 4.2, z: QO.z + 8},
+      {x: QO.x - 2, y: 4.2, z: QO.z + 9},
+      {x: QO.x + 3, y: 4.2, z: QO.z + 8.5},
+      {x: QO.x + 6, y: 4.2, z: QO.z + 7.5},
+      {x: QO.x + 9, y: 4.2, z: QO.z + 9},
+    ];
+    for(let i=0;i<8;i++){
+      const s = new THREE.Sprite(homeMat.clone());
+      s.scale.set(0.6, 0.6, 1); s.visible = false;
+      _scene.add(s);
+      homeSmoke.push({obj:s, t0:-9, life:3.0, src: HOME_SRC[i % HOME_SRC.length]});
+    }
+
+    ready = true;
+    console.info('[M-Polish/B] prêt · skeins:'+skeins.length+
+      ' cat:1 linge:'+linge.length+' fanions:'+fanions.length+
+      ' homeSmoke:'+homeSmoke.length);
+  }
+
+  function _qual(){
+    if(typeof GRAPHICS_QUALITY === 'undefined') return 1;
+    if(GRAPHICS_QUALITY === 'low') return 0;
+    if(GRAPHICS_QUALITY === 'medium') return 0.7;
+    return 1.0;
+  }
+
+  function update(dt){
+    if(!ready) return;
+    const t0p = (typeof performance !== 'undefined') ? performance.now() : 0;
+    const qf = _qual();
+    const T = (typeof t !== 'undefined') ? t : 0;
+    const kd = (typeof DayCycle !== 'undefined') ? DayCycle.kDay : 1;
+
+    if(qf <= 0){
+      // qualité basse : tout caché.
+      for(const sk of skeins) for(const s of sk.sprites) if(s.obj.visible) s.obj.visible = false;
+      if(cat) cat.obj.visible = false;
+      for(const f of fanions) if(f.obj.visible) f.obj.visible = false;
+      for(const s of homeSmoke) if(s.obj.visible) s.obj.visible = false;
+      return;
+    }
+
+    // — SKEINS — visibles seulement le jour, dérive +X lente —
+    const dayVis = kd > 0.3;
+    for(const sk of skeins){
+      sk.x += sk.vx * dt;
+      if(sk.x > 140) sk.x = -140;     // wrap
+      const beat = Math.sin(T * 8 + sk.phase) * 0.55;
+      for(let i=0;i<sk.sprites.length;i++){
+        const sp = sk.sprites[i];
+        sp.obj.visible = dayVis;
+        if(!dayVis) continue;
+        sp.obj.position.set(sk.x + sp.ox, sk.y + Math.sin(T * 0.5 + i*0.4) * 0.4, sk.z + sp.oz);
+        sp.obj.scale.y = 0.50 + Math.abs(beat) * 0.10;
+      }
+    }
+
+    // — CHAT — déambulation entre 3 points, parfois pause assis —
+    if(cat){
+      cat.obj.visible = true;
+      if(cat.state === 'walk'){
+        const a = cat.waypoints[cat.segIdx];
+        const b = cat.waypoints[(cat.segIdx + 1) % cat.waypoints.length];
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const dist = Math.hypot(dx, dz) || 1;
+        cat.p += (cat.speed * dt) / dist;
+        if(cat.p >= 1){
+          cat.p = 1; cat.state = 'sit'; cat.sitT = 0;
+        }
+        const x = a.x + dx * cat.p;
+        const z = a.z + dz * cat.p;
+        cat.obj.position.set(x, 0.06 + Math.abs(Math.sin(T*7 + cat._bobPh))*0.02, z);
+        cat.obj.rotation.y = Math.atan2(dx, dz);
+        // tête bouge légèrement
+        cat.head.rotation.y = Math.sin(T*1.4 + cat._bobPh)*0.2;
+        cat.tail.rotation.x = -0.40 + Math.sin(T*3 + cat._bobPh)*0.15;
+      } else {
+        // assis : queue qui oscille doucement, tête qui regarde alentour
+        cat.sitT += dt;
+        cat.obj.position.y = 0.06;
+        cat.head.rotation.y = Math.sin(T*0.8)*0.5;
+        cat.tail.rotation.x = -0.20 + Math.sin(T*0.9)*0.25;
+        if(cat.sitT > 4.5){
+          cat.segIdx = (cat.segIdx + 1) % cat.waypoints.length;
+          cat.p = 0; cat.state = 'walk';
+        }
+      }
+    }
+
+    // — LINGE — léger battement (sinusoïde) sur position Y + rotation Z —
+    for(let i=0;i<linge.length;i++){
+      const l = linge[i];
+      l.obj.rotation.z = l.baseRotZ + Math.sin(T*1.4 + l.ph) * 0.10;
+      l.obj.position.y = l.baseY + Math.sin(T*1.0 + l.ph)*0.015;
+    }
+
+    // — FANIONS — oscillation lente bruitée —
+    for(const f of fanions){
+      f.flag.rotation.y = Math.sin(T*0.9 + f.ph)*0.30 + Math.sin(T*2.1 + f.ph)*0.10;
+    }
+
+    // — FUMÉES DOMESTIQUES — fins puffs montant doucement, peu fréquents —
+    _homeT -= dt;
+    if(_homeT <= 0){
+      _homeT = 0.6 + Math.random()*0.8;
+      const homeBudget = Math.round(homeSmoke.length * qf);
+      for(let i=0;i<homeBudget;i++){
+        const s = homeSmoke[i];
+        if(T - s.t0 > s.life){
+          s.obj.position.set(s.src.x + (Math.random()-0.5)*0.5, s.src.y, s.src.z + (Math.random()-0.5)*0.5);
+          s.t0 = T; s.life = 2.4 + Math.random()*0.8;
+          s.obj.visible = true;
+          break;
+        }
+      }
+    }
+    for(const s of homeSmoke){
+      if(!s.obj.visible) continue;
+      const age = (T - s.t0) / s.life;
+      if(age >= 1){ s.obj.visible = false; continue; }
+      s.obj.position.y += dt * 0.45;
+      s.obj.position.x += dt * 0.20;
+      s.obj.scale.setScalar(0.45 + age*0.85);
+      s.obj.material.opacity = 0.22 * (1 - age);
+    }
+
+    if(t0p) _budgetMs = _budgetMs*0.9 + (performance.now()-t0p)*0.1;
+  }
+
+  function debug(){
+    return {
+      ready, budgetMs:+_budgetMs.toFixed(2),
+      skeins:skeins.length, linge:linge.length, fanions:fanions.length, homeSmoke:homeSmoke.length,
+    };
+  }
+
+  return { init, update, debug };
+})();
+if(typeof window !== 'undefined') window.__mlife = M_Life;
+
 /* v58 — LE PAYSAGE SONORE. Tout est synthétisé (aucun fichier) et mixé par
    PROXIMITÉ : un vent doux partout (souffle filtré, lentement modulé), des
    mouettes près de l'eau, le ronron grave des machines près des usines en
@@ -14900,6 +15200,7 @@ function loop(){
   Atmosphere.update(dt);              // v58 : brume + position du soleil
   PuffTrains.update(dt);              // v63 : trains de bouffées des cheminées
   M_Polish.update(dt);                // M-Polish/A : sparks, motes, steam, fog
+  M_Life.update(dt);                  // M-Polish/B : oiseaux V, chat, linge, fanions, fumées
   updateSkySmoke(dt);                 // M2 : fumée des cheminées lointaines (skyline)
   updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
   _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
