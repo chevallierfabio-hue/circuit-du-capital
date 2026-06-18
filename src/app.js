@@ -9090,7 +9090,19 @@ function updateWindowGlow(){
   const night=Math.max(0,1-DayCycle.kDay*1.7);            // 0 le jour, 1 la nuit
   if(Vehicle.lampGlass){ Vehicle.lampGlass.material.emissiveIntensity=night*1.2;  // M1c — lampe chariot calibrée
     if(Vehicle.lampPool) Vehicle.lampPool.material.opacity=night*0.5; }
-  for(const m of distantGlows) m.emissiveIntensity=night*1.6;  // v66 : les villes lointaines veillent
+  // M-Peaufinage/A : allumage IRRÉGULIER des fenêtres lointaines.
+  //   Chaque fenêtre porte un facteur (glowFactor) et une chance d'être
+  //   allumée (litChance), plus une phase de léger scintillement à 0.4 Hz.
+  //   Le résultat : pas deux fenêtres identiques, la ville respire.
+  const _T = (typeof t !== 'undefined') ? t : 0;
+  for(const m of distantGlows){
+    const u = m.userData;
+    if(!u){ m.emissiveIntensity = night*1.6; continue; }
+    if(!u.litChance){ m.emissiveIntensity = 0; continue; }
+    const fac = u.glowFactor || 1;
+    const flick = 0.85 + 0.15 * Math.sin(_T * 0.4 + u.flickerPh);
+    m.emissiveIntensity = night * 1.6 * fac * flick;
+  }
   // M4 — baseline night : chaque PointLight reprend SON propre baseI (forge/gold/gas
   // ont des poids différents). updateClassLighting peut ensuite multiplier par
   // un facteur dérivé de la simulation.
@@ -13140,13 +13152,20 @@ const SMOKE_COLUMNS=[];                                 // pour le sélecteur qu
 
 function buildHorizon(){
   let seed=99; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647; };
-  // matière commune : sombre, mate, ramassée par scene.fog (fog:true)
-  const sky_skyline=new THREE.MeshStandardMaterial({
-    color:0x232a3a, roughness:1, metalness:0, flatShading:true, fog:true,
-  });
+  // M-Peaufinage/A : 3 matières (proche, lointaine, très lointaine) plus
+  //   claires à mesure qu'on s'éloigne — donne la PROFONDEUR ATMOSPHÉRIQUE
+  //   même avant que le fog ne fasse son travail.
+  const mat_near = new THREE.MeshStandardMaterial({color:0x232a3a, roughness:1, metalness:0, flatShading:true, fog:true});
+  const mat_mid  = new THREE.MeshStandardMaterial({color:0x363d4f, roughness:1, metalness:0, flatShading:true, fog:true});
+  const mat_far  = new THREE.MeshStandardMaterial({color:0x4a5266, roughness:1, metalness:0, flatShading:true, fog:true});
   const sky_chimney=new THREE.MeshStandardMaterial({
     color:0x1c222e, roughness:1, metalness:0, flatShading:true, fog:true,
   });
+  const sky_chimney_far=new THREE.MeshStandardMaterial({
+    color:0x3a4256, roughness:1, metalness:0, flatShading:true, fog:true,
+  });
+  // matière dôme/ornement clair (financier ouest)
+  const mat_dome_near = new THREE.MeshStandardMaterial({color:0x4a4030, roughness:0.9, metalness:0.1, flatShading:true, fog:true});
 
   // densité fenêtres : ouest (-X) = riche, est (+X) = pauvre/noir
   const windowDensity=(x,z)=>{
@@ -13155,38 +13174,79 @@ function buildHorizon(){
     return 0.10 + 0.55*westness*westness;
   };
 
-  // une « façade » dans la skyline : box principale + 2-3 toits décalés,
-  // 1-2 cheminées fines, fenêtres aléatoires sur la face tournée vers la scène.
-  const buildFacade=(parent, w, hMax, depth, facingY)=>{
-    const h=hMax*(0.6+rnd()*0.4);
-    const main=new THREE.Mesh(new THREE.BoxGeometry(w,h,depth), sky_skyline);
+  // ------------- VARIANTES DE TOIT -------------------
+  function _roofPlat(parent, w, h, depth, mat){
+    const cw=w*(0.95+rnd()*0.1), cd=depth*1.10, ch=0.6+rnd()*0.8;
+    const cor=new THREE.Mesh(new THREE.BoxGeometry(cw,ch,cd), mat);
+    cor.position.y=h+ch/2; parent.add(cor);
+  }
+  function _roofPignon(parent, w, h, depth, mat){
+    const ph=1.4+rnd()*1.8;
+    const peak=new THREE.Mesh(new THREE.ConeGeometry(w*0.55, ph, 4), mat);
+    peak.rotation.y=Math.PI/4; peak.position.y=h+ph/2; parent.add(peak);
+  }
+  function _roofMansarde(parent, w, h, depth, mat){
+    // 2 boxes superposés trapézoïdaux (haut plus petit que bas) → toit cassé
+    const h1=0.7+rnd()*0.5;
+    const lower=new THREE.Mesh(new THREE.BoxGeometry(w*0.95, h1, depth*1.05), mat);
+    lower.position.y=h+h1/2; parent.add(lower);
+    const h2=0.5+rnd()*0.4;
+    const upper=new THREE.Mesh(new THREE.BoxGeometry(w*0.70, h2, depth*0.85), mat);
+    upper.position.y=h+h1+h2/2; parent.add(upper);
+  }
+  function _roofDome(parent, w, h, depth, matDome){
+    // demi-sphère sur tambour (institutionnel — clocher d'église, dôme)
+    const drumH=0.5+rnd()*0.4;
+    const drum=new THREE.Mesh(new THREE.CylinderGeometry(w*0.30, w*0.32, drumH, 10), matDome);
+    drum.position.y=h+drumH/2; parent.add(drum);
+    const r=w*0.30;
+    const dome=new THREE.Mesh(new THREE.SphereGeometry(r, 10, 6, 0, Math.PI*2, 0, Math.PI*0.5), matDome);
+    dome.position.y=h+drumH; parent.add(dome);
+    // pointe (lanterneau)
+    const tipH=0.8+rnd()*0.6;
+    const tip=new THREE.Mesh(new THREE.ConeGeometry(0.12, tipH, 6), matDome);
+    tip.position.y=h+drumH+r+tipH/2; parent.add(tip);
+  }
+  function _roofClocher(parent, w, h, depth, mat){
+    // tour-clocher : box étroite + flèche pointue
+    const tH=2+rnd()*2;
+    const tower=new THREE.Mesh(new THREE.BoxGeometry(w*0.45, tH, depth*0.45), mat);
+    tower.position.y=h+tH/2; parent.add(tower);
+    const sH=2.5+rnd()*2.5;
+    const spire=new THREE.Mesh(new THREE.ConeGeometry(w*0.22, sH, 6), mat);
+    spire.position.y=h+tH+sH/2; parent.add(spire);
+  }
+
+  // ------------- FAÇADE complète -----------------------
+  const buildFacade=(parent, w, hMax, depth, matBody, matChim, matDome)=>{
+    const h=hMax*(0.5+rnd()*0.5);                 // taille TRÈS variable
+    const main=new THREE.Mesh(new THREE.BoxGeometry(w,h,depth), matBody);
     main.position.y=h/2; parent.add(main);
 
-    // toits variés : tantôt plat (corniche), tantôt pignon
-    if(rnd()<0.6){
-      const cw=w*(0.95+rnd()*0.1), cd=depth*1.1, ch=0.6+rnd()*0.8;
-      const cor=new THREE.Mesh(new THREE.BoxGeometry(cw,ch,cd), sky_skyline);
-      cor.position.y=h+ch/2; parent.add(cor);
-    } else {
-      const peak=new THREE.Mesh(new THREE.ConeGeometry(w*0.55, 1.4+rnd()*1.8, 4), sky_skyline);
-      peak.rotation.y=Math.PI/4;
-      peak.position.y=h+(1.4+rnd()*1.8)/2; parent.add(peak);
-    }
-    // cheminées fines (1-2)
-    const nCh=1+(rnd()<0.5?1:0);
+    // Variantes de toit : plat 35 % · pignon 25 % · mansarde 18 % ·
+    //   dôme 12 % (institutionnel) · clocher 10 % (rare, haut).
+    const r=rnd();
+    if(r<0.35)      _roofPlat    (parent, w, h, depth, matBody);
+    else if(r<0.60) _roofPignon  (parent, w, h, depth, matBody);
+    else if(r<0.78) _roofMansarde(parent, w, h, depth, matBody);
+    else if(r<0.90) _roofDome    (parent, w, h, depth, matDome);
+    else            _roofClocher (parent, w, h, depth, matBody);
+
+    // cheminées (densité plus forte côté industriel = est/nord-est)
+    const angle=Math.atan2(parent.position.z, parent.position.x);
+    const eastness=(Math.cos(angle)*0.5)+0.5;
+    const nCh = (rnd() < 0.35 + eastness*0.40) ? (1 + (rnd()<0.4 ? 1 : 0)) : 0;
     for(let i=0;i<nCh;i++){
-      const ch=new THREE.Mesh(new THREE.CylinderGeometry(0.45+rnd()*0.25, 0.5+rnd()*0.3, 4+rnd()*8, 6), sky_chimney);
-      ch.position.set((rnd()-0.5)*w*0.7, h+(ch.geometry.parameters.height)/2, (rnd()-0.5)*depth*0.4);
+      const chH = 4+rnd()*8;
+      const ch=new THREE.Mesh(new THREE.CylinderGeometry(0.45+rnd()*0.25, 0.5+rnd()*0.3, chH, 6), matChim);
+      ch.position.set((rnd()-0.5)*w*0.7, h+chH/2, (rnd()-0.5)*depth*0.4);
       parent.add(ch);
-      // marqueur pour que les colonnes de fumée se posent dessus
       ch.userData.smokeAnchor=true;
     }
-    // fenêtres émissives sur la face avant (Y face -1, donc face = +Y vers caméra ? non, c'est la face Z+)
-    // En réalité après la rotation parent.rotation.y=facingY, on veut placer les fenêtres sur la face
-    // tournée vers la scène. Le parent est positionné à (sin(a), 0, cos(a))*R avec rotation.y=facingY,
-    // donc la face "intérieure" est celle à -Z local (orientée vers l'origine).
+
+    // fenêtres émissives : densité par x/z mondial + irrégularité par window.
     const dens=windowDensity(parent.position.x, parent.position.z);
-    const targetN=Math.round(8*dens);                   // max ~8, ouest = ~5-6, est = ~1
+    const targetN=Math.round(8*dens);
     for(let k=0;k<targetN;k++){
       const wx=(rnd()-0.5)*w*0.7;
       const wy=2+rnd()*(h-4);
@@ -13195,37 +13255,88 @@ function buildHorizon(){
           color:0x1c2026, emissive:COLORSCRIPT.gasLight, emissiveIntensity:0.0,
           fog:true,
         }));
-      fw.position.set(wx, wy, -depth/2-0.04);           // face intérieure (vers la scène)
-      fw.rotation.y=Math.PI;                            // normale vers la scène
-      parent.add(fw); distantGlows.push(fw.material);
+      fw.position.set(wx, wy, -depth/2-0.04);
+      fw.rotation.y=Math.PI;
+      parent.add(fw);
+      // M-Peaufinage/A : facteur de brillance + chance d'allumage + phase
+      //   de scintillement, stockés sur le material pour updateWindowGlow.
+      const mm = fw.material;
+      mm.userData = {
+        glowFactor: 0.55 + rnd()*0.95,      // 0.55..1.50
+        litChance:  rnd() < 0.78,           // 78 % des fenêtres s'allument la nuit
+        flickerPh:  rnd() * 6.2831853,
+      };
+      distantGlows.push(mm);
     }
   };
 
-  // construit une couche de skyline sur un cercle de rayon R
-  const buildLayer=(R, count, hMax, depth, minW, maxW)=>{
+  // ------------- GRUE/ÉCHAFAUDAGE industriel ----------
+  function buildCrane(x, z, mat, big){
+    const g=new THREE.Group(); g.position.set(x, 0, z);
+    g.rotation.y=Math.atan2(x, z);
+    const H = big ? (16+rnd()*6) : (10+rnd()*4);
+    // mât vertical (treillis simulé par 2 montants + croisillons fins)
+    const W = big ? 1.2 : 0.7;
+    for(const sx of [-1,1]){
+      const m=new THREE.Mesh(new THREE.BoxGeometry(0.18, H, 0.18), mat);
+      m.position.set(sx*W*0.5, H/2, 0); g.add(m);
+    }
+    // croisillons X (3-4 paires)
+    const Nx = big ? 4 : 3;
+    for(let i=0;i<Nx;i++){
+      const y = H*(0.18 + i*(0.65/Nx));
+      const cross=new THREE.Mesh(new THREE.BoxGeometry(W*1.2, 0.10, 0.10), mat);
+      cross.position.y=y; cross.rotation.z=(i%2 ? 0.5 : -0.5);
+      g.add(cross);
+    }
+    // potence horizontale en haut
+    const armLen = big ? (8+rnd()*4) : (5+rnd()*2);
+    const arm=new THREE.Mesh(new THREE.BoxGeometry(armLen, 0.20, 0.20), mat);
+    arm.position.set(armLen/2-W*0.5, H-0.3, 0); g.add(arm);
+    // câble vertical (un peu plus loin)
+    const cable=new THREE.Mesh(new THREE.BoxGeometry(0.05, H*0.6, 0.05), mat);
+    cable.position.set(armLen*0.75-W*0.5, H-H*0.30, 0); g.add(cable);
+    scene.add(g);
+  }
+
+  // ------------- COUCHES de SKYLINE ---------------------
+  // construit une couche de skyline sur un cercle de rayon R.
+  const buildLayer=(R, count, hMax, depth, minW, maxW, matBody, matChim, matDome)=>{
     for(let i=0;i<count;i++){
       const a=(i/count)*Math.PI*2 + (rnd()-0.5)*0.1;
       const x=Math.sin(a)*R+(rnd()-0.5)*10;
       const z=Math.cos(a)*R+(rnd()-0.5)*10;
       const g=new THREE.Group();
       g.position.set(x,0,z);
-      // chaque façade regarde vers l'origine
       g.rotation.y=Math.atan2(x,z);
-      // 2-4 façades adjacentes (un "block")
       const n=2+Math.floor(rnd()*3);
       for(let j=0;j<n;j++){
         const sub=new THREE.Group();
         sub.position.x=(j-(n-1)/2)*(maxW*0.95);
         const w=minW+rnd()*(maxW-minW);
-        buildFacade(sub, w, hMax, depth, g.rotation.y);
+        buildFacade(sub, w, hMax, depth, matBody, matChim, matDome);
         g.add(sub);
       }
       scene.add(g);
     }
   };
 
-  buildLayer(210, 16, 22, 7, 5, 9);    // couche proche : silhouettes hautes, plus de détail
-  buildLayer(280, 14, 14, 6, 4, 7);    // couche lointaine : plus basse, fondue plus avant
+  // M-Peaufinage/A : 3 COUCHES de profondeur. La plus lointaine (R=250)
+  //   se fond presque dans le fog (matériau quasi-fog), donne la sensation
+  //   d'horizon profond sans excéder le far du fog (260).
+  buildLayer(195, 18, 24, 7, 5, 9, mat_near, sky_chimney, mat_dome_near);   // proche : variée, haute, contrastée
+  buildLayer(225, 12, 16, 6, 4, 7, mat_mid,  sky_chimney,     mat_mid);     // intermédiaire
+  buildLayer(250, 14, 12, 5, 4, 6, mat_far,  sky_chimney_far, mat_far);     // lointaine : claire, fondue dans le fog
+
+  // Quelques grues/échafaudages industriels (silhouettes nettes — rappel
+  //   du caractère industriel des autres villes). Placées sur le côté
+  //   est/nord-est (industriel) en priorité.
+  const craneSpots = [
+    [ 165,  60], [ 185, -40], [ 130, 120], [-160, 110], [ 80, 180], [-90, 175],
+  ];
+  for(let i=0;i<craneSpots.length;i++){
+    buildCrane(craneSpots[i][0], craneSpots[i][1], mat_mid, i<3);
+  }
 
   // 4-5 colonnes de fumée sur cheminées lointaines.
   // On choisit des ancres parmi les cheminées posées + parmi les couches.
