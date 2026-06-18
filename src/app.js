@@ -5197,7 +5197,9 @@ const CinemaMode = (function(){
   let _fadeIn = 0.6, _fadeOut = 0.6;   // s — montée/descente des effets
   let _fov = null;                     // FOV ciblé pendant la séquence (null = conserver)
   let _baseGrain = 0.025;
-  let _baseFocus = 34.0, _baseAperture = 0.00002, _baseMaxBlur = 0.004;
+  // M-Cinéma-b/C : valeurs « de jeu » — DoF NEUTRE (aperture/maxblur = 0).
+  //   En sortie de cinéma on remet ces valeurs ET on coupe bokehPass.enabled.
+  let _baseFocus = 34.0, _baseAperture = 0, _baseMaxBlur = 0;
   let _domReady = false;
   let _topBar=null, _bottomBar=null, _titleEl=null;
   // scratch
@@ -5221,11 +5223,35 @@ const CinemaMode = (function(){
       .mcinema-letterbox.top    { top: 0;    height: 12vh; }
       .mcinema-letterbox.bottom { bottom: 0; height: 12vh; }
       body.mcinema-on .mcinema-letterbox { opacity: 1; }
+      /* M-Cinéma-b/B : MASQUE GLOBAL de toute l'UI de jeu pendant une
+         séquence cinéma. On veut un écran PROPRE : letterbox + scène
+         + titre éventuel. Tout le reste s'éteint en fondu (transition
+         .6 s pour rester cohérent avec le letterbox). */
       body.mcinema-on .hud,
       body.mcinema-on .crisisTag,
       body.mcinema-on #pov-target-indicator,
       body.mcinema-on #circuit-panel,
-      body.mcinema-on .panel { opacity: 0; pointer-events: none; transition: opacity .6s ease; }
+      body.mcinema-on .panel,
+      body.mcinema-on .coach,         /* TUTORIEL */
+      body.mcinema-on #tutorial-coach,
+      body.mcinema-on .quest,
+      body.mcinema-on #quest,
+      body.mcinema-on .formation,
+      body.mcinema-on #formation,
+      body.mcinema-on .log,
+      body.mcinema-on #log,
+      body.mcinema-on .villebadge,
+      body.mcinema-on #villebadge,
+      body.mcinema-on .whap,
+      body.mcinema-on .resolve-hint,
+      body.mcinema-on .tuto-focus,
+      body.mcinema-on .prompt,
+      body.mcinema-on #qa,
+      body.mcinema-on #chantier-btn,
+      body.mcinema-on #log-open,
+      body.mcinema-on .zoneact,
+      body.mcinema-on #flash,
+      body.mcinema-on #crisisVeil { opacity: 0 !important; pointer-events: none !important; transition: opacity .6s ease; }
       .mcinema-title {
         position: fixed; left: 0; right: 0; bottom: 14vh;
         text-align: center; z-index: 51;
@@ -5296,24 +5322,36 @@ const CinemaMode = (function(){
     // Bascule l'UI en mode cinéma — CSS s'occupe des fondus.
     document.body.classList.add('mcinema-on');
     if(_titleEl) _titleEl.textContent = _title;
+    // M-Cinéma-b/C : ACTIVE le DoF (BokehPass) seulement maintenant.
+    //   En jeu normal il reste désactivé → zéro flou résiduel possible.
+    //   On respecte la qualité 'low' (jamais de DoF en basse qualité).
+    if(bokehPass && (typeof RENDER_QUALITY === 'undefined' || RENDER_QUALITY !== 'low')){
+      bokehPass.enabled = true;
+    }
     return true;
   }
 
   function skip(){ if(active) end(); }
 
+  // M-Cinéma-b/C : CHEMIN UNIQUE DE SORTIE. Skip OU fin naturelle passent
+  //   ici. Tous les effets sont remis à leur état de jeu, garanti.
+  //   Pas de cas où on quitte un mode cinéma sans nettoyer.
   function end(){
     if(!active) return;
     active = false;
     document.body.classList.remove('mcinema-on');
     if(_titleEl) _titleEl.textContent = '';
-    // Restaure les uniforms post-prod à leurs niveaux de jeu.
+    // Grain → niveau de jeu.
     if(gradePass) gradePass.uniforms.uGrain.value = _baseGrain;
+    // DoF → COMPLÈTEMENT désactivé (enabled=false + uniforms à zéro).
+    //   C'est la garantie qu'il n'y a JAMAIS de flou résiduel en jeu.
     if(bokehPass){
       bokehPass.uniforms.focus.value    = _baseFocus;
       bokehPass.uniforms.aperture.value = _baseAperture;
       bokehPass.uniforms.maxblur.value  = _baseMaxBlur;
+      bokehPass.enabled = false;
     }
-    // Le ralenti REMONTE en douceur vers 1 (cf. _coolDownT dans update).
+    // Ralenti REMONTE en douceur vers 1 (cf. _coolDownT dans update).
     _timeScaleTarget = 1;
     _coolDownT = 0.5;     // s — fenêtre de lissage post-end()
     const cb = _onEnd; _onEnd = null;
@@ -8722,13 +8760,19 @@ export function init(opts={}){
       //   cinéma (CinemaMode le pilote en fonction du sujet de la séquence).
       //   Désactivable : si BokehPass absent ou en qualité 'low', bokehPass
       //   reste null et la chaîne saute simplement la passe.
+      // M-Cinéma-b/C : DoF OFF PAR DÉFAUT en jeu (zéro flou, zéro coût
+      //   d'une passe de profondeur inutile). bokehPass.enabled n'est
+      //   passé à true que pendant une séquence cinéma (CinemaMode.begin)
+      //   et est REMIS à false dans CinemaMode.end (chemin unique de
+      //   sortie : skip + fin naturelle passent par la même fonction).
       if(typeof THREE.BokehPass!=='undefined'){
         try{
           bokehPass=new THREE.BokehPass(scene, camera, {
-            focus:    34.0,      // distance focale par défaut (zones de jeu lointaines nettes)
-            aperture: 0.00002,   // ouverture très faible → flou imperceptible en jeu
-            maxblur:  0.004,     // blur max très bas par défaut
+            focus:    34.0,
+            aperture: 0,         // aucune ouverture → aucun flou même si enabled
+            maxblur:  0,
           });
+          bokehPass.enabled = false;   // DoF désactivé par défaut en jeu
           composer.addPass(bokehPass);
         }catch(err){ console.warn('[M-Cinéma] BokehPass indisponible :', err&&err.message||err); bokehPass=null; }
       }
@@ -8797,7 +8841,17 @@ export function init(opts={}){
   // M-Polish/B — micro-vie. Initialisé après populateEnvironment pour
   //   pouvoir scanner les cordes à linge taguées (userData.linge) déjà placées.
   try{ M_Life.init(); }catch(e){ console.warn('[M-Polish/B] init :', e&&e.message||e); }
-  startIntroTrailer();
+  // M-Cinéma-b/A : SUPPRESSION de l'ancienne intro HTML (overlay
+  //   introtrailer + scènes-narratives + applyWorldPreview). Elle se
+  //   superposait à la nouvelle séquence cinéma « La Veille du Capital »
+  //   (CinemaSequences.playIntro). On lance directement le jeu : le DOM
+  //   introtrailer est masqué, body.intro-open retiré, TutorialCoach
+  //   activé. La nouvelle intro cinéma se déclenche ~2 s plus tard via
+  //   CinemaSequences.tick() (guard _introPlayed → unique par session).
+  const _introDom = document.getElementById('introtrailer');
+  if(_introDom) _introDom.classList.add('hidden');
+  document.body.classList.remove('intro-open');
+  startGame({handoff:true});
   // M1c — audit one-shot des émissifs après peuplement complet (log console.table)
   try{ auditEmissiveMaterials(); }catch(_){}
   addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;
@@ -10058,9 +10112,11 @@ function applyRenderQuality(q){
   COMPOSER_BYPASS = (q === 'low');
   const grain = (q === 'high') ? 0.025 : 0.0;
   if(gradePass){ gradePass.uniforms.uGrain.value = grain; }
-  // M-Cinéma — DoF : désactivé en Basse (économise une render-pass de
-  //   profondeur). En Moyenne/Haute il reste actif mais subtil par défaut.
-  if(bokehPass){ bokehPass.enabled = (q !== 'low'); }
+  // M-Cinéma-b/C : DoF OFF PAR DÉFAUT en jeu. On ne le ré-active jamais
+  //   ici — c'est CinemaMode.begin/end qui pilote bokehPass.enabled le
+  //   temps d'une séquence. Si la qualité passe à 'low' PENDANT le cinéma,
+  //   on force enabled=false (économie de la render-pass de profondeur).
+  if(bokehPass && q === 'low'){ bokehPass.enabled = false; }
   let shadowsOn = false, shadowSize = 0;
   if(typeof renderer !== 'undefined' && renderer){
     if(q === 'low'){
