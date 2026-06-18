@@ -867,6 +867,7 @@ function buildWorld(){
   buildPuddles();      // M3 — flaques réfléchissantes : seules surfaces non mates du sol
   buildGroundDebris(); // M3 — papiers / éclats / pierres en InstancedMesh
   buildWaterEast();    // v56/M6 : littoral — eau étendue jusqu'à l'horizon (M6-bord)
+  buildLighthouse();   // M-Mer/B : phare + faisceau tournant sur môle pierre
   Nature.build();      // v57 : forêts et herbe instanciées — la nature précède le capital (visible dès la phase 0)
   buildClosingHorizon();// M6-bord : ferme le monde par géographie naturelle (collines, estran, voiliers distants)
   // v61 : le tube doré permanent est RETIRÉ (confus entre les bâtiments). Le guidage
@@ -3830,6 +3831,146 @@ function buildPort(g){                // PORT — quai planches, grue à vapeur,
 const _M6_cranes=[];   // grues pivotantes du port
 function _M6_updateCranes(){
   for(const c of _M6_cranes) c.rotation.y = Math.sin(t * 0.18) * 0.45;
+}
+
+/* =====================================================================
+   M-Mer/B — PHARE & FAISCEAU TOURNANT.
+   Tour low-poly à bandes (stone / blanc) sur un môle au sud du port.
+   Lanterne sommitale émissive (sous le seuil bloom). Cône additif qui
+   balaie l'horizon mer en rotation continue ~6 s/tour : intense la nuit
+   (kNight pilote l'opacité), atténué le jour. depthWrite=false,
+   blending=Additive — pas de cube blanchi par over-bloom.
+   ===================================================================== */
+let _M_Mer_phareBeam = null;   // groupe pivot du faisceau
+let _M_Mer_phareLantern = null; // material émissif (modulation jour/nuit)
+let _M_Mer_phareHalo = null;    // sprite halo (modulation jour/nuit)
+function buildLighthouse(){
+  // Position : môle pierre au SUD du port (x≈109, z=-70). Hors zone d'eau
+  //   (eau commence à x≈113) : la base reste sur la terre/jetée pierre.
+  const baseX = 109, baseZ = -70;
+  const root = new THREE.Group();
+  root.position.set(baseX, 0, baseZ);
+  // --- môle pierre (jetée) ---
+  const matStone = new THREE.MeshStandardMaterial({color:0x4a4540, roughness:1.0, metalness:0.0, flatShading:true});
+  const matStoneLight = new THREE.MeshStandardMaterial({color:0xb8a890, roughness:0.85, metalness:0.0, flatShading:true});
+  const matStoneDark  = new THREE.MeshStandardMaterial({color:0x2a2620, roughness:1.0, metalness:0.0, flatShading:true});
+  const matRed   = new THREE.MeshStandardMaterial({color:0x8a2a1c, roughness:0.9, metalness:0.0, flatShading:true});
+  const matBlack = new THREE.MeshStandardMaterial({color:0x1c1814, roughness:0.55, metalness:0.6, flatShading:true});
+  const jetee = new THREE.Mesh(new THREE.BoxGeometry(5.0, 0.6, 4.5), matStone);
+  jetee.position.set(0.6, 0.30, 0);            // déborde légèrement vers l'eau (+x)
+  jetee.castShadow = true; jetee.receiveShadow = true;
+  root.add(jetee);
+  // socle circulaire pierre (transition jetée → tour)
+  const socle = new THREE.Mesh(new THREE.CylinderGeometry(1.65, 1.85, 1.2, 12), matStone);
+  socle.position.set(0, 1.2, 0);
+  socle.castShadow = true; root.add(socle);
+  // --- tour : 3 anneaux alternés (stone clair / blanc / stone clair) ---
+  const towerY0 = 1.8;
+  const ringH = 2.3;
+  const ringR = 1.20;
+  const rings = [matStoneLight, matRed, matStoneLight];
+  for(let i=0; i<3; i++){
+    const seg = new THREE.Mesh(new THREE.CylinderGeometry(ringR - i*0.08, ringR - i*0.06, ringH, 14), rings[i]);
+    seg.position.set(0, towerY0 + i*ringH + ringH/2, 0);
+    seg.castShadow = true; root.add(seg);
+  }
+  // coursive (anneau d'observation sous la lanterne)
+  const coursH = 0.25;
+  const cours = new THREE.Mesh(new THREE.TorusGeometry(ringR + 0.18, 0.08, 6, 16), matBlack);
+  cours.rotation.x = Math.PI/2;
+  cours.position.set(0, towerY0 + 3*ringH + coursH/2, 0);
+  root.add(cours);
+  // plancher coursive (disque mince)
+  const coursDeck = new THREE.Mesh(new THREE.CylinderGeometry(ringR + 0.22, ringR + 0.22, coursH, 14), matStoneDark);
+  coursDeck.position.set(0, towerY0 + 3*ringH + coursH/2, 0);
+  root.add(coursDeck);
+  // --- lanterne (volume vitré + halo émissif) ---
+  const lantY = towerY0 + 3*ringH + coursH + 0.6;
+  const lantMat = new THREE.MeshStandardMaterial({
+    color:0xffe2a8, emissive:new THREE.Color(0xffb45e), emissiveIntensity:0.0,
+    roughness:0.30, metalness:0.20, flatShading:true,
+  });
+  _M_Mer_phareLantern = lantMat;
+  const lantern = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.95, 1.20, 12), lantMat);
+  lantern.position.set(0, lantY, 0);
+  root.add(lantern);
+  // cage métal autour de la lanterne (6 montants verticaux)
+  for(let i=0; i<6; i++){
+    const a = (i/6) * Math.PI*2;
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.07, 1.20, 0.07), matBlack);
+    post.position.set(Math.cos(a)*0.92, lantY, Math.sin(a)*0.92);
+    root.add(post);
+  }
+  // toit conique
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(1.10, 1.10, 12), matBlack);
+  roof.position.set(0, lantY + 0.60 + 0.55, 0);
+  root.add(roof);
+  // pointe (épi)
+  const epi = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.08, 0.70, 6), matBlack);
+  epi.position.set(0, lantY + 0.60 + 1.10 + 0.35, 0);
+  root.add(epi);
+
+  // --- halo source (sprite additif au niveau lanterne) ---
+  const haloCv = document.createElement('canvas'); haloCv.width=haloCv.height=128;
+  const hctx = haloCv.getContext('2d');
+  const hg = hctx.createRadialGradient(64,64,2,64,64,62);
+  hg.addColorStop(0,'rgba(255,230,180,0.95)');
+  hg.addColorStop(0.4,'rgba(255,180,100,0.40)');
+  hg.addColorStop(1,'rgba(255,160,80,0)');
+  hctx.fillStyle=hg; hctx.fillRect(0,0,128,128);
+  const haloTex = new THREE.CanvasTexture(haloCv);
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: haloTex, color: 0xffd8a8, transparent: true, opacity: 0.0,
+    depthWrite: false, blending: THREE.AdditiveBlending, fog: true,
+  }));
+  halo.scale.set(3.5, 3.5, 1);
+  halo.position.set(0, lantY, 0);
+  root.add(halo);
+  _M_Mer_phareHalo = halo;
+
+  // --- faisceau (cône additif) ---
+  // ConeGeometry pose la base en bas et l'apex en haut. On veut l'apex à la
+  //   source et la base loin sur la mer : on tourne le cône de 90° autour de X
+  //   pour le coucher horizontalement vers +X (l'orientation est ajustée par
+  //   le pivot parent). Longueur 38m, demi-angle ~10°.
+  const beamLen = 38;
+  const beamR = 5.5;            // rayon de la base (demi-angle ~8°)
+  const beamGeo = new THREE.ConeGeometry(beamR, beamLen, 16, 1, true);
+  beamGeo.translate(0, -beamLen/2, 0);   // apex à origine, base à y=-beamLen
+  beamGeo.rotateX(Math.PI/2);            // couche le cône horizontal (base → +Z après rotation pivot)
+  const beamMat = new THREE.MeshBasicMaterial({
+    color: 0xffd8a0, transparent: true, opacity: 0.0,
+    depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: true,
+  });
+  _M_Mer_phareLantern.userData.beamMat = beamMat;
+  const beam = new THREE.Mesh(beamGeo, beamMat);
+  const pivot = new THREE.Group();
+  pivot.position.set(0, lantY, 0);
+  pivot.add(beam);
+  // léger pitch vers le bas pour balayer la surface de la mer (pas le ciel)
+  beam.rotation.x = 0.18;
+  root.add(pivot);
+  _M_Mer_phareBeam = pivot;
+  scene.add(root);
+
+  // barrière invisible : on n'entre pas dans le môle
+  obstacles.push({pos:new THREE.Vector2(baseX, baseZ), radius:3.5});
+}
+function _M_Mer_updateLighthouse(){
+  if(!_M_Mer_phareBeam) return;
+  // rotation continue ~6 s/tour
+  _M_Mer_phareBeam.rotation.y = t * (Math.PI*2 / 6.0);
+  // intensité jour/nuit : kNight pilote (kDay≈0 nuit ; on veut l'inverse).
+  const kNight = (typeof DayCycle!=='undefined' && typeof DayCycle.kDay==='number')
+    ? Math.max(0, Math.min(1, 1 - DayCycle.kDay)) : 0.5;
+  // émissive lanterne : sous le seuil bloom même la nuit (intensité 0.75 max,
+  //   couleur déjà gasLight chaude — luminance ~0.7).
+  if(_M_Mer_phareLantern){
+    _M_Mer_phareLantern.emissiveIntensity = 0.10 + 0.65 * kNight;
+    const bm = _M_Mer_phareLantern.userData.beamMat;
+    if(bm) bm.opacity = 0.08 + 0.32 * kNight;   // 0.08 jour, 0.40 nuit
+  }
+  if(_M_Mer_phareHalo) _M_Mer_phareHalo.material.opacity = 0.12 + 0.55 * kNight;
 }
 function buildBourse(g){             // « le phare du capital » — verticale, rayonnante
   const pierre=pierreDeTailleTexture('clair');
@@ -16106,6 +16247,7 @@ function loop(){
   updateSkyAtmosphere(dt);            // M2 : nuages, godrays, voile doré
   _M6_updateWater();                  // M6 : vagues + reflets fanaux (ShaderMaterial)
   _M6_updateCranes();                 // M6 : pivot lent des grues du port
+  _M_Mer_updateLighthouse();          // M-Mer/B : rotation faisceau, intensité jour/nuit
   AmbientSound.update(dt);            // v58 : mixage par proximité
   updateLwTweens();
   updateLivingWorld(dt);
