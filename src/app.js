@@ -4159,12 +4159,18 @@ function buildWaterEast(){
   // ----- ShaderMaterial -----
   // M7-soleil : uAstreDir (xz du soleil/lune dominant), uAstreColor, uAstreUp
   // (élévation 0..1) ; la traînée pointe toujours vers l'astre visible.
+  // M-Peaufinage/B : 4 fanaux supplémentaires le long du quai (lumières
+  //   nocturnes du port). Tous reflétés par l'eau.
   const uniforms={
     uTime:      { value: 0 },
     uColor:     { value: new THREE.Color(0x35586b) },
     uGold:      { value: new THREE.Color(COLORSCRIPT.skyHorizon) },
     uFanal0:    { value: new THREE.Vector3(114,   1.2, -8) },
     uFanal1:    { value: new THREE.Vector3(114.5, 1.2, 14) },
+    uFanal2:    { value: new THREE.Vector3(112.5, 1.0, -28) },
+    uFanal3:    { value: new THREE.Vector3(113,   1.0,  32) },
+    uFanal4:    { value: new THREE.Vector3(112,   1.0, -56) },
+    uFanal5:    { value: new THREE.Vector3(113.5, 1.0,  60) },
     uAstreDir:  { value: new THREE.Vector2(-1, 0) },     // xz monde, normalisé
     uAstreColor:{ value: new THREE.Color(COLORSCRIPT.skyHorizon) },
     uAstreUp:   { value: 0.20 },                           // élévation [0..1]
@@ -4177,17 +4183,23 @@ function buildWaterEast(){
       varying vec3 vWorldPos;
       varying vec3 vNrm;
       void main(){
+        // M-Peaufinage/B : amplitudes des vagues + lisibles (×1.45 env)
+        //   pour que l'eau ne paraisse JAMAIS plate. Le surcoût reste nul
+        //   (mêmes opérations, juste des constantes plus hautes).
         vec3 p = position;
-        float w1 = sin(p.x*0.40 + uTime*0.65) * 0.10;
-        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.15;
-        float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.06;
-        p.z += w1 + w2 + w3;
+        float w1 = sin(p.x*0.40 + uTime*0.65) * 0.16;
+        float w2 = sin(p.y*0.18 + uTime*0.43) * 0.22;
+        float w3 = sin((p.x + p.y)*0.12 + uTime*0.90) * 0.10;
+        // petite oscillation chaotique haute fréquence pour casser la régularité
+        float w4 = sin(p.x*1.10 - p.y*0.70 + uTime*1.30) * 0.04;
+        p.z += w1 + w2 + w3 + w4;
         vec4 wp = modelMatrix * vec4(p, 1.0);
         vWorldPos = wp.xyz;
-        float dx = cos(p.x*0.40 + uTime*0.65)*0.40*0.10
-                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.06;
-        float dz = cos(p.y*0.18 + uTime*0.43)*0.18*0.15
-                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.06;
+        float dx = cos(p.x*0.40 + uTime*0.65)*0.40*0.16
+                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.10
+                 + cos(p.x*1.10 - p.y*0.70 + uTime*1.30)*1.10*0.04;
+        float dz = cos(p.y*0.18 + uTime*0.43)*0.18*0.22
+                 + cos((p.x+p.y)*0.12 + uTime*0.90)*0.12*0.10;
         vNrm = normalize(vec3(-dx, 1.0, -dz));
         gl_Position = projectionMatrix * viewMatrix * wp;
       }`,
@@ -4197,51 +4209,69 @@ function buildWaterEast(){
       uniform vec3  uGold;
       uniform vec3  uFanal0;
       uniform vec3  uFanal1;
+      uniform vec3  uFanal2;
+      uniform vec3  uFanal3;
+      uniform vec3  uFanal4;
+      uniform vec3  uFanal5;
       uniform vec2  uAstreDir;
       uniform vec3  uAstreColor;
       uniform float uAstreUp;
       uniform float uIsMoon;
       varying vec3  vWorldPos;
       varying vec3  vNrm;
+      // M-Peaufinage/B : helper réflexe-fanal (compacte le code, mêmes
+      //   coefficients que l'original 0.55 / 0.85 / 0.15).
+      float reflexFanal(vec2 wp, vec3 f, float phase){
+        float d = length(wp - f.xz);
+        return exp(-d*0.50) * (0.85 + 0.15*sin(uTime*phase + d*0.6));
+      }
       void main(){
         vec3 col = uColor;
-        // M7-soleil — TRAÎNÉE SPÉCULAIRE qui pointe vers l'astre dominant.
-        // L'astre est très loin → direction uniforme uAstreDir (xz).
-        // Le « centre » de la spéculaire est près de la berge (x≈110), la
-        // traînée s'étend ensuite VERS l'astre. Bande = perp/along.
+        // M-Peaufinage/B : TRAÎNÉE SPÉCULAIRE désormais visible EN TOUT
+        //   TEMPS (le gate horizonK ne descend plus jamais sous 0.30).
+        //   L'eau n'est plus jamais un aplat — l'astre y imprime toujours.
         vec2 wp2 = vWorldPos.xz - vec2(110.0, 0.0);
         vec2 dir = normalize(uAstreDir);
         vec2 perpD = vec2(-dir.y, dir.x);
         float along  = dot(wp2, dir);
         float across = dot(wp2, perpD);
-        // bande étroite, peak à along proche de 0 (près de la berge), s'évase loin
         float bandW = 4.0 + abs(along)*0.18;
         float streak = exp(-pow(across/bandW, 2.0)) * smoothstep(-3.0, 4.0, along);
-        // animation ondulante (faite tanguer la bande)
         float wave = sin(across*0.20 + uTime*0.45)*0.05 + sin(along*0.07 + uTime*0.30)*0.08;
         streak *= (0.85 + wave*0.6);
-        // intensité globale : pic à l'horizon (heure dorée / lune basse).
-        // M7-astres-bis : la traînée LUNAIRE est blanche-argent FRANCHE, bien
-        // visible — la lune brille et imprime sur l'eau.
         float horizonK = exp(-pow((uAstreUp - 0.12)*4.0, 2.0));
-        float strength = 0.55 + 0.30*uIsMoon;   // 0.55 jour, 0.85 nuit
-        // Pour la lune, on PUSHe vers le blanc-argent pur.
+        float strength = 0.75 + 0.35*uIsMoon;   // ↑ jour 0.75, nuit 1.10
         vec3 streakCol = mix(uAstreColor, vec3(0.92, 0.94, 1.00), uIsMoon * 0.55);
-        col += streakCol * streak * strength * (0.45 + 0.55*horizonK);
-        // teinte globale plus chaude côté astre (le jour) — froide la nuit
+        // ↑ floor : la traînée est visible MÊME quand l'astre est haut.
+        col += streakCol * streak * strength * (0.55 + 0.45*horizonK);
+        // teinte globale plus chaude côté astre (jour) — froide la nuit
         float warmth = clamp(dot(normalize(wp2 + vec2(0.001,0.0)), dir), 0.0, 1.0);
-        col = mix(col, streakCol, warmth * (0.35 - uIsMoon*0.10));
+        col = mix(col, streakCol, warmth * (0.40 - uIsMoon*0.10));
 
-        // FANAUX — reflets ondulants ponctuels (préservés, surtout visibles la nuit)
-        float d0 = length(vWorldPos.xz - uFanal0.xz);
-        float r0 = exp(-d0*0.55) * (0.85 + 0.15*sin(uTime*2.2 + d0*0.6));
-        col += vec3(1.0, 0.78, 0.42) * r0 * 0.70 * (0.30 + uIsMoon*0.70);
-        float d1 = length(vWorldPos.xz - uFanal1.xz);
-        float r1 = exp(-d1*0.55) * (0.85 + 0.15*sin(uTime*2.5 + d1*0.6));
-        col += vec3(1.0, 0.78, 0.42) * r1 * 0.70 * (0.30 + uIsMoon*0.70);
-        // écume sur les crêtes (normales fortement inclinées)
-        float foam = smoothstep(0.35, 0.85, (1.0 - vNrm.y) * 5.0);
-        col += vec3(0.42) * foam * 0.35;
+        // M-Peaufinage/B : BANDE DE REFLET DE SKYLINE/QUAI.
+        //   Une zone près de la berge (along < 8) reçoit un reflet diffus
+        //   ondulant des lumières chaudes du quai et de la skyline ouest.
+        //   Active à toute heure (modulée par le facteur nuit pour les
+        //   lampes émissives), réfléchit en bandes horizontales.
+        float quaiBand = exp(-along*along*0.012) * smoothstep(-2.0, 0.5, along);
+        float quaiWave = 0.55 + 0.45 * sin(across*0.30 + uTime*0.8);
+        vec3  quaiCol  = vec3(1.00, 0.72, 0.38);
+        col += quaiCol * quaiBand * quaiWave * (0.18 + 0.45*uIsMoon);
+
+        // FANAUX — 6 lumières le long du quai (au lieu de 2 seulement).
+        //   Reflets ondulants ponctuels qui montent en intensité la nuit.
+        float r0 = reflexFanal(vWorldPos.xz, uFanal0, 2.2);
+        float r1 = reflexFanal(vWorldPos.xz, uFanal1, 2.5);
+        float r2 = reflexFanal(vWorldPos.xz, uFanal2, 2.0);
+        float r3 = reflexFanal(vWorldPos.xz, uFanal3, 2.7);
+        float r4 = reflexFanal(vWorldPos.xz, uFanal4, 2.3);
+        float r5 = reflexFanal(vWorldPos.xz, uFanal5, 2.6);
+        float rSum = r0 + r1 + r2 + r3 + r4 + r5;
+        col += vec3(1.0, 0.78, 0.42) * rSum * 0.50 * (0.30 + uIsMoon*0.70);
+
+        // écume sur les crêtes (normales inclinées) — un peu plus marquée
+        float foam = smoothstep(0.30, 0.85, (1.0 - vNrm.y) * 5.0);
+        col += vec3(0.46) * foam * 0.42;
         gl_FragColor = vec4(col, 0.92);
       }`,
   });
