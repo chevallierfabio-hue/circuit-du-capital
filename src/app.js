@@ -5192,7 +5192,8 @@ const CinemaMode = (function(){
   let _t = 0, _dur = 1;
   let _pathCam = null, _pathTar = null;
   let _title = '', _onEnd = null;
-  let _timeScale = 1;
+  let _timeScaleTarget = 1;
+  let _timeScale = 1;                  // valeur lissée (entrée/sortie progressives)
   let _fadeIn = 0.6, _fadeOut = 0.6;   // s — montée/descente des effets
   let _fov = null;                     // FOV ciblé pendant la séquence (null = conserver)
   let _baseGrain = 0.025;
@@ -5202,6 +5203,9 @@ const CinemaMode = (function(){
   // scratch
   const _tmpP = new THREE.Vector3();
   const _tmpT = new THREE.Vector3();
+  // Pour ramener proprement le ralenti à 1 quand la séquence se termine
+  // (skip ou naturel) : on continue de lisser pendant ~0.5 s après end().
+  let _coolDownT = 0;
 
   function _ensureDom(){
     if(_domReady) return;
@@ -5273,8 +5277,12 @@ const CinemaMode = (function(){
     _t = 0;
     _dur = Math.max(0.5, spec.duration || 6.5);
     _title = spec.title || '';
-    _timeScale = (spec.timeScale != null) ? spec.timeScale : 0.35;
+    _timeScaleTarget = (spec.timeScale != null) ? spec.timeScale : 0.35;
+    // _timeScale n'est PAS remis à 1 brutalement : on part de sa valeur
+    //   courante (probablement 1 sauf rejouage rapide) et on lisse vers
+    //   _timeScaleTarget pendant le fadeIn — entrée parfaitement douce.
     _onEnd = spec.onEnd || null;
+    _coolDownT = 0;
     _fov = (spec.fov != null) ? spec.fov : null;
     // splines Catmull-Rom (centripetal → pas de boucles en virage), closed=false.
     _pathCam = new THREE.CatmullRomCurve3(spec.camPath, false, 'centripetal', 0.5);
@@ -5305,13 +5313,24 @@ const CinemaMode = (function(){
       bokehPass.uniforms.aperture.value = _baseAperture;
       bokehPass.uniforms.maxblur.value  = _baseMaxBlur;
     }
-    _timeScale = 1;
+    // Le ralenti REMONTE en douceur vers 1 (cf. _coolDownT dans update).
+    _timeScaleTarget = 1;
+    _coolDownT = 0.5;     // s — fenêtre de lissage post-end()
     const cb = _onEnd; _onEnd = null;
     if(cb){ try{ cb(); }catch(_){} }
   }
 
   function update(rawDt){
-    if(!active) return;
+    // Lissage du ralenti même après end() : descente progressive vers 1.
+    if(!active){
+      if(_coolDownT > 0){
+        _coolDownT = Math.max(0, _coolDownT - rawDt);
+        _timeScale += (1 - _timeScale) * Math.min(1, rawDt * 6);
+      } else {
+        _timeScale = 1;
+      }
+      return;
+    }
     _t += rawDt;
     if(_t >= _dur){ end(); return; }
     // ease-in-out global sur la spline
@@ -5320,7 +5339,9 @@ const CinemaMode = (function(){
     _pathCam.getPoint(e, _tmpP);
     _pathTar.getPoint(e, _tmpT);
     if(typeof camera !== 'undefined' && camera){
-      camera.position.lerp(_tmpP, 0.30);     // léger lissage pour éviter toute secousse
+      // M-Cinéma Lot C : lerp 0.18 (contemplatif) au lieu de 0.30 → entrée
+      //   plus douce depuis la position courante de la caméra.
+      camera.position.lerp(_tmpP, 0.18);
       camera.lookAt(_tmpT);
       if(_fov != null){
         if(Math.abs(camera.fov - _fov) > 0.05){
@@ -5333,6 +5354,8 @@ const CinemaMode = (function(){
     let envel = 1;
     if(_t < _fadeIn) envel = _t / _fadeIn;
     else if(_t > _dur - _fadeOut) envel = Math.max(0, (_dur - _t) / _fadeOut);
+    // Time-scale : lissé vers la cible (entrée) et vers 1 (sortie).
+    _timeScale += (_timeScaleTarget - _timeScale) * Math.min(1, rawDt * 4);
     // DoF — focus = distance camera → cible (sujet) ; aperture + maxblur montent.
     if(bokehPass && bokehPass.enabled){
       const dist = camera.position.distanceTo(_tmpT);
@@ -15631,14 +15654,16 @@ function loop(){
   requestAnimationFrame(loop);
   const rawDt=Math.min(0.05,clock.getDelta()); t+=rawDt;
   // M-Cinéma — pendant une séquence : le temps de simulation est ralenti
-  //   (timeScale par défaut 0.35). On en propage un dt 'sim' pour les
-  //   systèmes liés à la simulation, et on garde rawDt pour la caméra
-  //   cinéma et les particules d'atmosphère (qui doivent rester fluides).
-  const cinemaActive = (typeof CinemaMode!=='undefined') && CinemaMode.isActive();
-  const tScale = cinemaActive ? CinemaMode.getTimeScale() : 1;
-  const dt = rawDt * tScale;
+  //   (timeScale par défaut 0.35). CinemaMode gère le LISSAGE entrée/sortie
+  //   du timeScale (lerp 4 Hz pendant active + 6 Hz pendant ~0.5 s après
+  //   end()) — on lit donc getTimeScale() en permanence pour transitions
+  //   parfaitement continues. rawDt préservé pour la caméra cinéma et
+  //   les particules d'atmosphère.
   CinemaMode.update(rawDt);   // moteur cinéma (caméra + DoF + grain)
   if(typeof CinemaSequences !== 'undefined') CinemaSequences.tick(rawDt);
+  const cinemaActive = (typeof CinemaMode!=='undefined') && CinemaMode.isActive();
+  const tScale = (typeof CinemaMode!=='undefined') ? CinemaMode.getTimeScale() : 1;
+  const dt = rawDt * tScale;
   _coachTick+=dt; if(_coachTick>0.35){ _coachTick=0; tutorialCoachRefresh(); }
   // Pendant le cinéma le chariot reste immobile (les inputs sont ignorés
   // par Vehicle.speed=0 et le timeScale réduit toute dérive éventuelle).
