@@ -4533,7 +4533,8 @@ function _M6_buildEstran(){
   m.receiveShadow=true; scene.add(m);
 }
 function _M6_buildDistantSails(){
-  // 3 sprites brumeux côté mer : 2 voiliers + 1 phare (très loin, fondus dans le fog).
+  // 2 sprites brumeux côté mer : voiliers distants (phare supprimé en M13b
+  //   pour laisser l'horizon-eau vide de toute silhouette de bâtiment).
   const mkSailTex=()=>{
     const c=document.createElement('canvas'); c.width=128; c.height=96;
     const x=c.getContext('2d');
@@ -4555,30 +4556,13 @@ function _M6_buildDistantSails(){
     x.fillRect(63, 10, 2, 60);
     return new THREE.CanvasTexture(c);
   };
-  const mkLighthouseTex=()=>{
-    const c=document.createElement('canvas'); c.width=64; c.height=128;
-    const x=c.getContext('2d');
-    x.clearRect(0,0,64,128);
-    // base
-    x.fillStyle='rgba(60,52,42,0.85)';
-    x.fillRect(22, 100, 20, 18);
-    // tour
-    x.fillStyle='rgba(200,190,170,0.85)';
-    x.beginPath();
-    x.moveTo(28, 100); x.lineTo(36, 100); x.lineTo(38, 30); x.lineTo(26, 30); x.closePath(); x.fill();
-    // bande
-    x.fillStyle='rgba(180,40,28,0.85)'; x.fillRect(26, 60, 12, 14);
-    // lanterne (émissive)
-    x.fillStyle='rgba(255,220,170,1.0)';
-    x.fillRect(24, 18, 16, 12);
-    // toit
-    x.fillStyle='rgba(40,32,22,0.85)';
-    x.beginPath(); x.moveTo(22, 18); x.lineTo(42, 18); x.lineTo(32, 6); x.closePath(); x.fill();
-    return new THREE.CanvasTexture(c);
-  };
   const sailTex=mkSailTex();
-  const lhTex=mkLighthouseTex();
-  // 2 voiliers, distance 220 et 250, hauteur ~6m
+  // 2 voiliers, distance 220 et 250, hauteur ~6m. M13b — le phare lointain
+  //   (silhouette de bâtiment maritime statique) est SUPPRIMÉ : aucune
+  //   silhouette côté eau. Les voiliers restent — ce sont des navires,
+  //   éléments maritimes légitimes (le shader d'eau s'occupe seul des
+  //   reflets ; rien à enlever côté reflet puisqu'aucun reflet de phare
+  //   n'était imprimé dans le shader).
   const sail1=new THREE.Sprite(new THREE.SpriteMaterial({
     map:sailTex, color:0xffffff, transparent:true, opacity:0.75,
     depthWrite:false, fog:true,
@@ -4593,15 +4577,7 @@ function _M6_buildDistantSails(){
   sail2.scale.set(11, 8, 1);
   sail2.position.set(210, 5, 60);
   scene.add(sail2);
-  // phare lointain
-  const lh=new THREE.Sprite(new THREE.SpriteMaterial({
-    map:lhTex, color:0xffffff, transparent:true, opacity:0.85,
-    depthWrite:false, fog:true,
-  }));
-  lh.scale.set(8, 16, 1);
-  lh.position.set(218, 8, 130);
-  scene.add(lh);
-  _M6_distantSails.push(sail1, sail2, lh);
+  _M6_distantSails.push(sail1, sail2);
 }
 function buildClosingHorizon(){
   _M6_buildHillsBelt();
@@ -13493,11 +13469,16 @@ function buildHorizon(){
 
   // ------------- COUCHES de SKYLINE ---------------------
   // construit une couche de skyline sur un cercle de rayon R.
+  //   M13b — côté EAU (x > 105, dans la fourchette z de l'eau) : aucune
+  //   silhouette. L'horizon doit se perdre dans la brume au-dessus de
+  //   l'eau. Les couches terre (ouest/nord/sud) restent intactes.
   const buildLayer=(R, count, hMax, depth, minW, maxW, matBody, matChim, matDome)=>{
     for(let i=0;i<count;i++){
       const a=(i/count)*Math.PI*2 + (rnd()-0.5)*0.1;
       const x=Math.sin(a)*R+(rnd()-0.5)*10;
       const z=Math.cos(a)*R+(rnd()-0.5)*10;
+      // côté eau : pas de skyline.
+      if(x > 105 && z > -210 && z < 210) continue;
       const g=new THREE.Group();
       g.position.set(x,0,z);
       g.rotation.y=Math.atan2(x,z);
@@ -13522,12 +13503,13 @@ function buildHorizon(){
 
   // Quelques grues/échafaudages industriels (silhouettes nettes — rappel
   //   du caractère industriel des autres villes). Placées sur le côté
-  //   est/nord-est (industriel) en priorité.
+  //   TERRE uniquement (ouest/nord-ouest). Côté eau : aucune silhouette
+  //   industrielle — l'horizon reste vide jusqu'à la brume (M13b).
   const craneSpots = [
-    [ 165,  60], [ 185, -40], [ 130, 120], [-160, 110], [ 80, 180], [-90, 175],
+    [-160, 110], [ 80, 180], [-90, 175],
   ];
   for(let i=0;i<craneSpots.length;i++){
-    buildCrane(craneSpots[i][0], craneSpots[i][1], mat_mid, i<3);
+    buildCrane(craneSpots[i][0], craneSpots[i][1], mat_mid, i<2);
   }
 
   // 4-5 colonnes de fumée sur cheminées lointaines.
