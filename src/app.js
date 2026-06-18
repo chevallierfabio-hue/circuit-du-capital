@@ -28,6 +28,7 @@ import { EffectComposer }    from 'three/addons/postprocessing/EffectComposer.js
 import { RenderPass }        from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass }   from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass }        from 'three/addons/postprocessing/ShaderPass.js';
+import { BokehPass }         from 'three/addons/postprocessing/BokehPass.js';
 import { CopyShader }        from 'three/addons/shaders/CopyShader.js';
 import { LuminosityHighPassShader } from 'three/addons/shaders/LuminosityHighPassShader.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -35,7 +36,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // Miroir THREE = core + addons. Object.assign copie les références ; les
 // constructeurs (Mesh, Material…) restent ceux du module three.
 const THREE = Object.assign({}, THREE_BASE, {
-  EffectComposer, RenderPass, UnrealBloomPass, ShaderPass,
+  EffectComposer, RenderPass, UnrealBloomPass, ShaderPass, BokehPass,
   CopyShader, LuminosityHighPassShader,
 });
 
@@ -5123,6 +5124,10 @@ const CameraController = {
   update(){
     if(typeof IntroCinematic!=='undefined' && IntroCinematic.active){ IntroCinematic.update(); return; }
     if(typeof CycleCinematic!=='undefined' && CycleCinematic.active){ CycleCinematic.update(); return; }
+    // M-Cinéma : pendant une séquence scriptée, le moteur cinéma possède la
+    // caméra entièrement (positions + lookAt par spline). On rend la main au
+    // mode M-POV courant dès que la séquence se termine ou que le joueur skip.
+    if(typeof CinemaMode!=='undefined' && CinemaMode.isActive()){ return; }
     const v=Vehicle;
     const cfg=CAM_PRESETS[CAM_MODE];
     const sp=Math.min(1, Math.abs(v.speed)/26);
@@ -5154,6 +5159,185 @@ const CameraController = {
     _M_POV_updateTargetIndicator();
   }
 };
+
+/* =====================================================================
+   M-Cinéma — MOTEUR DE SÉQUENCE CONTEMPLATIVE.
+   Prend la main sur la caméra pour un travelling scripté par splines
+   Catmull-Rom (camP[] + targetP[] + durée + titre). Pendant la séquence :
+     • caméra suivie le long des splines (ease-in-out global, lissage),
+     • barres letterbox haut/bas en fondu (CSS),
+     • HUD de jeu masqué en fondu (class 'cinema-on' sur body),
+     • temps de simulation ralenti (timeScale réglable, défaut 0.35),
+     • DoF prononcé (BokehPass aperture/maxblur montés ; focus = sujet),
+     • grain renforcé (GradeShader.uGrain ×2.5).
+   ESC ou clic = skip ; retour au gameplay PROPRE (caméra rendue au M-POV
+   courant, HUD restauré, time scale = 1, DoF/grain remis à leurs niveaux
+   de jeu).
+   LECTURE SEULE de la simulation. Pas d'écriture, pas de mutation d'état.
+   ===================================================================== */
+const CinemaMode = (function(){
+  let active = false;
+  let _t = 0, _dur = 1;
+  let _pathCam = null, _pathTar = null;
+  let _title = '', _onEnd = null;
+  let _timeScale = 1;
+  let _fadeIn = 0.6, _fadeOut = 0.6;   // s — montée/descente des effets
+  let _fov = null;                     // FOV ciblé pendant la séquence (null = conserver)
+  let _baseGrain = 0.025;
+  let _baseFocus = 34.0, _baseAperture = 0.00002, _baseMaxBlur = 0.004;
+  let _domReady = false;
+  let _topBar=null, _bottomBar=null, _titleEl=null;
+  // scratch
+  const _tmpP = new THREE.Vector3();
+  const _tmpT = new THREE.Vector3();
+
+  function _ensureDom(){
+    if(_domReady) return;
+    // INJECTION CSS (une seule fois)
+    const css = document.createElement('style');
+    css.id = 'mcinema-style';
+    css.textContent = `
+      .mcinema-letterbox {
+        position: fixed; left: 0; right: 0;
+        background: #000; pointer-events: none; z-index: 50;
+        opacity: 0; transition: opacity .6s ease;
+      }
+      .mcinema-letterbox.top    { top: 0;    height: 12vh; }
+      .mcinema-letterbox.bottom { bottom: 0; height: 12vh; }
+      body.mcinema-on .mcinema-letterbox { opacity: 1; }
+      body.mcinema-on .hud,
+      body.mcinema-on .crisisTag,
+      body.mcinema-on #pov-target-indicator,
+      body.mcinema-on #circuit-panel,
+      body.mcinema-on .panel { opacity: 0; pointer-events: none; transition: opacity .6s ease; }
+      .mcinema-title {
+        position: fixed; left: 0; right: 0; bottom: 14vh;
+        text-align: center; z-index: 51;
+        color: #e9ddc6; opacity: 0; transition: opacity .8s ease;
+        font: 600 22px/1.4 "Cormorant Garamond", "Zilla Slab", serif;
+        letter-spacing: 0.06em; text-shadow: 0 2px 8px rgba(0,0,0,0.85);
+        pointer-events: none;
+      }
+      body.mcinema-on .mcinema-title { opacity: 0.92; }
+      .mcinema-skip {
+        position: fixed; right: 14px; bottom: 13vh; z-index: 52;
+        color: #c9b78c; opacity: 0; transition: opacity .8s ease;
+        font: 500 11px/1 "IBM Plex Mono", monospace; letter-spacing: 0.10em;
+        pointer-events: none;
+      }
+      body.mcinema-on .mcinema-skip { opacity: 0.65; }
+    `;
+    document.head.appendChild(css);
+    _topBar    = document.createElement('div'); _topBar.className='mcinema-letterbox top';
+    _bottomBar = document.createElement('div'); _bottomBar.className='mcinema-letterbox bottom';
+    _titleEl   = document.createElement('div'); _titleEl.className='mcinema-title';
+    const skipEl = document.createElement('div'); skipEl.className='mcinema-skip'; skipEl.textContent='ESC / clic — passer';
+    document.body.appendChild(_topBar);
+    document.body.appendChild(_bottomBar);
+    document.body.appendChild(_titleEl);
+    document.body.appendChild(skipEl);
+    // Skip handlers — uniquement ACTIFS pendant le mode cinéma.
+    window.addEventListener('keydown', e => {
+      if(active && (e.code === 'Escape' || e.code === 'Space')){ e.preventDefault(); skip(); }
+    });
+    window.addEventListener('mousedown', () => { if(active) skip(); }, true);
+    _domReady = true;
+  }
+
+  /* spec :
+     { camPath:   [Vector3, ...]   ≥ 2 points
+       targetPath:[Vector3, ...]   même cardinal (ou 1 cible fixe)
+       duration:  Number (s)       défaut 6.5
+       title:     String           ligne de bas d'écran (peut être '')
+       timeScale: Number 0..1      défaut 0.35
+       fov:       Number           FOV cible pendant la séquence (null = conserver)
+       onEnd:     Function         appelée à end() (skip ou fin naturelle) }
+  */
+  function begin(spec){
+    if(active) return false;
+    _ensureDom();
+    if(!spec || !spec.camPath || spec.camPath.length < 2) return false;
+    active = true;
+    _t = 0;
+    _dur = Math.max(0.5, spec.duration || 6.5);
+    _title = spec.title || '';
+    _timeScale = (spec.timeScale != null) ? spec.timeScale : 0.35;
+    _onEnd = spec.onEnd || null;
+    _fov = (spec.fov != null) ? spec.fov : null;
+    // splines Catmull-Rom (centripetal → pas de boucles en virage), closed=false.
+    _pathCam = new THREE.CatmullRomCurve3(spec.camPath, false, 'centripetal', 0.5);
+    let targetPts = spec.targetPath;
+    if(!targetPts || targetPts.length < 2){
+      // pas de spline cible → cible fixe répétée (compatible avec getPoint)
+      const fixed = (targetPts && targetPts[0]) || new THREE.Vector3(0,0,0);
+      targetPts = [fixed.clone(), fixed.clone()];
+    }
+    _pathTar = new THREE.CatmullRomCurve3(targetPts, false, 'centripetal', 0.5);
+    // Bascule l'UI en mode cinéma — CSS s'occupe des fondus.
+    document.body.classList.add('mcinema-on');
+    if(_titleEl) _titleEl.textContent = _title;
+    return true;
+  }
+
+  function skip(){ if(active) end(); }
+
+  function end(){
+    if(!active) return;
+    active = false;
+    document.body.classList.remove('mcinema-on');
+    if(_titleEl) _titleEl.textContent = '';
+    // Restaure les uniforms post-prod à leurs niveaux de jeu.
+    if(gradePass) gradePass.uniforms.uGrain.value = _baseGrain;
+    if(bokehPass){
+      bokehPass.uniforms.focus.value    = _baseFocus;
+      bokehPass.uniforms.aperture.value = _baseAperture;
+      bokehPass.uniforms.maxblur.value  = _baseMaxBlur;
+    }
+    _timeScale = 1;
+    const cb = _onEnd; _onEnd = null;
+    if(cb){ try{ cb(); }catch(_){} }
+  }
+
+  function update(rawDt){
+    if(!active) return;
+    _t += rawDt;
+    if(_t >= _dur){ end(); return; }
+    // ease-in-out global sur la spline
+    const k = Math.min(1, _t / _dur);
+    const e = k < 0.5 ? 2*k*k : 1 - Math.pow(-2*k + 2, 2)/2;
+    _pathCam.getPoint(e, _tmpP);
+    _pathTar.getPoint(e, _tmpT);
+    if(typeof camera !== 'undefined' && camera){
+      camera.position.lerp(_tmpP, 0.30);     // léger lissage pour éviter toute secousse
+      camera.lookAt(_tmpT);
+      if(_fov != null){
+        if(Math.abs(camera.fov - _fov) > 0.05){
+          camera.fov += (_fov - camera.fov) * 0.05;
+          camera.updateProjectionMatrix();
+        }
+      }
+    }
+    // facteur de transition : 0 au début → 1 après fadeIn, redescend dans fadeOut.
+    let envel = 1;
+    if(_t < _fadeIn) envel = _t / _fadeIn;
+    else if(_t > _dur - _fadeOut) envel = Math.max(0, (_dur - _t) / _fadeOut);
+    // DoF — focus = distance camera → cible (sujet) ; aperture + maxblur montent.
+    if(bokehPass && bokehPass.enabled){
+      const dist = camera.position.distanceTo(_tmpT);
+      bokehPass.uniforms.focus.value    = dist;
+      bokehPass.uniforms.aperture.value = _baseAperture + (0.00018 - _baseAperture) * envel;
+      bokehPass.uniforms.maxblur.value  = _baseMaxBlur  + (0.030    - _baseMaxBlur ) * envel;
+    }
+    // Grain renforcé
+    if(gradePass) gradePass.uniforms.uGrain.value = _baseGrain * (1 + 1.5 * envel);
+  }
+
+  function isActive(){ return active; }
+  function getTimeScale(){ return _timeScale; }
+
+  return { begin, skip, end, update, isActive, getTimeScale };
+})();
+if(typeof window !== 'undefined') window.__cinema = CinemaMode;
 
 /* M-POV — INDICATEUR DE BORD D'ÉCRAN pour l'objectif.
    Visible uniquement en mode 'shoulder' ou 'immersion' (la vue Carte
@@ -5253,6 +5437,31 @@ addEventListener('keydown',e=>{ const k=KEYMAP[e.code]; if(k){Input[k]=true;e.pr
   if(e.code==='KeyB'){ AmbientSound.start(); AmbientSound.toggle(); }
   if(e.code==='KeyE'){ e.preventDefault(); if(currentZone) interactZone(currentZone); }
   if(e.code==='Backquote'){ e.preventDefault(); setQA(!QA_MODE); }
+  // M-Cinéma — déclencheur de test (KeyN) : lance une courte séquence de
+  //   travelling contemplatif autour de la ville, point de focus = chariot.
+  if(e.code==='KeyN' && typeof CinemaMode !== 'undefined' && !CinemaMode.isActive()){
+    e.preventDefault();
+    const vx = Vehicle.pos.x, vz = Vehicle.pos.z;
+    CinemaMode.begin({
+      camPath: [
+        new THREE.Vector3(vx - 28, 4.5, vz + 22),
+        new THREE.Vector3(vx - 10, 9.0, vz + 16),
+        new THREE.Vector3(vx + 12, 11.0, vz +  8),
+        new THREE.Vector3(vx + 26, 8.0, vz -  6),
+      ],
+      targetPath: [
+        new THREE.Vector3(vx, 1.6, vz),
+        new THREE.Vector3(vx, 1.8, vz),
+        new THREE.Vector3(vx, 2.0, vz),
+        new THREE.Vector3(vx, 1.8, vz),
+      ],
+      duration: 6.5,
+      title: 'La Veille du Capital',
+      timeScale: 0.30,
+      fov: 48,
+    });
+    pushLog('Cinéma', 'Séquence de test — ESC ou clic pour passer.', 'plain');
+  }
   // M7-soleil — accélération du temps : ',' ralentit, '.' accélère, '/' = 1.0,
   // ';' (Semicolon) pour avancer instantanément +5% du cycle (rapide pour tester).
   if(e.code==='Comma'){ TIME_SPEED = Math.max(0.5, TIME_SPEED * 0.5); pushLog('Cycle','×'+TIME_SPEED.toFixed(2)+' temps.','plain'); }
@@ -8285,6 +8494,21 @@ export function init(opts={}){
       composer.addPass(new THREE.RenderPass(scene,camera));
       bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.55,0.4,0.82);
       composer.addPass(bloomPass);
+      // M-Cinéma — DoF (BokehPass) inséré APRÈS le bloom, AVANT le grade.
+      //   Subtil en jeu (focus lointain, maxblur bas) ; prononcé en mode
+      //   cinéma (CinemaMode le pilote en fonction du sujet de la séquence).
+      //   Désactivable : si BokehPass absent ou en qualité 'low', bokehPass
+      //   reste null et la chaîne saute simplement la passe.
+      if(typeof THREE.BokehPass!=='undefined'){
+        try{
+          bokehPass=new THREE.BokehPass(scene, camera, {
+            focus:    34.0,      // distance focale par défaut (zones de jeu lointaines nettes)
+            aperture: 0.00002,   // ouverture très faible → flou imperceptible en jeu
+            maxblur:  0.004,     // blur max très bas par défaut
+          });
+          composer.addPass(bokehPass);
+        }catch(err){ console.warn('[M-Cinéma] BokehPass indisponible :', err&&err.message||err); bokehPass=null; }
+      }
       if(typeof THREE.ShaderPass!=='undefined'){
         gradePass=new THREE.ShaderPass(GradeShader);
         gradePass.uniforms.uTime.value=0;
@@ -9525,6 +9749,7 @@ let sunLight=null, hemiLight=null;   // v57 : poignées du cycle de lumière
 let nightAmbient=null;               // M7 : floor warm nocturne (sol lisible la nuit)
 let moonLight=null;                  // M7-soleil : directionnelle de la lune (bleu froid)
 let composer=null, bloomPass=null, gradePass=null;   // v66/M1 : bloom + GradePass (null si bypass)
+let bokehPass=null;                                  // M-Cinéma : DoF (BokehPass) entre bloom et grade
 
 /* M1 — GradeShader : ShaderPass terminal, trois effets dans un seul shader.
    (a) split-tone : ombres tirées vers uShadowTint, hautes lumières vers
@@ -9610,6 +9835,9 @@ function applyRenderQuality(q){
   COMPOSER_BYPASS = (q === 'low');
   const grain = (q === 'high') ? 0.025 : 0.0;
   if(gradePass){ gradePass.uniforms.uGrain.value = grain; }
+  // M-Cinéma — DoF : désactivé en Basse (économise une render-pass de
+  //   profondeur). En Moyenne/Haute il reste actif mais subtil par défaut.
+  if(bokehPass){ bokehPass.enabled = (q !== 'low'); }
   let shadowsOn = false, shadowSize = 0;
   if(typeof renderer !== 'undefined' && renderer){
     if(q === 'low'){
@@ -15201,9 +15429,19 @@ function renderFormationPanel(){
 let _coachTick=0;
 function loop(){
   requestAnimationFrame(loop);
-  const dt=Math.min(0.05,clock.getDelta()); t+=dt;
+  const rawDt=Math.min(0.05,clock.getDelta()); t+=rawDt;
+  // M-Cinéma — pendant une séquence : le temps de simulation est ralenti
+  //   (timeScale par défaut 0.35). On en propage un dt 'sim' pour les
+  //   systèmes liés à la simulation, et on garde rawDt pour la caméra
+  //   cinéma et les particules d'atmosphère (qui doivent rester fluides).
+  const cinemaActive = (typeof CinemaMode!=='undefined') && CinemaMode.isActive();
+  const tScale = cinemaActive ? CinemaMode.getTimeScale() : 1;
+  const dt = rawDt * tScale;
+  CinemaMode.update(rawDt);   // moteur cinéma (caméra + DoF + grain)
   _coachTick+=dt; if(_coachTick>0.35){ _coachTick=0; tutorialCoachRefresh(); }
-  Vehicle.update(dt,Input);
+  // Pendant le cinéma le chariot reste immobile (les inputs sont ignorés
+  // par Vehicle.speed=0 et le timeScale réduit toute dérive éventuelle).
+  Vehicle.update(dt, cinemaActive ? {fwd:false,back:false,left:false,right:false} : Input);
   CameraController.update();
   handleZones(dt);
   cooldownReal=Math.max(0,cooldownReal-dt);
