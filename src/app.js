@@ -7596,6 +7596,7 @@ function birthOfCapital(){
   flashTimer=0.9;                             // éclat à l'écran
   ['Banque','Usine','Marché de vente'].forEach(n=>fxPing(n)); // le circuit s'éveille
   afterConcept=()=>{ renderQuest(); renderCircuitBar(); moveTargetMarker(); updateHUD(); updateVilleBadge(); tutorialCoachRefresh(true); };
+  Tuto.applyBodyClass();               // bascule phase-precapital → phase-circuit dès la naissance du capital
   showConcept(BIRTH_SCREEN);           // "Le capital est né" (onClose: unlockVoile)
 }
 
@@ -8059,6 +8060,8 @@ const Tuto={
   _last:-1,
   applyBodyClass(){
     const ph=this.phase();
+    document.body.classList.toggle('phase-precapital', gamePhase==='precapital');
+    document.body.classList.toggle('phase-circuit',    gamePhase!=='precapital');
     if(ph===this._last) return;
     document.body.classList.remove('tuto-p0','tuto-p1','tuto-p2','tuto-p3','tuto-p4','tuto-p5');
     document.body.classList.add('tuto-p'+ph);

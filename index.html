@@ -132,7 +132,8 @@
   /* ---- panneau Objectif actuel (sous l'aide clavier, à droite) ---- */
   .quest{position:fixed;top:172px;right:14px;z-index:10;width:218px;
     background:rgba(233,221,198,.94);border:1.5px solid var(--encre);
-    border-left:5px solid var(--rouge);box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:10px 12px}
+    border-left:5px solid var(--rouge);box-shadow:3px 4px 0 rgba(36,31,23,.25);padding:10px 12px;
+    display:flex;flex-direction:column}
   .quest .qt{font-family:"Zilla Slab",serif;font-size:11px;letter-spacing:1px;text-transform:uppercase;
     border-bottom:2px solid var(--encre);padding-bottom:4px;margin-bottom:6px;display:flex;justify-content:space-between}
   .quest .qt b{color:var(--rouge)}
@@ -733,6 +734,14 @@
 
   /* v47 — densité d'interface pilotée par la phase tutorielle (body.tuto-pN) */
   body.tuto-p0 .quest, body.tuto-p0 .log, body.tuto-p0 .villebadge{opacity:.25;pointer-events:none}
+  /* Entrée épurée : pendant tout le précapital, seul le coach guide.
+     Le HUD éclôt en phase circuit (la lumière, c'est le capital). */
+  #hud, #circuit, .quest, .villebadge, .log{ transition:opacity .9s ease; }
+  body.phase-precapital #hud,
+  body.phase-precapital #circuit,
+  body.phase-precapital .quest,
+  body.phase-precapital .villebadge,
+  body.phase-precapital .log{ opacity:0; pointer-events:none; }
   body.tuto-p5 .how-actions{display:none!important}
   body.tuto-p5 #tutorial-coach{display:none!important}
   /* v46 — l'interface pédagogique ne reste pas après le tutoriel */
