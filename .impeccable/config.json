@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "clipped-overflow-container",
+        "value": "*",
+        "files": [
+          "index.html"
+        ],
+        "createdAt": "2026-09-01T15:10:19.742Z",
+        "reason": "Claude: jeu WebGL plein écran. overflow:hidden sur html,body est le garde-fou du canvas ; tous les panneaux sont en position:fixed. Mesuré dans le navigateur : 0 élément dépasse le viewport, document.scrollWidth/Height == viewport (1280x720). Rien n'est réellement rogné. Portée volontairement large (toute la règle sur ce fichier) car le détecteur n'expose aucune valeur pour cette règle."
+      },
+      {
+        "rule": "kicker-above-heading",
+        "value": "*",
+        "files": [
+          "index.html"
+        ],
+        "createdAt": "2026-09-01T15:10:38.129Z",
+        "reason": "Claude: le cartouche est le motif de document d'epoque de la charte, systematique (.cstamp/.ustamp/.distamp/.cpstamp) et anterieur a ce travail ; le troisieme cas n'est pas un cartouche mais la formule A->M->Ft->P->M'->A', contenu central du jeu. Portee large (toute la regle sur ce fichier) car le stockage normalise les valeurs et l'appariement exact echoue."
+      }
+    ]
+  }
+}

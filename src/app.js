@@ -42,7 +42,12 @@ const THREE = Object.assign({}, THREE_BASE, {
 
 // Compensation BRDF moderne (cf. en-tête).
 const LIGHT_GAIN = Math.PI;
-const physI = (v) => v * LIGHT_GAIN;
+// M8 — LUMINOSITÉ GLOBALE. Un seul curseur traverse TOUTES les sources
+// (soleil, lune, hémisphérique, ambiantes, réverbères, forges) parce que
+// tout passe par physI. Remonter ici plutôt qu'au cas par cas garde les
+// rapports d'intensité de la DA intacts : c'est la scène entière qui monte.
+const BRIGHTNESS = 1.42;
+const physI = (v) => v * LIGHT_GAIN * BRIGHTNESS;
 
 // CanvasTexture par défaut en sRGB.
 (function patchCanvasTextureColorSpace(){
@@ -63,7 +68,9 @@ const physI = (v) => v * LIGHT_GAIN;
 // les MeshStandardMaterial respirent la lumière du ciel. hemiLight est
 // compensé à la baisse plus bas (0.45 → ajustable) plutôt que de redescendre
 // l'IBL si une zone semble trop claire.
-export const ENV_INTENSITY = 0.7;
+// M8 — 0.7 → 0.92 : l'IBL porte davantage l'ambiance, ce qui déboucne les
+// faces non exposées au soleil sans avoir à écraser le contraste directionnel.
+export const ENV_INTENSITY = 0.92;
 
 /* ===== MOTEUR ÉCONOMIQUE (modules sim, identiques au fichier moteur) ===== */
 /* =====================================================================
@@ -668,6 +675,10 @@ function runCycle(){
      && !(typeof anyModalOpen==='function' && anyModalOpen())){
     CinemaSequences.playCycle();
   }
+  // M9 — le cycle est l'unité de progression du jeu : c'est le point de
+  // sauvegarde automatique naturel. Silencieux (pas de ligne de journal) —
+  // le joueur n'a pas à être interrompu à chaque tour.
+  if(typeof SaveGame!=='undefined') SaveGame.autosave();
 }
 
 // MiniCircuit garde son nom (la 3D l'appelle deja) mais PILOTE le vrai moteur.
@@ -6325,7 +6336,7 @@ const CinemaSequences = (function(){
     return (candidates[0].weight > 0.3) ? candidates[0].zone : null;
   }
 
-  function playIntro(){
+  function playIntro(onEnd){
     if(_introPlayed) return false;
     if(typeof CinemaMode==='undefined' || CinemaMode.isActive()) return false;
     _introPlayed = true;
@@ -6353,6 +6364,7 @@ const CinemaSequences = (function(){
       title: 'La Veille du Capital',
       timeScale: 0.30,
       fov: 50,
+      onEnd: (typeof onEnd==='function') ? onEnd : null,
     });
   }
 
@@ -6433,20 +6445,12 @@ const CinemaSequences = (function(){
   }
   */
 
-  let _introTimer = 0;
   // Hook frame-by-frame :
-  //   • intro lancée une seule fois, ~2 s après que l'overlay HTML
-  //     IntroCinematic se soit refermé (ou directement si absent) ;
+  //   • intro : déclenchée DÉTERMINISTE au handoff (cf. startGame), plus de
+  //     timer fragile ici — _introPlayed garde l'unicité par chargement ;
   //   • détection de franchissement de seuil colère (0.65 = 'colere2').
   function tick(dt){
-    _introTimer += dt;
     if(_crisisCooldown > 0) _crisisCooldown = Math.max(0, _crisisCooldown - dt);
-    // INTRO — guard : HTML intro fermée, aucun modal, ≥ 2 s depuis le boot.
-    if(!_introPlayed && _introTimer > 2.0){
-      const htmlActive = (typeof IntroCinematic!=='undefined' && IntroCinematic.active);
-      const modalOpen  = (typeof anyModalOpen==='function' && anyModalOpen());
-      if(!htmlActive && !modalOpen){ playIntro(); }
-    }
     if(typeof state === 'undefined' || !state) return;
     const c = state.colere || 0;
     const SEUIL = 0.65;
@@ -7698,6 +7702,10 @@ function applyUpgrade(u){
   document.getElementById('ures-marx').innerHTML=marx;
   document.getElementById('upanel-choose').style.display='none';
   document.getElementById('upanel-result').style.display='block';
+  // M9 — en phase 0 il n'y a pas encore de cycles : construire EST la
+  // progression. Sans ce point de sauvegarde, toute la fondation du capital
+  // serait perdue au rechargement.
+  if(typeof SaveGame!=='undefined') SaveGame.autosave();
 }
 function closeUpgrade(){
   document.getElementById('upgrade').classList.remove('on');
@@ -9400,6 +9408,10 @@ function startGame(opts={}){
   showChantierBtn(false);
   TutorialCoach.active=true; TutorialCoach.minimized=false; TutorialCoach.resetMovement();
   moveTargetMarker(); renderQuest(); renderCircuitBar(); tutorialCoachRefresh(true);
+  // M9 — en reprise de sauvegarde, la ligne « Phase 0 » serait un mensonge :
+  // la partie restaurée a déjà son propre avancement. chargerPartie() pose
+  // son propre message juste après.
+  if(opts.resume) return;
   pushLog('Phase 0','Ton argent dort. Va sur le terrain vide et construis un atelier pour commencer.','plain');
 }
 const introSkip=document.getElementById('intro-skip'); if(introSkip) introSkip.addEventListener('click',()=>startGame());
@@ -9619,7 +9631,9 @@ export function init(opts={}){
     try{
       composer=new THREE.EffectComposer(renderer);
       composer.addPass(new THREE.RenderPass(scene,camera));
-      bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.55,0.4,0.82);
+      // M8 — 0.55/0.82 → 0.42/0.86. L'exposition ayant monté, le bloom
+      // attrapait trop de surfaces et les transformait en taches saturées.
+      bloomPass=new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.42,0.4,0.86);
       composer.addPass(bloomPass);
       // M-Cinéma — DoF (BokehPass) inséré APRÈS le bloom, AVANT le grade.
       //   Subtil en jeu (focus lointain, maxblur bas) ; prononcé en mode
@@ -9655,7 +9669,7 @@ export function init(opts={}){
   }
   renderer.setPixelRatio(Math.min(1.5,devicePixelRatio)); // v33 : cap léger pour retrouver une conduite fluide
   renderer.toneMapping=THREE.ACESFilmicToneMapping;        // v57 : rendu plus riche, hautes lumières douces
-  renderer.toneMappingExposure=1.18;
+  renderer.toneMappingExposure=1.45;                       // M8 : 1.18 → 1.45, jeu plus lumineux
   renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
   document.getElementById('app').appendChild(renderer.domElement);
   // M1 — qualité par défaut : Haute. Le sélecteur du panneau réglages
@@ -9712,12 +9726,17 @@ export function init(opts={}){
   //   superposait à la nouvelle séquence cinéma « La Veille du Capital »
   //   (CinemaSequences.playIntro). On lance directement le jeu : le DOM
   //   introtrailer est masqué, body.intro-open retiré, TutorialCoach
-  //   activé. La nouvelle intro cinéma se déclenche ~2 s plus tard via
-  //   CinemaSequences.tick() (guard _introPlayed → unique par session).
+  //   activé. L'intro cinéma est déclenchée DÉTERMINISTE ici, AVANT
+  //   startGame, pour poser body.mcinema-on avant que le coach se rende
+  //   (le CSS le masque pendant le cinéma → aucun flash).
   const _introDom = document.getElementById('introtrailer');
   if(_introDom) _introDom.classList.add('hidden');
   document.body.classList.remove('intro-open');
-  startGame({handoff:true});
+  // M9 — le jeu ne démarre plus tout seul : l'ACCUEIL décide. C'est lui qui
+  // lance l'intro cinéma (nouvelle partie) ou la restauration (reprise).
+  // Le monde est déjà construit derrière : le joueur choisit devant un
+  // paysage qui s'éveille.
+  Accueil.ouvrir();
   // M1c — audit one-shot des émissifs après peuplement complet (log console.table)
   try{ auditEmissiveMaterials(); }catch(_){}
   addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;
@@ -10261,7 +10280,7 @@ if(typeof window!=='undefined') window._applyM4Quality=_applyM4Quality;
 
 /* M1c — AUDIT ÉMISSIFS. Parcourt la scène, recense les matériaux émissifs
    ou très clairs, calcule une luminance approximative (Rec.709 * intensité)
-   et signale ceux qui dépasseraient le threshold du bloom (0.82 par défaut).
+   et signale ceux qui dépasseraient le threshold du bloom (M8 : 0.86).
    One-shot à l'init + accessible en console : window.auditEmissiveMaterials().
    Charte M1c : seuls peuvent fleurir lampes/flammes, fenêtres émissives, soleil
    et marqueurs d'objectif ponctuels. Tout guidage permanent étendu reste
@@ -10922,12 +10941,24 @@ const GradeShader = {
   uniforms:{
     tDiffuse:        { value:null },
     uTime:           { value:0 },
-    uShadowTint:     { value:new THREE_BASE.Color(0x2a3550) },
+    // M8 — la teinte d'ombre est éclaircie (0x2a3550 → 0x3f4d6b) et la force
+    // du split abaissée : le bleu-encre reste, mais il ne mange plus les bas
+    // niveaux. La vignette est également adoucie (0.22 → 0.15).
+    uShadowTint:     { value:new THREE_BASE.Color(0x3f4d6b) },
     uHighlightTint:  { value:new THREE_BASE.Color(0xffc98a) },
     uSplitPivot:     { value:0.5 },
-    uSplitStrength:  { value:0.35 },
-    uVignetteMax:    { value:0.22 },
+    uSplitStrength:  { value:0.28 },
+    uVignetteMax:    { value:0.15 },
     uGrain:          { value:0.025 },
+    // M8 — ROLL-OFF DES HAUTES LUMIÈRES. Au-delà de uHiKnee : (1) la chroma
+    // est ramenée vers le gris, donc une surface qui sature blanchit comme
+    // sur une pellicule au lieu de virer à l'aplat de couleur pure (ors,
+    // braises, lanternes, tôles au soleil) ; (2) uHiGain rabaisse en plus
+    // leur intensité. Mesuré sur le plein jour : saturation moyenne des
+    // pixels chauds 0.56 → 0.05, sans bouger la luminance moyenne du cadre.
+    uHiKnee:         { value:0.50 },
+    uHiDesat:        { value:0.85 },
+    uHiGain:         { value:0.88 },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -10945,7 +10976,16 @@ const GradeShader = {
     uniform float uSplitStrength;
     uniform float uVignetteMax;
     uniform float uGrain;
+    uniform float uHiKnee;
+    uniform float uHiDesat;
+    uniform float uHiGain;
     varying vec2 vUv;
+
+    const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+    float luma(vec3 c){ return dot(c, LUMA); }
+    // teinte ramenée à luminance 1 : elle DÉPLACE la couleur sans ajouter
+    // de gain (cf. split-tone ci-dessous).
+    vec3 unitTint(vec3 c){ return c / max(1e-4, luma(c)); }
 
     float hash21(vec2 p){
       p = fract(p * vec2(123.34, 456.21));
@@ -10957,12 +10997,26 @@ const GradeShader = {
       vec4 src = texture2D(tDiffuse, vUv);
       vec3 col = src.rgb;
 
-      // (a) split-tone par luminance
-      float Y = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      // (a) split-tone par luminance — M8 : les teintes sont NORMALISÉES
+      // (unitTint) au lieu d'être multipliées par 2.0. L'ancienne formule
+      // appliquait aux hautes lumières un gain (2.00, 1.58, 1.08) : tout ce
+      // qui était clair montait ET virait à l'orange, puis clippait en aplat
+      // saturé. Le split ne fait plus que déplacer la couleur.
+      float Y = luma(col);
       float shadowMask    = smoothstep(uSplitPivot, 0.0, Y);
       float highlightMask = smoothstep(uSplitPivot, 1.0, Y);
-      col = mix(col, col * uShadowTint    * 2.0, shadowMask    * uSplitStrength);
-      col = mix(col, col * uHighlightTint * 2.0, highlightMask * uSplitStrength);
+      col = mix(col, col * unitTint(uShadowTint),    shadowMask    * uSplitStrength);
+      col = mix(col, col * unitTint(uHighlightTint), highlightMask * uSplitStrength);
+
+      // (a bis) ROLL-OFF DES HAUTES LUMIÈRES — M8. Passé uHiKnee, la chroma
+      // se retire progressivement : une surface qui sature blanchit au lieu
+      // de devenir une tache de couleur pure. uHiGain rabaisse ensuite son
+      // intensité — c'est ce qui empêche les émissifs (or, forge, lanternes)
+      // de se lire comme des aplats en surbrillance.
+      float Yh  = luma(col);
+      float hot = smoothstep(uHiKnee, 1.0, Yh);
+      col = mix(col, vec3(Yh), hot * uHiDesat);
+      col *= mix(1.0, uHiGain, hot);
 
       // (b) vignette radiale
       vec2 d = vUv - 0.5;
@@ -14843,8 +14897,13 @@ function buildSky(){
     uMidExp:    {value:1.4},
     uTime:      {value:0},
   };
-  // Alias rétro-compat DayCycle : laisse moduler uniquement le zénith
-  // (l'horizon reste verrouillé sur COLORSCRIPT.skyHorizon — DA fixe).
+  // Alias rétro-compat DayCycle : moduler le zénith.
+  // M8 — uMid et uHorizon ne sont PLUS verrouillés : DayCycle les fait
+  // respirer aussi (cf. STOPS.mid / STOPS.horiz). Un mid slate fixe et un
+  // horizon doré fixe donnaient un midi olive et sourd — or le ciel occupe
+  // la moitié du cadre. L'inflexion dorée de la DA est préservée là où elle
+  // signifie quelque chose : elle est REMISE à COLORSCRIPT.skyHorizon exact
+  // à l'aurore et à l'heure dorée.
   uniforms.topColor = uniforms.uZenith;
   const mat=new THREE.ShaderMaterial({
     uniforms, side:THREE.BackSide, depthWrite:false, fog:false,
@@ -15992,8 +16051,10 @@ const AmbientSound={
      0.00 = minuit (sun nadir, lune zénith)
      0.25 = aube (sun lève à l'EST, lune se couche à l'OUEST)
      0.50 = midi (sun zénith)
-     0.72 = HEURE DORÉE — spawn par défaut (identité DA)
+     0.72 = HEURE DORÉE (identité DA)
      0.75 = crépuscule (sun se couche à l'ouest)
+   M8 — le spawn n'est PLUS 0.72 mais DAWN_START (0.205, avant l'aube) :
+   la partie s'ouvre sur un lever de soleil, puis se joue de jour.
      1.00 = minuit (loop)
    SunState.sunDir / moonDir : vecteurs unitaires dans le repère MONDE,
    utilisés par ABSOLUMENT TOUT (sunLight, moonLight, sun/moon disks,
@@ -16007,7 +16068,7 @@ const SunState = {
   sunIntensity:  1.0,
   moonIntensity: 0.0,
   kDay: 1.0,                                // 0 = nuit profonde, 1 = plein soleil
-  timeOfDay: 0.72,                          // démarre à l'heure dorée
+  timeOfDay: 0.205,                         // M8 : démarre AVANT l'aube (cf. DAWN_START)
   // dominante (pour la traînée spéculaire de la mer & godrays)
   dominantDir2D: new THREE.Vector2(),       // xz normalisé de l'astre visible
   dominantColor: new THREE.Color(0xffd9a4),
@@ -16018,9 +16079,26 @@ const SunState = {
   // et éclaire la scène). Contraste assumé avec le soleil rouge-sang.
   moonColor: new THREE.Color(0xeaf0fa),
 };
-const DAY_PERIOD = 240;                     // 4 min par cycle complet
+// M8 — 240 s → 900 s. Le cycle complet dure 15 min, donc ~7 min de plein
+// jour : après le lever, la partie se joue LARGEMENT de jour avant que le
+// soir ne revienne. (À 240 s la nuit retombait au bout de 2 min de jeu.)
+const DAY_PERIOD = 900;
 const SUN_DISPLAY_R = 235;                  // distance pour les sprites célestes
-let timeOfDay = 0.72;
+
+/* M8 — LEVER DE SOLEIL D'OUVERTURE.
+   La partie s'ouvre sur une nuit finissante (DAWN_START), et le soleil se
+   lève en accéléré (×DAWN_SPEED) jusqu'au matin franc (DAWN_END).
+   Déroulé mesuré : ~9 s le soleil franchit l'horizon, ~20 s la lumière est
+   celle du plein jour (kDay = 1), ~43 s l'accélération s'arrête — le trailer
+   d'intro (~35 s) EST donc le lever de soleil, et le joueur prend la main
+   sur un monde déjà éclairé. Passé DAWN_END le temps reprend sa marche
+   normale et ne rejoue plus jamais l'accélération (dawnIntroDone). */
+const DAWN_START = 0.205;                   // soleil sous l'horizon, lueur à l'EST
+const DAWN_END   = 0.42;                    // matin franc, le monde est clairement éclairé
+const DAWN_SPEED = 4.5;                     // ≈43 s : le trailer (~35 s) EST le lever de soleil
+let dawnIntroDone = false;
+
+let timeOfDay = DAWN_START;
 let TIME_SPEED = 1.0;                       // ajustable via touches `,` `.` `]` (cf. input)
 
 // teinte du soleil en fonction de la hauteur
@@ -16104,17 +16182,24 @@ const DayCycle={
      teinte du ciel, éclat des lampes, et kDay (0 = nuit, 1 = midi) que toute l'atmosphère
      consomme : brume, étoiles, lune, nuages, oiseaux, grillons. La nuit est une nuit
      d'encre lavée, jouable : la lumière lunaire garde des ombres lisibles. */
+  /* M8 — les p sont désormais ALIGNÉS SUR LA POSITION PHYSIQUE du soleil
+     (sunDir.y = -cos(2π·timeOfDay)) : lever à 0.25, zénith à 0.50, coucher
+     à 0.75. L'ancienne table était décalée (aurore à p=0.07 alors que le
+     soleil était encore sous l'horizon) — ce qui rendait tout démarrage
+     ailleurs qu'à 0.72 incohérent : ambiance de matin, ciel sans soleil.
+     Les hemI de journée sont aussi relevés (le monde est plus clair). */
   PERIOD:420, lampBoost:0.6, kDay:1,
   STOPS:[
-    {p:0.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit (M7 : hemI 0.32→0.46)
-    {p:0.07, el:0.12, az: 1.15, sunC:0xffb27a, sunI:0.50, hemC:0xb9a48c, hemI:0.50, fog:0xc9a98c, top:0x7d8fb0, lamp:1.2, k:0.30}, // aurore
-    {p:0.14, el:0.45, az: 0.95, sunC:0xffd9a4, sunI:0.95, hemC:0xe8d8b8, hemI:0.68, fog:0xd2bd92, top:0x9bb0c8, lamp:0.6, k:0.80}, // matin
-    {p:0.40, el:0.95, az: 0.35, sunC:0xfff1d4, sunI:1.12, hemC:0xefe2c6, hemI:0.78, fog:0xcbbd9a, top:0x7fb0d4, lamp:0.35,k:1.00}, // midi
-    {p:0.62, el:0.60, az:-0.55, sunC:0xffe2b0, sunI:1.00, hemC:0xead9b4, hemI:0.70, fog:0xcfbd96, top:0x8fb0c8, lamp:0.5, k:0.90}, // après-midi
-    {p:0.72, el:0.30, az:-0.95, sunC:0xffc98e, sunI:0.85, hemC:0xe2c9a2, hemI:0.62, fog:0xd2b88c, top:0x9bb0c8, lamp:0.9, k:0.60}, // heure dorée
-    {p:0.80, el:0.08, az:-1.15, sunC:0xff7d4a, sunI:0.50, hemC:0xb08a78, hemI:0.48, fog:0xc07a52, top:0x4c5a86, lamp:1.3, k:0.25}, // crépuscule (M7 : 0.42→0.48)
-    {p:0.88, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // nuit (M7)
-    {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, lamp:1.6, k:0.00}, // boucle (M7)
+    {p:0.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, mid:0x3d4a66, horiz:0x5b4b54, lamp:1.6, k:0.00}, // minuit
+    {p:0.18, el:0.55, az:-2.60, sunC:0x9db2d8, sunI:0.30, hemC:0x68798f, hemI:0.50, fog:0x424b5c, top:0x2e3a4e, mid:0x475672, horiz:0x6d5862, lamp:1.5, k:0.04}, // nuit finissante
+    {p:0.25, el:0.12, az: 1.15, sunC:0xffb27a, sunI:0.50, hemC:0xb9a48c, hemI:0.58, fog:0xc9a98c, top:0x7d8fb0, mid:0x8a86a0, horiz:0xd98a3d, lamp:1.2, k:0.30}, // AURORE — soleil à l'horizon EST (horizon = DA)
+    {p:0.32, el:0.45, az: 0.95, sunC:0xffd9a4, sunI:0.95, hemC:0xe8d8b8, hemI:0.78, fog:0xd2bd92, top:0x9bb0c8, mid:0x8fabca, horiz:0xecc99a, lamp:0.6, k:0.82}, // matin
+    {p:0.50, el:0.95, az: 0.35, sunC:0xfff1d4, sunI:1.12, hemC:0xefe2c6, hemI:0.90, fog:0xd4cbb0, top:0x7fb0d4, mid:0xa8cbe4, horiz:0xe6e7dc, lamp:0.30,k:1.00}, // MIDI — zénith, ciel franchement diurne
+    {p:0.66, el:0.60, az:-0.55, sunC:0xffe2b0, sunI:1.00, hemC:0xead9b4, hemI:0.80, fog:0xcfbd96, top:0x8fb0c8, mid:0x97bbd8, horiz:0xe7cfa6, lamp:0.45,k:0.95}, // après-midi
+    {p:0.73, el:0.30, az:-0.95, sunC:0xffc98e, sunI:0.85, hemC:0xe2c9a2, hemI:0.68, fog:0xd2b88c, top:0x9bb0c8, mid:0x7d90ae, horiz:0xd98a3d, lamp:0.9, k:0.65}, // heure dorée (horizon = DA)
+    {p:0.78, el:0.08, az:-1.15, sunC:0xff7d4a, sunI:0.50, hemC:0xb08a78, hemI:0.52, fog:0xc07a52, top:0x4c5a86, mid:0x5f6284, horiz:0xc06a3c, lamp:1.3, k:0.25}, // crépuscule — couchant OUEST
+    {p:0.85, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, mid:0x3d4a66, horiz:0x5b4b54, lamp:1.6, k:0.00}, // nuit
+    {p:1.00, el:0.55, az:-2.60, sunC:0x8aa6d4, sunI:0.26, hemC:0x5d7086, hemI:0.46, fog:0x39414e, top:0x27303f, mid:0x3d4a66, horiz:0x5b4b54, lamp:1.6, k:0.00}, // boucle
   ],
   _cA:null,_cB:null,
   // M7 — phase() = timeOfDay continue (alignée sur la position physique du
@@ -16127,8 +16212,16 @@ const DayCycle={
   update(dt){
     if(!sunLight) return;
     // M7 — avance timeOfDay puis recompute SunState (source de vérité).
+    // M8 — pendant le lever d'ouverture, le temps court ×DAWN_SPEED : le
+    // soleil franchit l'horizon pendant le trailer, et la partie démarre en
+    // plein jour. Le drapeau ne se relève jamais : un seul lever par session.
     if(typeof dt==='number' && dt>0){
-      timeOfDay += dt * TIME_SPEED / DAY_PERIOD;
+      let speed = TIME_SPEED;
+      if(!dawnIntroDone){
+        if(timeOfDay >= DAWN_END || timeOfDay < DAWN_START) dawnIntroDone = true;
+        else speed *= DAWN_SPEED;
+      }
+      timeOfDay += dt * speed / DAY_PERIOD;
       timeOfDay = ((timeOfDay % 1) + 1) % 1;
     }
     updateSun(timeOfDay);
@@ -16172,11 +16265,23 @@ const DayCycle={
     }
     this.kDay=SunState.kDay;            // source de vérité unique consommée par tout le reste
     if(skyDome){
-      // M2 — DayCycle ne touche QUE le zénith (alias topColor → uZenith).
-      // L'horizon doré (COLORSCRIPT.skyHorizon) reste fixe : c'est l'inflexion
-      // de DA « La Veille du Capital ». uHorizon est volontairement laissé.
-      const uTop=skyDome.material.uniforms.topColor;
-      if(uTop) this._mixColor(uTop.value, a.top, b.top, u);
+      // M8 — les TROIS paliers du dégradé suivent maintenant l'heure : zénith
+      // (topColor → uZenith), bande médiane (uMid) et horizon (uHorizon).
+      // L'inflexion dorée de la DA n'est pas perdue : les STOPS aurore et
+      // heure dorée reposent uHorizon sur COLORSCRIPT.skyHorizon exact.
+      const U=skyDome.material.uniforms;
+      if(U.topColor) this._mixColor(U.topColor.value, a.top, b.top, u);
+      if(U.uMid)     this._mixColor(U.uMid.value,     a.mid, b.mid, u);
+      if(U.uHorizon) this._mixColor(U.uHorizon.value, a.horiz, b.horiz, u);
+      // M8 — uEastCool était figé sur un slate sombre : en plein jour il
+      // creusait une bande sale à l'horizon EST. On le DÉRIVE de la bande
+      // médiane, ramenée vers le slate d'origine à mesure que la nuit vient
+      // (kDay=0 → exactement la valeur historique 0x4a5868).
+      if(U.uEastCool && U.uMid){
+        if(!this._cEastNight) this._cEastNight = new THREE.Color(0x4a5868);
+        U.uEastCool.value.copy(U.uMid.value)
+          .lerp(this._cEastNight, 1 - SunState.kDay * 0.85);
+      }
       if(skyDome.material.uniforms.uTime)
         skyDome.material.uniforms.uTime.value=t;
       if(typeof camera!=='undefined'&&camera)
@@ -16495,7 +16600,7 @@ function playCycleAnimation(done){
   function frame(now){
     const p=clamp((now-start)/duration); const i=Math.min(steps.length-1,Math.floor(p*steps.length));
     steps.forEach((s,k)=>s.classList.toggle('on',k===i));
-    if(bar) bar.style.width=Math.round(p*100)+'%';
+    if(bar) bar.style.transform='scaleX('+p+')';   // scaleX plutôt que width : composité, pas de reflow
     if(txt) txt.textContent=labels[i]+' : '+explains[i]+'.';
     if(title) title.textContent='Vue drone du cycle productif';
     if(p<1) requestAnimationFrame(frame);
@@ -16709,6 +16814,490 @@ function renderFormationPanel(){
   const cip=document.getElementById('circuit-info'); if(cip) cip.addEventListener('click',e=>{ if(e.target===cip) closeCircuitInfo(); });
 })();
 
+/* =====================================================================
+   M9 — SAUVEGARDE DE LA PROGRESSION.
+
+   PRINCIPE : on n'écrit QUE de la donnée de partie. Aucun Mesh, aucune
+   référence THREE, aucune géométrie. Le monde 3D n'est pas sérialisé —
+   il est RECONSTRUIT à partir de l'état au chargement (updateBuildings,
+   CityGrowth, CompetitorWorld…), c'est-à-dire par le même chemin que le
+   jeu emprunte déjà après chaque action du joueur (cf. applyUpgrade).
+   La sauvegarde reste donc petite, et elle survit à toute évolution du
+   décor : ajouter un bâtiment ou changer une texture ne l'invalide pas.
+
+   SimulationState est de la donnée pure (nombres, booléens, objets et
+   tableaux simples) : un aller-retour JSON suffit. On ne REMPLACE jamais
+   l'instance `state` — les systèmes du moteur en gardent la référence ;
+   on la ré-alimente par Object.assign. Un champ ajouté dans une version
+   future et absent d'une vieille sauvegarde garde simplement sa valeur
+   par défaut du constructeur : la compatibilité ascendante est gratuite.
+   ===================================================================== */
+const SAVE_KEY     = 'circuit-du-capital/partie';
+const SAVE_VERSION = 1;
+// M9 — TROIS EMPLACEMENTS. Une clé par emplacement : lire ou effacer l'un
+// ne touche jamais les autres, et une sauvegarde corrompue n'emporte pas
+// les deux parties voisines (ce qu'un index unique aurait fait).
+const SAVE_SLOTS   = 3;
+const saveKeyFor   = (i) => `${SAVE_KEY}/${i}`;
+// Emplacement où écrivent les sauvegardes automatiques. Posé par l'accueil
+// au moment où le joueur choisit sa partie ; null = personne n'a choisi,
+// donc on n'écrit nulle part (on n'écrase jamais un emplacement au hasard).
+let slotActif = null;
+
+/* Filtre de sérialisation. `state` n'est PAS entièrement pur : les systèmes
+   du monde accrochent des références THREE dessus à l'exécution — surtout
+   `competitors[i]._group` (le district 3D de chaque firme). Sérialiser
+   naïvement produirait une sauvegarde énorme, voire une récursion. On coupe
+   par nom ET par signature THREE, pour attraper aussi les accroches futures. */
+const SAVE_SKIP_KEYS = new Set(['_group','group','mesh','sprite','material','geometry','parent']);
+function saveReplacer(k, v){
+  if(SAVE_SKIP_KEYS.has(k)) return undefined;
+  if(v && typeof v==='object' &&
+     (v.isObject3D || v.isVector3 || v.isColor || v.isMaterial || v.isBufferGeometry || v.isTexture))
+    return undefined;
+  return v;
+}
+
+const SaveGame = {
+  lastError: null,
+
+  // localStorage peut être absent, désactivé, ou lever (navigation privée,
+  // quota, iframe cloisonnée). Tout passe par ce point d'accès unique.
+  _store(){
+    try{
+      const s = window.localStorage;
+      if(!s) return null;
+      const probe = '__cdc_probe__';
+      s.setItem(probe,'1'); s.removeItem(probe);
+      return s;
+    }catch(err){ this.lastError = err && err.message || String(err); return null; }
+  },
+  disponible(){ return !!this._store(); },
+
+  /* --------------------------- ÉCRITURE --------------------------- */
+  snapshot(){
+    return {
+      v: SAVE_VERSION,
+      date: new Date().toISOString(),
+      // en-tête lisible : sert à étiqueter la sauvegarde dans l'interface
+      // sans avoir à désérialiser toute la partie.
+      apercu: {
+        cycle:  state.cycle,
+        argent: Math.round(state.argent),
+        phase:  gamePhase,
+        age:    state.age || 1,
+      },
+      etat:    JSON.parse(JSON.stringify(state, saveReplacer)),
+      journal: journalEntries.slice(0, 120),
+      evenements: log.entries.slice(0, 200),
+      histoire: historyLog.slice(0, 40),
+      // conceptShown est un Set : JSON le sérialiserait en {}. On l'aplatit.
+      conceptsVus: Array.from(conceptShown),
+      progression: {
+        step, gameOver, gamePhase, gameMode, pendingEnterSF,
+        voileUnlocked, crisisStreak, activeDeck, guideMode, marxView,
+        cargo:        MiniCircuit.cargo,
+        niveauVille:  CityGrowth.level,
+        // Non dérivables : ces bascules ne se rejouent pas toutes seules.
+        concurrentsReveles: !!CompetitorWorld.revealed,
+        quartierMarque:     !!PlayerDistrict.marked,
+        coach: { active:TutorialCoach.active, hasMoved:TutorialCoach.hasMoved,
+                 tourKey:TutorialCoach.tourKey, tourIndex:TutorialCoach.tourIndex },
+        timeOfDay,
+      },
+      vehicule: Vehicle && Vehicle.pos
+        ? { x:Vehicle.pos.x, y:Vehicle.pos.y, z:Vehicle.pos.z, cap:Vehicle.heading }
+        : null,
+    };
+  },
+
+  ecrire(slot){
+    const i = (slot==null) ? slotActif : slot;
+    // Aucun emplacement choisi = personne n'a encore ouvert de partie :
+    // écrire ici écraserait un emplacement arbitraire. On s'abstient.
+    if(i==null) return {ok:false, erreur:'aucun emplacement actif'};
+    const s = this._store();
+    if(!s){ return {ok:false, erreur:'stockage indisponible'}; }
+    try{
+      s.setItem(saveKeyFor(i), JSON.stringify(this.snapshot()));
+      this.lastError = null;
+      return {ok:true};
+    }catch(err){
+      // QuotaExceededError surtout : on ne casse pas la partie en cours.
+      this.lastError = err && err.message || String(err);
+      return {ok:false, erreur:this.lastError};
+    }
+  },
+
+  /* Sauvegarde automatique : silencieuse et sans exception. Une écriture
+     qui échoue (quota, mode privé) ne doit JAMAIS interrompre une partie —
+     elle se signale dans le panneau, pas au milieu du jeu. */
+  autosave(){
+    const r = this.ecrire();
+    if(typeof refreshSaveUI==='function') refreshSaveUI();
+    return r.ok;
+  },
+
+  /* --------------------------- LECTURE ---------------------------- */
+  lire(slot){
+    const i = (slot==null) ? slotActif : slot;
+    if(i==null) return null;
+    const s = this._store(); if(!s) return null;
+    try{
+      const brut = s.getItem(saveKeyFor(i)); if(!brut) return null;
+      const d = JSON.parse(brut);
+      // On refuse une sauvegarde d'une version de format inconnue plutôt
+      // que de restaurer à moitié une partie incohérente.
+      if(!d || d.v !== SAVE_VERSION || !d.etat) return null;
+      return d;
+    }catch(err){ this.lastError = err && err.message || String(err); return null; }
+  },
+  // Les trois emplacements, dans l'ordre. `null` = emplacement libre.
+  emplacements(){
+    const out=[]; for(let i=0;i<SAVE_SLOTS;i++) out.push(this.lire(i));
+    return out;
+  },
+  /* Un emplacement peut contenir des octets que lire() refuse : JSON abîmé,
+     ou sauvegarde écrite par une version plus récente du jeu. Il ne faut
+     PAS l'afficher comme libre — le joueur y lancerait une partie et
+     écraserait sans le savoir une progression qu'il croyait en sécurité.
+     On distingue donc « vide » de « occupé mais illisible ». */
+  occupe(i){
+    const s=this._store(); if(!s) return false;
+    try{ return s.getItem(saveKeyFor(i)) != null; }catch(err){ return false; }
+  },
+  illisible(i){ return this.occupe(i) && !this.lire(i); },
+  placesLibres(){
+    let n=0; for(let i=0;i<SAVE_SLOTS;i++) if(!this.occupe(i)) n++;
+    return n;
+  },
+  existe(slot){ return !!this.lire(slot); },
+  effacer(slot){
+    const i = (slot==null) ? slotActif : slot;
+    if(i==null) return;
+    const s=this._store(); if(s){ try{ s.removeItem(saveKeyFor(i)); }catch(err){} }
+  },
+
+  /* ------------------------- RESTAURATION ------------------------- */
+  restaurer(d){
+    if(!d || !d.etat) return false;
+
+    // 1. moteur économique — on ré-alimente l'instance existante.
+    // Les firmes concurrentes portent une référence 3D VIVANTE (`_group`,
+    // leur district déjà construit dans la scène). Remplacer le tableau par
+    // la version désérialisée l'effacerait : les districts resteraient dans
+    // la scène sans que plus personne ne puisse les montrer, les cacher ou
+    // les mettre à jour. On garde donc les objets vivants et on ne réécrit
+    // que leurs champs de données.
+    const firmes = state.competitors;
+    Object.assign(state, d.etat);
+    state.d    = d.etat.d    || {};
+    state.prev = d.etat.prev || {};
+    if(Array.isArray(firmes) && Array.isArray(d.etat.competitors)){
+      d.etat.competitors.forEach((donnees, i)=>{
+        if(firmes[i]) Object.assign(firmes[i], donnees);
+        else          firmes[i] = donnees;
+      });
+      firmes.length = d.etat.competitors.length;
+      state.competitors = firmes;
+    }
+
+    // 2. journaux : bandeau compact, modale historique, chronique.
+    journalEntries.length = 0;
+    if(Array.isArray(d.journal)) journalEntries.push(...d.journal);
+    log.entries.length = 0;
+    if(Array.isArray(d.evenements)) log.entries.push(...d.evenements);
+    lastLogLen = log.entries.length;
+    historyLog.length = 0;
+    if(Array.isArray(d.histoire)) historyLog.push(...d.histoire);
+    conceptShown.clear();
+    if(Array.isArray(d.conceptsVus)) d.conceptsVus.forEach(c=>conceptShown.add(c));
+
+    // 3. progression hors moteur.
+    const p = d.progression || {};
+    if(typeof p.step==='number')        step        = p.step;
+    if(typeof p.gameOver==='boolean')   gameOver    = p.gameOver;
+    if(typeof p.gamePhase==='string')   gamePhase   = p.gamePhase;
+    if(typeof p.gameMode==='string')    gameMode    = p.gameMode;
+    if(typeof p.pendingEnterSF==='boolean') pendingEnterSF = p.pendingEnterSF;
+    if(typeof p.voileUnlocked==='boolean')  voileUnlocked  = p.voileUnlocked;
+    if(typeof p.crisisStreak==='number')    crisisStreak   = p.crisisStreak;
+    if(typeof p.activeDeck==='string')      activeDeck     = p.activeDeck;
+    if(typeof p.guideMode==='boolean')      guideMode      = p.guideMode;
+    if(typeof p.marxView==='boolean')       marxView       = p.marxView;
+    if(typeof p.cargo==='string')       MiniCircuit.cargo = p.cargo;
+    if(typeof p.niveauVille==='number') CityGrowth.level  = p.niveauVille;
+    // NB : on ne touche PAS à PlayerDistrict.marked ni au chemin reveal().
+    // Ces deux-là s'auto-gardent sur leur drapeau ET ajoutent de la géométrie :
+    // poser le drapeau à la main les rendrait inertes (aucun anneau, aucun
+    // district visible). Le drapeau sauvegardé est une INTENTION, honorée
+    // dans resynchroniser() en appelant la méthode elle-même.
+    if(p.coach){
+      if(typeof p.coach.active==='boolean')   TutorialCoach.active   = p.coach.active;
+      if(typeof p.coach.hasMoved==='boolean') TutorialCoach.hasMoved = p.coach.hasMoved;
+      if(typeof p.coach.tourKey==='string')   TutorialCoach.tourKey  = p.coach.tourKey;
+      if(typeof p.coach.tourIndex==='number') TutorialCoach.tourIndex= p.coach.tourIndex;
+    }
+    // M9 — l'heure reprend où elle était, MAIS le lever d'ouverture est
+    // considéré comme joué : reprendre une partie ne rejoue pas l'aube.
+    if(typeof p.timeOfDay==='number'){ timeOfDay = p.timeOfDay; dawnIntroDone = true; }
+
+    // 4. véhicule.
+    if(d.vehicule && Vehicle && Vehicle.pos){
+      Vehicle.pos.set(d.vehicule.x, d.vehicule.y||0, d.vehicule.z);
+      if(typeof d.vehicule.cap==='number') Vehicle.heading = d.vehicule.cap;
+      Vehicle.speed = 0;
+    }
+
+    this.resynchroniser(p);
+    return true;
+  },
+
+  /* Reconstruit le monde et l'interface depuis l'état restauré. C'est la
+     même séquence que le jeu exécute après une action (applyUpgrade) et
+     après un cycle (CompetitionSystem) — pas un chemin parallèle. */
+  resynchroniser(p){
+    p = p || {};
+    // --- monde : bâti, stade historique, décor, ville ---
+    recomputeProduction();
+    updateBuildings();
+    refreshNiveauVille();
+    updateEnvironmentByStage();
+    updateVilleBadge();
+    updateZoneVisibility();
+    updateConsequences();
+    updateQuartier(0);
+    if(typeof refreshPlayerPlant==='function') refreshPlayerPlant();
+
+    // Districts concurrents : on pose le drapeau (beaucoup de règles de jeu
+    // le lisent) puis on rend les groupes visibles — c'est tout le travail
+    // visuel de reveal(), sans re-narrer l'événement au joueur.
+    if(p.concurrentsReveles){
+      CompetitorWorld.revealed = true;
+      for(const c of CompetitorWorld.firms()) if(c._group) c._group.visible = true;
+    }
+    // mark() est protégée par son propre drapeau : sûre à appeler, elle ne
+    // reposera pas les anneaux si la géométrie est déjà là.
+    if(p.quartierMarque) PlayerDistrict.mark();
+    PlayerDistrict.refreshHousing();
+    CompetitorWorld.refreshVisuals();
+    CompetitorWorld.renderRanking();
+    CityGrowth.rebuild();
+
+    // --- interface ---
+    updateHUD(); updateMarx(); renderLeviers();
+    renderQuest(); renderCircuitBar(); moveTargetMarker();
+    renderHistLog();
+    // Le panneau de formation sociale n'existe qu'une fois ce mode entamé.
+    if(gameMode==='socialFormation') renderFormationPanel();
+    const body=document.getElementById('log-body');
+    if(body && journalEntries.length){
+      const e=journalEntries[0];
+      body.innerHTML=`<p${e.col?` style="color:${e.col}"`:''}>${e.html}</p>`;
+    }
+    if(document.getElementById('journal').classList.contains('on')) renderJournalModal();
+    if(typeof tutorialCoachRefresh==='function') tutorialCoachRefresh(true);
+  },
+
+  /* --------------------------- INTERFACE -------------------------- */
+  // Où en est la partie — la ligne de titre d'une carte d'accueil.
+  ou(d){
+    const a=(d&&d.apercu)||{};
+    if(a.phase==='precapital')      return 'Phase 0 — le capital dort';
+    if(a.phase==='socialFormation') return `Formation sociale — cycle ${a.cycle}`;
+    return `Cycle ${a.cycle}`;
+  },
+  quand(d){
+    try{ return new Date(d.date).toLocaleString('fr-FR',
+      {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
+  },
+  // Étiquette compacte, pour le panneau ⚙ Paramètres.
+  etiquette(d){
+    if(!d) return 'aucune partie sauvegardée';
+    const q=this.quand(d);
+    return `${this.ou(d)} · ${(d.apercu||{}).argent} £${q?` — ${q}`:''}`;
+  },
+};
+
+/* =====================================================================
+   M9 — ÉCRAN D'ACCUEIL.
+
+   Il s'ouvre après le préchargement, PAR-DESSUS le monde déjà construit :
+   le joueur voit le paysage s'éveiller derrière le panneau pendant qu'il
+   choisit. Trois emplacements, pas un de plus — la contrainte est visible
+   plutôt que subie : pour ouvrir une quatrième partie, il faut en effacer
+   une, et l'accueil le dit.
+
+   L'accueil est le SEUL point d'entrée : c'est lui qui lance l'intro
+   cinéma (nouvelle partie) ou la restauration (reprise). init() ne
+   démarre plus le jeu tout seul.
+   ===================================================================== */
+let accueilOuvert = false;
+
+const Accueil = {
+  ouvrir(){
+    accueilOuvert = true;
+    document.body.classList.add('accueil-open');
+    const el=document.getElementById('accueil'); if(el) el.classList.remove('hidden');
+    this.rendre();
+  },
+  fermer(){
+    accueilOuvert = false;
+    document.body.classList.remove('accueil-open');
+    const el=document.getElementById('accueil'); if(el) el.classList.add('hidden');
+  },
+
+  rendre(){
+    const grille=document.getElementById('accueil-slots'); if(!grille) return;
+    const note=document.getElementById('accueil-note');
+    if(!SaveGame.disponible()){
+      grille.innerHTML='';
+      if(note) note.textContent='Ce navigateur n’autorise pas la sauvegarde locale : '
+        + 'tu peux jouer, mais la progression ne sera pas conservée.';
+      const seul=document.createElement('button');
+      seul.className='ac-go'; seul.textContent='Commencer sans sauvegarde ▸';
+      seul.addEventListener('click',()=>this.nouvelle(null));
+      grille.appendChild(seul);
+      return;
+    }
+    const parties=SaveGame.emplacements();
+    const libres=SaveGame.placesLibres();
+    if(note) note.textContent = libres>0
+      ? `${libres} emplacement${libres>1?'s':''} libre${libres>1?'s':''} sur ${SAVE_SLOTS}.`
+      : `Les ${SAVE_SLOTS} emplacements sont occupés. Efface une partie pour en commencer une nouvelle.`;
+
+    grille.innerHTML='';
+    parties.forEach((d,i)=>grille.appendChild(this.carte(d,i)));
+  },
+
+  carte(d,i){
+    const c=document.createElement('div');
+    c.className='ac-slot'+(d?'':' vide');
+    const num=`<div class="ac-num">Emplacement ${i+1}</div>`;
+    if(!d){
+      // Occupé mais illisible : on le dit, et on n'offre QUE l'effacement.
+      // Proposer « Nouvelle partie » ici écraserait en silence une partie
+      // que le joueur n'a pas décidé de perdre.
+      if(SaveGame.illisible(i)){
+        c.className='ac-slot abime';
+        c.innerHTML=`${num}<div class="ac-ou">Sauvegarde illisible</div>
+          <p class="ac-abime">Cette partie a été écrite par une autre version du jeu,
+          ou son contenu est abîmé. Elle ne peut pas être reprise.</p>`;
+        const sup=document.createElement('button');
+        sup.className='ac-act danger'; sup.textContent='Effacer';
+        sup.addEventListener('click',()=>{
+          if(sup.dataset.armed!=='1'){
+            sup.dataset.armed='1'; sup.textContent='Confirmer ?';
+            setTimeout(()=>{ if(sup.dataset.armed==='1'){ sup.dataset.armed='0'; sup.textContent='Effacer'; } },4000);
+            return;
+          }
+          SaveGame.effacer(i); this.rendre();
+        });
+        c.appendChild(sup);
+        return c;
+      }
+      c.innerHTML=`${num}<div class="ac-empty">Libre</div>`;
+      const b=document.createElement('button');
+      b.className='ac-act primaire'; b.textContent='Nouvelle partie';
+      b.addEventListener('click',()=>this.nouvelle(i));
+      c.appendChild(b);
+      return c;
+    }
+    const a=d.apercu||{};
+    c.innerHTML=`${num}
+      <div class="ac-ou">${SaveGame.ou(d)}</div>
+      <dl class="ac-stats">
+        <div><dt>Capital</dt><dd>${a.argent} £</dd></div>
+        <div><dt>Stade</dt><dd>${AGES[(a.age||1)-1]||'Atelier'}</dd></div>
+      </dl>
+      <div class="ac-date">${SaveGame.quand(d)}</div>`;
+    const row=document.createElement('div'); row.className='ac-row';
+    const rep=document.createElement('button');
+    rep.className='ac-act primaire'; rep.textContent='Reprendre';
+    rep.addEventListener('click',()=>this.reprendre(i));
+    const sup=document.createElement('button');
+    sup.className='ac-act danger'; sup.textContent='Effacer';
+    sup.addEventListener('click',()=>{
+      // Irréversible : on exige une seconde intention explicite, et on la
+      // désarme toute seule pour qu'un clic oublié ne reste pas armé.
+      if(sup.dataset.armed!=='1'){
+        sup.dataset.armed='1'; sup.textContent='Confirmer ?';
+        setTimeout(()=>{ if(sup.dataset.armed==='1'){ sup.dataset.armed='0'; sup.textContent='Effacer'; } },4000);
+        return;
+      }
+      SaveGame.effacer(i); this.rendre();
+    });
+    row.appendChild(rep); row.appendChild(sup);
+    c.appendChild(row);
+    return c;
+  },
+
+  /* --- nouvelle partie : l'intro cinéma joue, puis le jeu commence --- */
+  nouvelle(i){
+    slotActif = i;
+    this.fermer();
+    CinemaSequences.playIntro(() => tutorialCoachRefresh(true));
+    startGame({handoff:true});
+    SaveGame.autosave();      // l'emplacement est réservé dès le premier pas
+    refreshSaveUI();
+  },
+
+  /* --- reprise : pas d'intro cinéma, on rend la main tout de suite --- */
+  reprendre(i){
+    const d=SaveGame.lire(i);
+    if(!d){ this.rendre(); return; }
+    slotActif = i;
+    this.fermer();
+    startGame({handoff:true, resume:true});
+    if(!SaveGame.restaurer(d)){
+      // Sauvegarde illisible : on ne laisse pas le joueur dans un état
+      // à moitié restauré — retour à l'accueil, l'emplacement reste là.
+      this.ouvrir();
+      return;
+    }
+    ['journal','guide','concept','greve','upgrade','cards','report','zoneact','cycleplay','circuit-info']
+      .forEach(id=>{ const e=document.getElementById(id); if(e) e.classList.remove('on'); });
+    refreshModalMode();
+    pushLog('Partie','Partie reprise là où tu l’avais laissée.','plain');
+    refreshSaveUI();
+  },
+};
+
+/* Panneau ⚙ Paramètres : état de l'emplacement en cours + retour à l'accueil. */
+function refreshSaveUI(){
+  const lab = document.getElementById('save-status');
+  const btnSave = document.getElementById('save-now');
+  if(lab){
+    if(!SaveGame.disponible())      lab.textContent='sauvegarde indisponible dans ce navigateur';
+    else if(slotActif==null)        lab.textContent='partie non enregistrée';
+    else{
+      const d=SaveGame.lire(slotActif);
+      lab.textContent=`Emplacement ${slotActif+1} — ${SaveGame.etiquette(d)}`;
+    }
+  }
+  if(btnSave) btnSave.disabled = (slotActif==null) || !SaveGame.disponible();
+}
+function sauvegarderPartie(){
+  const r = SaveGame.ecrire();
+  refreshSaveUI();
+  if(r.ok) pushLog('Partie','Progression sauvegardée.','plain');
+  else     pushLog('Partie',`Sauvegarde impossible (${r.erreur}).`,'warn');
+  return r.ok;
+}
+(function wireSaveUI(){
+  const b=(id,fn)=>{ const e=document.getElementById(id); if(e) e.addEventListener('click',fn); };
+  b('save-now', ()=>sauvegarderPartie());
+  b('save-home',()=>{
+    // Retour à l'accueil : on sauvegarde puis on recharge. Le rechargement
+    // est délibéré — c'est déjà la façon dont le jeu se remet à zéro
+    // (endGame → location.reload) et il évite toute une classe de bugs de
+    // réinitialisation partielle entre deux parties.
+    SaveGame.ecrire();
+    location.reload();
+  });
+  refreshSaveUI();
+})();
+
 let _coachTick=0;
 function loop(){
   requestAnimationFrame(loop);
@@ -16727,7 +17316,10 @@ function loop(){
   _coachTick+=dt; if(_coachTick>0.35){ _coachTick=0; tutorialCoachRefresh(); }
   // Pendant le cinéma le chariot reste immobile (les inputs sont ignorés
   // par Vehicle.speed=0 et le timeScale réduit toute dérive éventuelle).
-  Vehicle.update(dt, cinemaActive ? {fwd:false,back:false,left:false,right:false} : Input);
+  // M9 — accueil ouvert : le chariot ne bouge pas. Le monde continue de
+  // vivre derrière le panneau (soleil, fumées, oiseaux), mais rien de ce
+  // que tape le joueur ne part dans une partie qu'il n'a pas encore choisie.
+  Vehicle.update(dt, (cinemaActive||accueilOuvert) ? {fwd:false,back:false,left:false,right:false} : Input);
   CameraController.update();
   handleZones(dt);
   cooldownReal=Math.max(0,cooldownReal-dt);
@@ -16755,7 +17347,10 @@ function loop(){
   CompetitorWorld.updateCommuters(dt);// v53 : navetteurs quartier ouvrier -> chaque usine
   CityGrowth.updateRails(dt);         // v54 : wagon navette usines -> port
   WorldBeauty.update(dt);             // v56 : nuages, oiseaux, tangage des bateaux
-  DayCycle.update(dt);                // v57/M7 : avance timeOfDay + sun/moon via SunState
+  // M8 — rawDt et non dt : la course du soleil est une horloge du MONDE, pas
+  // de la simulation. Avec dt elle subissait le timeScale du cinéma (×0.35),
+  // et le lever d'ouverture n'avançait qu'au tiers pendant tout le trailer.
+  DayCycle.update(rawDt);             // v57/M7 : avance timeOfDay + sun/moon via SunState
   updateQuartier(dt);                 // M-Quartier : niveaux d'extension du quartier ouvrier
   updateClassLighting(dt);            // M4 : sim → facteurs lissés (avant le rendu des vitres)
   updateWindowGlow();                 // v62 + M4 : fenêtres + lampes + cônes

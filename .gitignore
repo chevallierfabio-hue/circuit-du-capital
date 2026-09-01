@@ -3,3 +3,8 @@ dist/
 .DS_Store
 *.log
 .vite/
+
+# Réglages locaux d'outillage (chemins absolus, permissions machine)
+.claude/settings.local.json
+.impeccable/config.local.json
+.impeccable/hook.cache.json

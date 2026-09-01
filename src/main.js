@@ -23,7 +23,9 @@ const gateErr = $('gate-err');
 
 function setGateProgress(done, total){
   const pct = total ? Math.round((done/total)*100) : 0;
-  if (gateBar) gateBar.style.width = `${pct}%`;
+  // La barre occupe 100 % et se révèle par scaleX : animer `width` forçait
+  // un recalcul de mise en page à chaque frame du préchargement.
+  if (gateBar) gateBar.style.transform = `scaleX(${pct / 100})`;
 }
 function setGateMessage(m){ if (gateMsg) gateMsg.textContent = m; }
 function appendGateError(m){
