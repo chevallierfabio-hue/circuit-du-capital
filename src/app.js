@@ -16566,6 +16566,14 @@ const saveKeyFor   = (i) => `${SAVE_KEY}/${i}`;
 // au moment où le joueur choisit sa partie ; null = personne n'a choisi,
 // donc on n'écrit nulle part (on n'écrase jamais un emplacement au hasard).
 let slotActif = null;
+// Titre donné par le joueur à la partie en cours. Voyage dans l'aperçu de
+// la sauvegarde pour que l'accueil puisse étiqueter une carte sans avoir à
+// désérialiser toute la partie.
+let titrePartie = '';
+const TITRE_MAX = 40;
+// Un titre vient du joueur : il ne doit JAMAIS être concaténé dans du HTML.
+// Toutes les insertions passent par textContent (cf. Accueil.carte).
+const nettoieTitre = (t) => String(t == null ? '' : t).replace(/\s+/g, ' ').trim().slice(0, TITRE_MAX);
 
 /* Filtre de sérialisation. `state` n'est PAS entièrement pur : les systèmes
    du monde accrochent des références THREE dessus à l'exécution — surtout
@@ -16605,6 +16613,7 @@ const SaveGame = {
       // en-tête lisible : sert à étiqueter la sauvegarde dans l'interface
       // sans avoir à désérialiser toute la partie.
       apercu: {
+        titre:  titrePartie,
         cycle:  state.cycle,
         argent: Math.round(state.argent),
         phase:  gamePhase,
@@ -16707,6 +16716,9 @@ const SaveGame = {
   /* ------------------------- RESTAURATION ------------------------- */
   restaurer(d){
     if(!d || !d.etat) return false;
+    // Le titre repart avec la partie : les sauvegardes automatiques
+    // suivantes doivent continuer de l'écrire.
+    titrePartie = nettoieTitre(d.apercu && d.apercu.titre);
 
     // 1. moteur économique — on ré-alimente l'instance existante.
     // Les firmes concurrentes portent une référence 3D VIVANTE (`_group`,
@@ -16842,6 +16854,25 @@ const SaveGame = {
     try{ return new Date(d.date).toLocaleString('fr-FR',
       {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; }
   },
+  // Nom de la partie : celui du joueur, ou un repli neutre s'il n'en a pas
+  // voulu. Toujours restitué en texte, jamais interpolé dans du HTML.
+  nom(d, i){
+    const t = nettoieTitre(d && d.apercu && d.apercu.titre);
+    return t || `Partie ${(i==null?0:i)+1}`;
+  },
+  /* Renomme SANS toucher au reste de la sauvegarde : on relit, on remplace
+     le seul champ titre, on réécrit. Renommer ne doit pas devenir une
+     occasion de réécrire une partie avec l'état courant du moteur. */
+  renommer(i, titre){
+    const d = this.lire(i); if(!d) return false;
+    d.apercu = d.apercu || {};
+    d.apercu.titre = nettoieTitre(titre);
+    const s = this._store(); if(!s) return false;
+    try{ s.setItem(saveKeyFor(i), JSON.stringify(d)); }
+    catch(err){ this.lastError = err && err.message || String(err); return false; }
+    if(i === slotActif) titrePartie = d.apercu.titre;
+    return true;
+  },
   // Étiquette compacte, pour le panneau ⚙ Paramètres.
   etiquette(d){
     if(!d) return 'aucune partie sauvegardée';
@@ -16927,21 +16958,57 @@ const Accueil = {
         c.appendChild(sup);
         return c;
       }
+      // Emplacement libre : le joueur nomme sa partie avant de la commencer.
+      // Le champ est présent d'emblée plutôt que caché derrière un clic —
+      // il se voit, et rester vide reste parfaitement valable.
       c.innerHTML=`${num}<div class="ac-empty">Libre</div>`;
+      const champ=document.createElement('input');
+      champ.type='text'; champ.className='ac-nom'; champ.maxLength=TITRE_MAX;
+      champ.placeholder=`Partie ${i+1}`;
+      champ.setAttribute('aria-label',`Nom de la partie — emplacement ${i+1}`);
       const b=document.createElement('button');
       b.className='ac-act primaire'; b.textContent='Nouvelle partie';
-      b.addEventListener('click',()=>this.nouvelle(i));
-      c.appendChild(b);
+      const lancer=()=>this.nouvelle(i, champ.value);
+      b.addEventListener('click',lancer);
+      champ.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); lancer(); } });
+      c.appendChild(champ); c.appendChild(b);
       return c;
     }
     const a=d.apercu||{};
+    // Le titre est du texte SAISI PAR LE JOUEUR : il n'entre jamais dans
+    // une interpolation HTML. On monte la coquille, puis on pose le nom
+    // par textContent.
     c.innerHTML=`${num}
+      <h2 class="ac-titre"></h2>
       <div class="ac-ou">${SaveGame.ou(d)}</div>
       <dl class="ac-stats">
         <div><dt>Capital</dt><dd>${a.argent} £</dd></div>
         <div><dt>Stade</dt><dd>${AGES[(a.age||1)-1]||'Atelier'}</dd></div>
       </dl>
-      <div class="ac-date">${SaveGame.quand(d)}</div>`;
+      <div class="ac-pied"><span class="ac-date">${SaveGame.quand(d)}</span></div>`;
+    const hTitre=c.querySelector('.ac-titre');
+    hTitre.textContent=SaveGame.nom(d, i);
+
+    // Renommer : le titre bascule en champ de saisie sur place.
+    const btnNom=document.createElement('button');
+    btnNom.type='button'; btnNom.className='ac-ren'; btnNom.textContent='Renommer';
+    btnNom.addEventListener('click',()=>{
+      const champ=document.createElement('input');
+      champ.type='text'; champ.className='ac-nom'; champ.maxLength=TITRE_MAX;
+      champ.value=nettoieTitre(a.titre); champ.placeholder=`Partie ${i+1}`;
+      champ.setAttribute('aria-label',`Renommer la partie — emplacement ${i+1}`);
+      hTitre.replaceWith(champ); btnNom.remove(); champ.focus(); champ.select();
+      let clos=false;
+      const valider=()=>{ if(clos) return; clos=true;
+        SaveGame.renommer(i, champ.value); this.rendre(); };
+      champ.addEventListener('keydown',e=>{
+        if(e.key==='Enter'){ e.preventDefault(); valider(); }
+        if(e.key==='Escape'){ clos=true; this.rendre(); }   // abandon : on ne garde rien
+      });
+      champ.addEventListener('blur',valider);
+    });
+    c.querySelector('.ac-pied').appendChild(btnNom);
+
     const row=document.createElement('div'); row.className='ac-row';
     const rep=document.createElement('button');
     rep.className='ac-act primaire'; rep.textContent='Reprendre';
@@ -16964,8 +17031,9 @@ const Accueil = {
   },
 
   /* --- nouvelle partie : l'intro cinéma joue, puis le jeu commence --- */
-  nouvelle(i){
+  nouvelle(i, titre){
     slotActif = i;
+    titrePartie = nettoieTitre(titre);
     this.fermer();
     CinemaSequences.playIntro(() => tutorialCoachRefresh(true));
     startGame({handoff:true});
@@ -17003,7 +17071,7 @@ function refreshSaveUI(){
     else if(slotActif==null)        lab.textContent='partie non enregistrée';
     else{
       const d=SaveGame.lire(slotActif);
-      lab.textContent=`Emplacement ${slotActif+1} — ${SaveGame.etiquette(d)}`;
+      lab.textContent=`${SaveGame.nom(d, slotActif)} — ${SaveGame.etiquette(d)}`;
     }
   }
   if(btnSave) btnSave.disabled = (slotActif==null) || !SaveGame.disponible();
