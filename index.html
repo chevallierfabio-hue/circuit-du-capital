@@ -645,28 +645,9 @@
   .tuto .dots i{width:8px;height:8px;border:1.5px solid var(--encre);display:inline-block;transition:.2s}
   .tuto .dots i.on{background:var(--rouge);border-color:var(--rouge)}
 
-  /* ---- intro bande-annonce centrée ---- */
-  .introtrailer{position:fixed;inset:0;z-index:72;display:block;pointer-events:none;
-    background:radial-gradient(circle at center, rgba(36,31,23,.82) 0%, rgba(36,31,23,.78) 45%, rgba(36,31,23,.72) 100%)}
-  .introtrailer.hidden{opacity:0;pointer-events:none;transition:opacity .45s ease}
-  body.intro-open .hud,
-  body.intro-open .circuit,
-  body.intro-open .formation,
-  body.intro-open .help,
-  body.intro-open .log,
-  body.intro-open .quest,
-  body.intro-open .levers,
-  body.intro-open .villebadge,
-  body.intro-open .whap,
-  body.intro-open .prompt,
-  body.intro-open #levelup,
-  body.intro-open #marxbox{display:none!important}
-  .introtrailer .skip{position:absolute;top:16px;right:16px;pointer-events:auto;border:1.5px solid rgba(233,221,198,.82);
-    background:rgba(36,31,23,.42);color:var(--papier);font:700 12px "Zilla Slab",serif;letter-spacing:.8px;
-    text-transform:uppercase;padding:8px 12px;cursor:pointer;box-shadow:3px 4px 0 rgba(36,31,23,.22);backdrop-filter:blur(3px)}
-  .introtrailer .skip:hover{background:rgba(36,31,23,.78)}
-  /* M9 — reprise de partie. Même bouton que « Passer », posé à gauche et en
-     plein papier : c'est l'action principale quand une sauvegarde existe. */
+
+
+
   /* ---- M9 : écran d'accueil — choix de la partie (3 emplacements) ---- */
   .accueil{position:fixed;inset:0;z-index:78;display:flex;align-items:center;justify-content:center;
     background:rgba(20,17,12,.62);backdrop-filter:blur(2px);pointer-events:auto}
@@ -708,30 +689,6 @@
     .accueil .ac-slot{min-height:0}
     .accueil h1{font-size:27px}
   }
-  .introtrailer .centerwrap{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(820px,88vw);
-    text-align:center;color:var(--papier);text-shadow:0 3px 4px rgba(0,0,0,.95),0 8px 24px rgba(0,0,0,.95),0 0 42px rgba(0,0,0,.75)}
-  .introtrailer .stamp{font:600 11px "IBM Plex Mono",monospace;letter-spacing:2px;text-transform:uppercase;color:#f1d48a;margin-bottom:10px;opacity:.92}
-  .introtrailer .formula{font:600 13px "IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;opacity:.82;margin-bottom:10px}
-  .introtrailer h2{font-family:"Zilla Slab",serif;font-size:48px;line-height:1.02;margin:0 auto 10px;max-width:12.5em;
-    text-shadow:0 4px 4px rgba(0,0,0,1),0 12px 30px rgba(0,0,0,.95),0 0 56px rgba(0,0,0,.85)}
-  .introtrailer .body{font-size:19px;line-height:1.42;max-width:32em;margin:0 auto;opacity:.98;
-    text-shadow:0 3px 4px rgba(0,0,0,1),0 9px 24px rgba(0,0,0,.95),0 0 40px rgba(0,0,0,.8)}
-  .introtrailer .body b,.introtrailer h2 b{color:#f1d48a}
-  .introtrailer .tags{display:flex;justify-content:center;flex-wrap:wrap;gap:10px;margin-top:14px;min-height:20px;opacity:.9}
-  .introtrailer .tags span{font:600 12px "IBM Plex Mono",monospace;letter-spacing:.04em;text-shadow:0 2px 3px rgba(0,0,0,1),0 7px 20px rgba(0,0,0,.95)}
-  .introtrailer .progressline{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;color:rgba(233,221,198,.88);text-shadow:0 2px 10px rgba(0,0,0,.7)}
-  .introtrailer .dots{display:flex;gap:7px;flex-wrap:wrap;justify-content:center}
-  .introtrailer .dots i{width:8px;height:8px;border:1.5px solid rgba(233,221,198,.82);display:inline-block;background:transparent}
-  .introtrailer .dots i.on{background:var(--rouge);border-color:var(--rouge)}
-  .introtrailer .meta{font:600 11px "IBM Plex Mono",monospace;letter-spacing:.08em;text-transform:uppercase;opacity:.82}
-  @media (max-width:760px){
-    .introtrailer .centerwrap{width:92vw}
-    .introtrailer h2{font-size:34px}
-    .introtrailer .body{font-size:16px}
-    .introtrailer .formula{font-size:11px;letter-spacing:.08em}
-  }
-
-
 
   /* ---- tutoriel contextuel v34 ---- */
   .coach{position:fixed;left:50%;bottom:118px;transform:translateX(-50%);z-index:22;width:min(520px,88vw);
@@ -857,7 +814,7 @@
 <div id="app"></div>
 
 <!-- M0 — gate : écran de chargement des assets. Disparaît dès le manifest résolu,
-     puis l'introtrailer prend le relais. Si un asset critique manque, message lisible. -->
+     puis l'accueil prend le relais. Si un asset critique manque, message lisible. -->
 <div class="gate" id="gate" aria-live="polite">
   <h2>Le Circuit du Capital</h2>
   <div class="f">prototype 3D · <b>v66</b> — préchargement</div>
@@ -1153,20 +1110,6 @@
   </div>
 </div>
 
-<div class="introtrailer" id="introtrailer">
-  <button class="skip" id="intro-skip">Passer l’introduction ▸</button>
-  <div class="centerwrap">
-    <div class="stamp" id="intro-stamp">Prologue</div>
-    <div class="formula" id="intro-formula">A → M → Ft → P → M′ → A′</div>
-    <h2 id="intro-title">Le capital commence comme argent dormant.</h2>
-    <p class="body" id="intro-body">Une somme d’argent cherche à devenir capital.</p>
-    <div class="tags" id="intro-tags"></div>
-  </div>
-  <div class="progressline">
-    <div class="dots" id="intro-dots"></div>
-    <div class="meta" id="intro-meta">séquence 1 / 7</div>
-  </div>
-</div>
 
 <script type="module" src="/src/main.js"></script>
 </body>

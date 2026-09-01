@@ -6008,7 +6008,6 @@ const CameraController = {
     this.setMode(_CAM_ORDER[(idx+1)%_CAM_ORDER.length]);
   },
   update(){
-    if(typeof IntroCinematic!=='undefined' && IntroCinematic.active){ IntroCinematic.update(); return; }
     if(typeof CycleCinematic!=='undefined' && CycleCinematic.active){ CycleCinematic.update(); return; }
     // M-Cinéma : pendant une séquence scriptée, le moteur cinéma possède la
     // caméra entièrement (positions + lookAt par spline). On rend la main au
@@ -6463,7 +6462,26 @@ const CinemaSequences = (function(){
 
   function debug(){ return { introPlayed:_introPlayed, crisisCooldown:+_crisisCooldown.toFixed(1) }; }
 
-  return { playIntro, playCycle, playCrise, snapshotCycle, tick, debug };
+  /* M9 — cet état vivait dans la closure, donc hors de portée de la
+     sauvegarde : une séquence déjà vue se rejouait après reprise.
+     `_lastColere` est le plus important des quatre — c'est la mémoire de
+     détection de FRANCHISSEMENT du seuil. Sans lui, reprendre une partie
+     dont la colère est déjà au-dessus de 0.65 repart de 0 et déclenche
+     aussitôt la cinématique de crise, alors qu'aucun seuil n'a été
+     franchi. Donnée pure : nombres, booléen, objet plat. */
+  function etat(){
+    return { introPlayed:_introPlayed, lastColere:_lastColere,
+             crisisCooldown:_crisisCooldown, cycleSnapshot:_cycleSnapshot };
+  }
+  function restaurer(o){
+    if(!o) return;
+    if(typeof o.introPlayed==='boolean')   _introPlayed    = o.introPlayed;
+    if(typeof o.lastColere==='number')     _lastColere     = o.lastColere;
+    if(typeof o.crisisCooldown==='number') _crisisCooldown = o.crisisCooldown;
+    _cycleSnapshot = o.cycleSnapshot || null;
+  }
+
+  return { playIntro, playCycle, playCrise, snapshotCycle, tick, debug, etat, restaurer };
 })();
 if(typeof window !== 'undefined') window.__sequences = CinemaSequences;
 
@@ -9117,294 +9135,14 @@ function checkCommuneEndgame(){
 
 
 
-const INTRO_SCENES = [
-  {
-    kicker:'Prologue',
-    title:'Au départ : <b>l’argent dort</b>.',
-    body:'Une somme d’argent cherche à devenir capital.',
-    formula:'Argent dormant',
-    tags:['Banque','Trésorerie','Attente'],
-    dur:4300, shot:'bank'
-  },
-  {
-    kicker:'Le circuit',
-    title:'Le capital circule entre des <b>lieux construits</b>.',
-    body:'L’argent passe par la banque, le marché, le travail, l’usine, l’entrepôt, la vente.',
-    formula:'A → M → Ft → P → M′ → A′',
-    tags:['Banque','Marché','Travail','Usine','Entrepôt','Vente'],
-    dur:5000, shot:'cycle'
-  },
-  {
-    kicker:'Formation sociale',
-    title:'Le circuit finit par produire <b>un monde plein</b>.',
-    body:'Une ville capitaliste : flux, fumées, ouvriers, stocks, institutions.',
-    formula:'La formation sociale apparaît',
-    tags:['Ville','Flux','Fumées','Quartiers','État'],
-    dur:4700, shot:'wide'
-  },
-  {
-    kicker:'Contradictions',
-    title:'Accumuler, c’est aussi créer des <b>tensions</b>.',
-    body:'Dette. Stocks. Colère. Chômage. Crise.',
-    formula:'Les lettres rouges signalent ce qui bloque',
-    tags:['Dette','Stocks','Colère','Crise'],
-    dur:4700, shot:'contradiction'
-  },
-  {
-    kicker:'Âges historiques',
-    title:'<b>Atelier</b>. Manufacture. Grande industrie.',
-    body:'Le capital change d’échelle et transforme la production.',
-    formula:'Développement du capital',
-    tags:['Atelier','Manufacture','Grande industrie'],
-    dur:5600, shot:'ages'
-  },
-  {
-    kicker:'Horizon du jeu',
-    title:'Ville industrielle. Capital financier. <b>Marché mondial</b>.',
-    body:'Le monde s’étend — et les formes politiques avec lui.',
-    formula:'Des trajectoires historiques émergent',
-    tags:['Ville industrielle','Marché mondial','Libéral','Autoritaire','Révolution'],
-    dur:5600, shot:'worldmarket'
-  },
-  {
-    kicker:'Le jeu commence',
-    title:'Fais émerger le <b>monde produit par le capital</b>.',
-    body:'Observe. Interviens. Lance un cycle productif.',
-    formula:'Objectif proche : atteindre la Manufacture',
-    tags:['Observer','Intervenir','Lancer le cycle'],
-    dur:5200, shot:'handoff'
-  }
-];
-
-const IntroCinematic={
-  active:false, startedGame:false, start:0, sceneIndex:-1, total:0, points:[], lastPulse:0, savedVehicle:null, savedCargo:null, savedWorld:null, previewOn:false,
-  saveWorldPreview(){
-    this.savedWorld={
-      buildings:Object.assign({},state.buildings),
-      travailleurs:state.travailleurs,
-      populationActive:state.populationActive,
-      niveauMachine:state.niveauMachine,
-      productionActive:state.productionActive,
-      niveauVille:state.niveauVille,
-      age:state.age,
-      cyclesProfitables:state.cyclesProfitables,
-      stocks:state.stocks,
-      dette:state.dette,
-      argent:state.argent,
-      gamePhase:gamePhase
-    };
-  },
-  applyWorldPreview(){
-    // Prévisualisation purement cinématique : la carte montre le futur possible du jeu,
-    // mais l'état réel est restauré avant que le joueur prenne la main.
-    if(!this.savedWorld) this.saveWorldPreview();
-    this.previewOn=true;
-    state.buildings={banque:3, atelier:1, usine:6, entrepot:5, marche:5, quartier:5, travail:4, rails:1, port:1, bourse:1, terres:1, outils:1};
-    state.travailleurs=16; state.populationActive=24; state.niveauMachine=7; state.productionActive=true;
-    state.niveauVille=6; state.age=6; state.cyclesProfitables=5; state.stocks=90; state.dette=260; state.argent=1600;
-    gamePhase='socialFormation';
-    updateBuildings(); updateZoneVisibility(); updateVilleBadge();
-    if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
-  },
-  restoreWorldPreview(){
-    if(!this.savedWorld) return;
-    const w=this.savedWorld;
-    state.buildings=Object.assign({},w.buildings);
-    state.travailleurs=w.travailleurs; state.populationActive=w.populationActive; state.niveauMachine=w.niveauMachine;
-    state.productionActive=w.productionActive; state.niveauVille=w.niveauVille; state.age=w.age;
-    state.cyclesProfitables=w.cyclesProfitables; state.stocks=w.stocks; state.dette=w.dette; state.argent=w.argent;
-    gamePhase=w.gamePhase; this.savedWorld=null; this.previewOn=false;
-    updateBuildings(); updateConsequences(); updateZoneVisibility(); updateVilleBadge(); updateHUD(); updateMarx();
-    if(typeof updateEnvironmentByStage==='function') updateEnvironmentByStage();
-    clearTransientCinematicEffects();
-  },
-  begin(){
-    const overlay=document.getElementById('introtrailer');
-    if(!overlay) return;
-    document.body.classList.add('intro-open');
-    this.total=INTRO_SCENES.reduce((a,s)=>a+(s.dur||6000),0);
-    this.active=true; this.startedGame=false; this.start=performance.now(); this.sceneIndex=-1; this.lastPulse=0;
-    this.points=CIRCUIT.map(c=>{ const p=zonePos(c.zone); return new THREE.Vector3(p.x,0,p.z); });
-    this.savedVehicle={pos:Vehicle.pos.clone(), heading:Vehicle.heading, speed:Vehicle.speed};
-    this.savedCargo=(typeof MiniCircuit!=='undefined'?MiniCircuit.cargo:null);
-    this.applyWorldPreview();
-    Vehicle.speed=0; Input.fwd=Input.back=Input.left=Input.right=false;
-    CycleCinematic.buildActors();
-    overlay.classList.remove('hidden');
-    this.applyScene(0);
-  },
-  end(restoreVehicle=true){
-    this.active=false; this.sceneIndex=-1; this.points=[];
-    document.body.classList.remove('intro-open');
-    CycleCinematic.clearActors();
-    this.restoreWorldPreview();
-    clearTransientCinematicEffects();
-    if(restoreVehicle && this.savedVehicle && Vehicle){
-      Vehicle.pos.copy(this.savedVehicle.pos); Vehicle.heading=this.savedVehicle.heading; Vehicle.speed=0;
-      if(Vehicle.group){ Vehicle.group.position.set(Vehicle.pos.x,0,Vehicle.pos.z); Vehicle.group.rotation.y=Vehicle.heading; Vehicle.group.rotation.z=0; }
-    }
-    if(typeof MiniCircuit!=='undefined' && this.savedCargo!=null) MiniCircuit.cargo=this.savedCargo;
-    this.savedVehicle=null; this.savedCargo=null;
-  },
-  routePoint(p){
-    if(!this.points.length) return new THREE.Vector3();
-    const span=this.points.length-1;
-    const raw=clamp(p)*span, idx=Math.min(span-1,Math.floor(raw)), local=raw-idx;
-    return new THREE.Vector3().lerpVectors(this.points[idx], this.points[Math.min(idx+1,span)], local);
-  },
-  setVehicleAtSaved(){
-    if(!this.savedVehicle || !Vehicle || !Vehicle.group) return;
-    Vehicle.pos.copy(this.savedVehicle.pos);
-    Vehicle.heading=this.savedVehicle.heading;
-    Vehicle.speed=0;
-    Vehicle.group.position.set(Vehicle.pos.x,0,Vehicle.pos.z);
-    Vehicle.group.rotation.y=Vehicle.heading;
-    Vehicle.group.rotation.z=0;
-    if(typeof MiniCircuit!=='undefined') MiniCircuit.cargo='argent';
-    if(Vehicle.cargoGroups){ for(const k in Vehicle.cargoGroups) Vehicle.cargoGroups[k].visible=(k==='argent'); }
-  },
-  applyScene(i){
-    this.sceneIndex=i;
-    const s=INTRO_SCENES[i]||INTRO_SCENES[0];
-    const stamp=document.getElementById('intro-stamp'); if(stamp) stamp.textContent=s.kicker||'';
-    const title=document.getElementById('intro-title'); if(title) title.innerHTML=s.title||'';
-    const body=document.getElementById('intro-body'); if(body) body.innerHTML=s.body||'';
-    const formula=document.getElementById('intro-formula'); if(formula) formula.innerHTML=s.formula||'';
-    const tags=document.getElementById('intro-tags');
-    if(tags){ tags.innerHTML=''; (s.tags||[]).forEach(t=>{ const el=document.createElement('span'); el.textContent=t; tags.appendChild(el); }); }
-    if(s.shot==='handoff'){
-      if(this.previewOn) this.restoreWorldPreview();
-    } else {
-      if(!this.previewOn) this.applyWorldPreview();
-    }
-    const meta=document.getElementById('intro-meta'); if(meta) meta.textContent='séquence '+(i+1)+' / '+INTRO_SCENES.length;
-    const dots=document.getElementById('intro-dots');
-    if(dots){ dots.innerHTML=''; INTRO_SCENES.forEach((_,k)=>{ const d=document.createElement('i'); if(k===i)d.className='on'; dots.appendChild(d); }); }
-  },
-  pulseZones(names,color){
-    const now=performance.now();
-    if(now-this.lastPulse<900) return;
-    this.lastPulse=now;
-    names.forEach(n=>{ fxHalo(n,color); fxPing(n,color); });
-  },
-  updateSceneMotion(scene,local,elapsed){
-    const tt=elapsed*0.001;
-    const bank=zonePos('Banque'), usine=zonePos('Usine'), vente=zonePos('Marché de vente'), etat=zonePos('État'), qw=zonePos('Quartier ouvrier');
-    if(scene==='bank'){
-      const focus=new THREE.Vector3(bank.x,1.5,bank.z);
-      const desired=new THREE.Vector3(bank.x+22+Math.sin(tt)*2,13.5,bank.z+16+Math.cos(tt*0.8)*1.4);
-      camera.position.lerp(desired,0.08); camera.lookAt(focus);
-      CycleCinematic.positionVehicle(0.02); CycleCinematic.updateMoney(0.12); CycleCinematic.updateWorkers(0.02,0.04); CycleCinematic.updateGoods(0.02);
-      this.pulseZones(['Banque'],COL.or); return;
-    }
-    if(scene==='cycle'){
-      // Plan 2 : le mouvement du capital doit être lisible entre des bâtiments déjà construits.
-      const p=local;
-      const focus=this.routePoint(p);
-      const current=CIRCUIT[Math.min(CIRCUIT.length-1,Math.floor(p*CIRCUIT.length))];
-      const desired=new THREE.Vector3(focus.x-18+Math.sin(p*Math.PI*2)*6,30+Math.sin(p*Math.PI)*5,focus.z+18);
-      camera.position.lerp(desired,0.12); camera.lookAt(focus.x,1.2,focus.z);
-      CycleCinematic.positionVehicle(p); CycleCinematic.updateWorkers(p,0.04); CycleCinematic.updateMoney(p); CycleCinematic.updateGoods(p);
-      this.pulseZones([current.zone], COL.or);
-      if(p>0.06 && p<0.96 && current) floatText(current.sym,{x:focus.x,y:10,z:focus.z},p>0.55?'gain':'plain');
-      return;
-    }
-    if(scene==='wide'){
-      // Plan 3 : montrer le monde le plus rempli possible, comme une image promesse du jeu.
-      const p=0.50+Math.sin(tt*0.8)*0.18;
-      const focus=new THREE.Vector3(0,0,0);
-      const desired=new THREE.Vector3(-26+Math.sin(tt*0.55)*14,46+Math.sin(tt*0.35)*8,32+Math.cos(tt*0.5)*12);
-      camera.position.lerp(desired,0.075); camera.lookAt(focus.x,0,focus.z);
-      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(clamp(p)); CycleCinematic.updateGoods(clamp(p));
-      this.pulseZones(['Banque','Marché des moyens','Marché du travail','Usine','Entrepôt','Marché de vente','Quartier ouvrier','État','Bourse','Port · Marché mondial'],COL.or);
-      return;
-    }
-    if(scene==='contradiction'){
-      const p=0.58+Math.sin(tt*0.9)*0.08;
-      const focus=new THREE.Vector3(usine.x-2,0,usine.z);
-      const desired=new THREE.Vector3(usine.x-34,60,usine.z+28+Math.cos(tt*0.6)*5);
-      camera.position.lerp(desired,0.08); camera.lookAt(focus.x,0,focus.z);
-      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(0.86); CycleCinematic.updateGoods(clamp(p));
-      this.pulseZones(['Banque','Marché du travail','Usine','Entrepôt','Marché de vente'],COL.rouge); return;
-    }
-    if(scene==='ages'){
-      const phase=local;
-      let focus, desired, p;
-      if(phase<0.34){
-        p=0.34; // atelier / manufacture
-        focus=new THREE.Vector3(usine.x-1,0,usine.z);
-        desired=new THREE.Vector3(usine.x-18,18,usine.z+15);
-        this.pulseZones(['Usine'],COL.or);
-      } else if(phase<0.68){
-        p=0.48; // grande industrie
-        focus=new THREE.Vector3(usine.x,0,usine.z);
-        desired=new THREE.Vector3(usine.x-26,34,usine.z+22);
-        this.pulseZones(['Usine','Entrepôt'],COL.or);
-      } else {
-        p=0.56; // ville industrielle
-        focus=new THREE.Vector3(0,0,0);
-        desired=new THREE.Vector3(-34,60,36);
-        this.pulseZones(['Usine','Entrepôt','Quartier ouvrier','État'],COL.or);
-      }
-      camera.position.lerp(desired,0.08); camera.lookAt(focus.x,0,focus.z);
-      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(clamp(p),0.04); CycleCinematic.updateMoney(0.24); CycleCinematic.updateGoods(0.68);
-      return;
-    }
-    if(scene==='worldmarket'){
-      const phase=local;
-      let focus, desired, p;
-      if(phase<0.45){
-        p=0.62;
-        focus=new THREE.Vector3(0,0,0);
-        desired=new THREE.Vector3(-42+Math.sin(tt*0.5)*6,72,50+Math.cos(tt*0.45)*5); // ville industrielle élargie
-        this.pulseZones(['Usine','Entrepôt','Quartier ouvrier','État','Banque'],COL.or);
-      } else {
-        p=0.78;
-        focus=new THREE.Vector3(0,0,0);
-        desired=new THREE.Vector3(Math.sin(tt*0.38)*58,98,Math.cos(tt*0.38)*58); // horizon mondial / orbite large
-        this.pulseZones(['Banque','Marché de vente','État','Entrepôt','Bourse','Port · Marché mondial'],COL.bleu);
-      }
-      camera.position.lerp(desired,0.07); camera.lookAt(focus.x,0,focus.z);
-      CycleCinematic.positionVehicle(clamp(p)); CycleCinematic.updateWorkers(0.42,0.04); CycleCinematic.updateMoney(0.82); CycleCinematic.updateGoods(0.82);
-      return;
-    }
-    // handoff : retour au monde de départ, puis contre-plongée vers le chariot
-    this.setVehicleAtSaved();
-    const focus=new THREE.Vector3(Vehicle.pos.x,1.6,Vehicle.pos.z);
-    const dx=Math.sin(Vehicle.heading), dz=Math.cos(Vehicle.heading);
-    const high=new THREE.Vector3(Vehicle.pos.x-26,26,Vehicle.pos.z+28);
-    const low=new THREE.Vector3(Vehicle.pos.x-dx*11,2.7,Vehicle.pos.z-dz*11);
-    const e=local<0.5 ? 2*local*local : 1-Math.pow(-2*local+2,2)/2;
-    const desired=new THREE.Vector3().lerpVectors(high,low,e);
-    camera.position.lerp(desired,0.12);
-    camera.lookAt(focus.x+dx*5,1.7+local*1.2,focus.z+dz*5);
-    this.pulseZones(['Banque'],COL.or);
-  },
-  update(){
-    if(!this.active) return;
-    const elapsed=performance.now()-this.start;
-    let sum=0, idx=INTRO_SCENES.length-1, local=1;
-    for(let i=0;i<INTRO_SCENES.length;i++){
-      const dur=INTRO_SCENES[i].dur||6000;
-      if(elapsed < sum + dur){ idx=i; local=(elapsed-sum)/dur; break; }
-      sum += dur;
-    }
-    if(elapsed>=this.total){ idx=INTRO_SCENES.length-1; local=1; }
-    if(idx!==this.sceneIndex) this.applyScene(idx);
-    const shot=INTRO_SCENES[idx].shot || 'wide';
-    this.updateSceneMotion(shot, clamp(local), elapsed);
-    if(elapsed>=this.total+450 && !this.startedGame){
-      this.startedGame=true; startGame({handoff:true});
-    }
-  }
-};
-
-function startIntroTrailer(){ IntroCinematic.begin(); }
 function startGame(opts={}){
   const handoff=!!opts.handoff;
-  const intro=document.getElementById('introtrailer');
-  if(intro) intro.classList.add('hidden');
-  IntroCinematic.end(!handoff);
+  // M9 — l'overlay d'intro HTML a été retiré : il était masqué au
+  //   démarrage depuis M-Cinéma-b et ne s'affichait donc plus jamais.
+  //   On conserve les deux nettoyages défensifs que IntroCinematic.end()
+  //   effectuait réellement à chaque démarrage de partie.
+  CycleCinematic.clearActors();
+  clearTransientCinematicEffects();
   showChantierBtn(false);
   TutorialCoach.active=true; TutorialCoach.minimized=false; TutorialCoach.resetMovement();
   moveTargetMarker(); renderQuest(); renderCircuitBar(); tutorialCoachRefresh(true);
@@ -9414,7 +9152,6 @@ function startGame(opts={}){
   if(opts.resume) return;
   pushLog('Phase 0','Ton argent dort. Va sur le terrain vide et construis un atelier pour commencer.','plain');
 }
-const introSkip=document.getElementById('intro-skip'); if(introSkip) introSkip.addEventListener('click',()=>startGame());
 
 
 let activeZone=null, lastTriggered=null, cooldown=0;
@@ -9721,17 +9458,6 @@ export function init(opts={}){
   // M-Polish/B — micro-vie. Initialisé après populateEnvironment pour
   //   pouvoir scanner les cordes à linge taguées (userData.linge) déjà placées.
   try{ M_Life.init(); }catch(e){ console.warn('[M-Polish/B] init :', e&&e.message||e); }
-  // M-Cinéma-b/A : SUPPRESSION de l'ancienne intro HTML (overlay
-  //   introtrailer + scènes-narratives + applyWorldPreview). Elle se
-  //   superposait à la nouvelle séquence cinéma « La Veille du Capital »
-  //   (CinemaSequences.playIntro). On lance directement le jeu : le DOM
-  //   introtrailer est masqué, body.intro-open retiré, TutorialCoach
-  //   activé. L'intro cinéma est déclenchée DÉTERMINISTE ici, AVANT
-  //   startGame, pour poser body.mcinema-on avant que le coach se rende
-  //   (le CSS le masque pendant le cinéma → aucun flash).
-  const _introDom = document.getElementById('introtrailer');
-  if(_introDom) _introDom.classList.add('hidden');
-  document.body.classList.remove('intro-open');
   // M9 — le jeu ne démarre plus tout seul : l'ACCUEIL décide. C'est lui qui
   // lance l'intro cinéma (nouvelle partie) ou la restauration (reprise).
   // Le monde est déjà construit derrière : le joueur choisit devant un
@@ -11285,9 +11011,7 @@ function updateEnvironmentByStage(){
 }
 function updateInteractiveProps(dt){
   if(!envReady) return;
-  if(typeof IntroCinematic!=='undefined' && IntroCinematic.active) {
-    // l'intro peut animer les décors, mais le jeu vide de départ ne doit pas payer ce coût ensuite
-  } else if(typeof gamePhase!=='undefined' && gamePhase==='precapital') {
+  if(typeof gamePhase!=='undefined' && gamePhase==='precapital') {
     return;
   }
   for(const L of envLamps){ if(L&&L.material) L.material.emissiveIntensity=(0.35+0.35*(0.5+0.5*Math.sin(t*3+(L.position?L.position.x:0))))*((typeof DayCycle!=='undefined')?DayCycle.lampBoost:1); }
@@ -12910,7 +12634,6 @@ function clearTransientCinematicEffects(){
   }catch(e){}
 }
 function shouldRunHeavySceneEffects(){
-  if(typeof IntroCinematic!=='undefined' && IntroCinematic.active) return true;
   if(typeof CycleCinematic!=='undefined' && CycleCinematic.active) return true;
   if(typeof gamePhase!=='undefined' && gamePhase==='precapital') return false;
   if(typeof state==='undefined' || !state) return false;
@@ -16908,6 +16631,9 @@ const SaveGame = {
       vehicule: Vehicle && Vehicle.pos
         ? { x:Vehicle.pos.x, y:Vehicle.pos.y, z:Vehicle.pos.z, cap:Vehicle.heading }
         : null,
+      // séquences cinéma : « déjà vu » + mémoire de seuil de colère
+      cinema: (typeof CinemaSequences!=='undefined' && CinemaSequences.etat)
+        ? CinemaSequences.etat() : null,
     };
   },
 
@@ -17042,7 +16768,12 @@ const SaveGame = {
     // considéré comme joué : reprendre une partie ne rejoue pas l'aube.
     if(typeof p.timeOfDay==='number'){ timeOfDay = p.timeOfDay; dawnIntroDone = true; }
 
-    // 4. véhicule.
+    // 4. séquences cinéma — avant la resynchro, pour que le tick suivant
+    //    parte de la bonne mémoire de seuil.
+    if(typeof CinemaSequences!=='undefined' && CinemaSequences.restaurer)
+      CinemaSequences.restaurer(d.cinema);
+
+    // 5. véhicule.
     if(d.vehicule && Vehicle && Vehicle.pos){
       Vehicle.pos.set(d.vehicule.x, d.vehicule.y||0, d.vehicule.z);
       if(typeof d.vehicule.cap==='number') Vehicle.heading = d.vehicule.cap;
