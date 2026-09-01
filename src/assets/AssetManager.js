@@ -19,6 +19,15 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { KTX2Loader }  from 'three/addons/loaders/KTX2Loader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 
+// Le jeu n'est pas toujours servi à la racine d'un domaine : le site Lire Marx
+// le sert sous /jeu/. Tous les chemins d'actifs du RUNTIME (décodeur DRACO,
+// transcodeur Basis, HDRI, GLB) doivent donc être préfixés par la base Vite —
+// un '/draco/' en dur irait chercher liremarx.com/draco/ et échouerait.
+// import.meta.env.BASE_URL vaut '/' par défaut, donc rien ne change en local.
+const BASE = import.meta.env.BASE_URL || '/';
+const asset = (p) => BASE.replace(/\/$/, '') + p;
+
+
 export class AssetManager {
   constructor(){
     this._renderer = null;
@@ -38,14 +47,14 @@ export class AssetManager {
   _draco(){
     if (this._dracoLoader) return this._dracoLoader;
     const d = new DRACOLoader();
-    d.setDecoderPath('/draco/');
+    d.setDecoderPath(asset('/draco/'));
     this._dracoLoader = d;
     return d;
   }
 
   _ktx2(){
     if (this._ktx2Loader) return this._ktx2Loader;
-    const k = new KTX2Loader().setTranscoderPath('/basis/');
+    const k = new KTX2Loader().setTranscoderPath(asset('/basis/'));
     if (this._renderer) k.detectSupport(this._renderer);
     this._ktx2Loader = k;
     return k;
@@ -153,10 +162,10 @@ export function playClip(gltf, name){
 // Manifest par défaut M0 : HDRI + GLB de test (preuve du pipeline DRACO).
 export const DEFAULT_MANIFEST = {
   hdri: {
-    sunset: '/assets/hdri/industrial_sunset_puresky_2k.hdr',
+    sunset: asset('/assets/hdri/industrial_sunset_puresky_2k.hdr'),
   },
   models: {
-    test:    '/assets/models/test/cube-draco.glb',
+    test:    asset('/assets/models/test/cube-draco.glb'),
   },
   textures: {
     // (M1+ : KTX2 quand on aura un atlas)
