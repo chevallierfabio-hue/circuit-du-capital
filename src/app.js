@@ -8966,10 +8966,9 @@ function enterCommune(){
   gameMode='commune';
   initCommune(state);
   state.actionsRestantes=3;
-  if(circuitLine) circuitLine.visible=false;
-  if(targetMarker) targetMarker.visible=false;
-  if(groundArrow) groundArrow.visible=false;
-  const cb=document.getElementById('circuit'); if(cb) cb.style.display='none';
+  stageMode();
+  // Fermer le bilan est un geste d'ENTRÉE, pas de mise en scène : on ne
+  // referme pas une modale à chaque restauration.
   const rp=document.getElementById('report'); if(rp) rp.classList.remove('on');
   addHistoricalEvent('age','La Commune : l’accumulation cède la place à la coordination. Un autre monde commence.');
   renderFormationPanel();
@@ -16421,6 +16420,39 @@ function resolvePeriod(){
   });
 }
 
+/* La MISE EN SCÈNE d'un mode : ce que l'écran doit montrer tant qu'on y est.
+   Elle est SÉPARÉE de l'entrée dans le mode (enterSocialFormation,
+   enterCommune), qui narre, débloque et révèle — et qui ne doit jouer
+   qu'une fois.
+
+   C'est très exactement ce qui bloquait une partie reprise : `.formation`
+   est en `display:none` et n'a `display:block` qu'avec la classe `on`, or
+   le seul endroit qui posait cette classe était enterSocialFormation().
+   Une reprise restaure bien `gameMode='socialFormation'` et remplit le
+   panneau — mais ne le montre jamais, et enterSocialFormation() ne peut
+   plus rien réparer puisqu'elle sort d'entrée sur ce même `gameMode`. Le
+   bouton « Lancer le cycle productif » vivant DANS ce panneau, la partie
+   n'avançait plus d'un cycle.
+
+   Tout ce qui est ici doit être idempotent et se déduire du seul `gameMode` :
+   c'est la condition pour pouvoir le rejouer à chaque restauration. */
+function stageMode(){
+  const social = (gameMode==='socialFormation' || gameMode==='commune');
+  const f=document.getElementById('formation'); if(f) f.classList.toggle('on', social);
+  // On rend la main au CSS au lieu de forcer une valeur : le panneau de
+  // quête a ses propres règles selon la largeur d'écran.
+  const q=document.getElementById('quest'); if(q) q.style.display = social ? 'none' : '';
+  const cb=document.getElementById('circuit'); if(cb) cb.style.display = (gameMode==='commune') ? 'none' : '';
+  if(social){
+    // Le circuit n'est plus une route à suivre : ni ligne, ni marqueur, ni
+    // flèche au sol. moveTargetMarker() en cache déjà deux, mais il ne faut
+    // pas dépendre de l'ordre des appels pour un état d'écran.
+    if(circuitLine) circuitLine.visible=false;
+    if(targetMarker) targetMarker.visible=false;
+    if(groundArrow) groundArrow.visible=false;
+  }
+}
+
 function enterSocialFormation(){
   if(gameMode==='socialFormation') return;
   gameMode='socialFormation';
@@ -16428,11 +16460,7 @@ function enterSocialFormation(){
   if(state.objIndex==null) state.objIndex=0; if(state.niveau==null) state.niveau=1;
   if(!state.regime) initRegime(state);
   if(!state.groups) initGroups(state);
-  const f=document.getElementById('formation'); if(f) f.classList.add('on');
-  const q=document.getElementById('quest'); if(q) q.style.display='none';
-  if(circuitLine) circuitLine.visible=false;
-  if(targetMarker) targetMarker.visible=false;
-  if(groundArrow) groundArrow.visible=false;
+  stageMode();
   updateSocialGroups(state); computeRanking(state); updateRegime(state); renderFormationPanel(); renderCircuitBar();
   if(typeof buildSocialTableau==='function') buildSocialTableau();
   addHistoricalEvent('age','Naissance de la formation sociale : le circuit devient une contrainte systémique.');
@@ -16828,11 +16856,23 @@ const SaveGame = {
     CityGrowth.rebuild();
 
     // --- interface ---
+    // La MISE EN SCÈNE d'abord : c'est elle qui montre le panneau de la
+    // formation sociale (ou de la Commune). Sans elle, une partie reprise
+    // dans ces modes voyait son panneau rempli mais laissé en display:none,
+    // donc le bouton « Lancer le cycle productif » hors d'atteinte — et la
+    // partie bloquée pour de bon.
+    stageMode();
+    // Le tableau social est de la GÉOMÉTRIE : il n'existe que dans ces deux
+    // modes, il se garde tout seul dessus, et il se reconstruit à neuf.
+    if(typeof buildSocialTableau==='function') buildSocialTableau();
     updateHUD(); updateMarx(); renderLeviers();
     renderQuest(); renderCircuitBar(); moveTargetMarker();
     renderHistLog();
-    // Le panneau de formation sociale n'existe qu'une fois ce mode entamé.
-    if(gameMode==='socialFormation') renderFormationPanel();
+    // Appel INCONDITIONNEL : la fonction dispatche elle-même vers le
+    // panneau de la Commune et sort si l'on n'est dans aucun des deux modes.
+    // Gardée sur `socialFormation`, elle laissait une reprise en Commune
+    // devant un panneau vide.
+    renderFormationPanel();
     const body=document.getElementById('log-body');
     if(body && journalEntries.length){
       const e=journalEntries[0];
