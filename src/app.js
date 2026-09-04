@@ -693,7 +693,7 @@ const MiniCircuit = {
   get colere(){ return state.colere; },
   banque(){ this.cargo='argent';
     if(state.cycle<=2)
-      return ["Banque","Ici, tu pourras plus tard recourir au crédit. Pour l’instant, ton argent suffit : avance-le (A)."];
+      return ["Banque","Cette fois, l’argent que tu avances est du capital : il ne dort plus, il part pour revenir augmenté. Le crédit viendra plus tard."];
     if(state.dette>0)
       return ["Banque",`Crédit ouvert. Dette : ${money(state.dette)} · taux ${pct(state.tauxInteret)}. Emprunte ou rembourse au panneau.`];
     return ["Banque",`Tu peux emprunter pour investir — mais le crédit se rembourse avec intérêts (taux ${pct(state.tauxInteret)}). Choisis au panneau.`]; },
@@ -6101,6 +6101,8 @@ const CinemaMode = (function(){
          + titre éventuel. Tout le reste s'éteint en fondu (transition
          .6 s pour rester cohérent avec le letterbox). */
       body.mcinema-on .hud,
+      body.mcinema-on .circuit,
+      body.mcinema-on #circuit,
       body.mcinema-on .crisisTag,
       body.mcinema-on #pov-target-indicator,
       body.mcinema-on #circuit-panel,
@@ -6367,6 +6369,32 @@ const CinemaSequences = (function(){
     });
   }
 
+  // La clôture des communs — l'acte II se regarde. La caméra quitte le chariot
+  //   et fait le tour des champs pendant que les paysans les quittent.
+  function playEnclosure(onEnd){
+    if(typeof CinemaMode==='undefined' || CinemaMode.isActive()) return false;
+    const c = _zonePosSafe('Terres communes');
+    return CinemaMode.begin({
+      camPath: [
+        new THREE.Vector3(c.x + 24, 7,  c.z + 26),
+        new THREE.Vector3(c.x + 6,  12, c.z + 28),
+        new THREE.Vector3(c.x - 11, 9,  c.z + 19),
+        new THREE.Vector3(c.x - 13, 5.5, c.z + 5),
+      ],
+      targetPath: [
+        new THREE.Vector3(c.x,     1.5, c.z),
+        new THREE.Vector3(c.x,     1.5, c.z - 2),
+        new THREE.Vector3(c.x + 2, 1.2, c.z - 2),
+        new THREE.Vector3(c.x + 4, 1.0, c.z),
+      ],
+      duration: 7,
+      title: 'Les communs sont clôturés',
+      timeScale: 0.30,
+      fov: 46,
+      onEnd: (typeof onEnd==='function') ? onEnd : null,
+    });
+  }
+
   function snapshotCycle(){
     _cycleSnapshot = _snapState();
   }
@@ -6481,7 +6509,7 @@ const CinemaSequences = (function(){
     _cycleSnapshot = o.cycleSnapshot || null;
   }
 
-  return { playIntro, playCycle, playCrise, snapshotCycle, tick, debug, etat, restaurer };
+  return { playIntro, playEnclosure, playCycle, playCrise, snapshotCycle, tick, debug, etat, restaurer };
 })();
 if(typeof window !== 'undefined') window.__sequences = CinemaSequences;
 
@@ -6670,15 +6698,20 @@ function hudLevel(id,ratio){ // ratio 0..1 : <0.5 ok, <0.75 ambre, sinon rouge
 function updateHUD(){
   const m=MiniCircuit;
   const o=objectifCourant();
+  const hudTitle=document.getElementById('hud-title'), argLab=document.getElementById('h-argent-lab');
   if(gamePhase==='precapital'){
-    // Phase 0-1 : entrée sensible — un seul chiffre, presque pas de texte
-    set('h-argent',fmtMoney(m.argent)+' · dormant');
+    // Fondation : un seul chiffre — et le libellé dit que ce n'est pas encore du capital.
+    if(hudTitle && !marxView) hudTitle.textContent='Ton coffre';
+    if(argLab) argLab.textContent='Argent';
+    set('h-argent',fmtMoney(m.argent));
     set('h-obj','créer les conditions');
     ['h-dette','h-profit','h-stocks','h-chomage','h-colere','h-risque'].forEach(id=>set(id,'—'));
     ['d-argent','d-dette','d-profit','d-stocks','d-chomage','d-colere','d-risque'].forEach(id=>{const e=document.getElementById(id); if(e) e.textContent='';});
     return;
   }
   const d=state.d||{};
+  if(hudTitle && !marxView) hudTitle.textContent='Tableau de bord';
+  if(argLab) argLab.textContent='Capital';
   const profit=Math.round(d.resultatNet!=null?d.resultatNet:(d.profitRealise||0));
   const vals={ 'd-argent':state.argent, 'd-dette':state.dette, 'd-profit':profit,
     'd-stocks':state.stocks, 'd-chomage':state.chomage, 'd-colere':state.colere,
@@ -6780,21 +6813,32 @@ let step = 0;                 // index du PROCHAIN lieu requis
 let voileUnlocked = false;
 let gameOver = false;
 let gamePhase = 'precapital';  // 'precapital' (argent dormant) puis 'circuit'
-const PRECAPITAL_STEPS = [
-  {sym:'£',  nm:'Argent dormant',     done:()=>true},
-  {sym:'At', nm:'Atelier',            done:()=>state.buildings.atelier>0},
-  {sym:'Ou', nm:'Outils',             done:()=>state.buildings.outils>0},
-  {sym:'Ft', nm:'Force de travail',   done:()=>state.travailleurs>0},
-  {sym:'M′', nm:'Première marchandise',done:()=>state.firstProduced},
-  {sym:'A′', nm:'Première vente',     done:()=>state.firstSold},
+/* LA FONDATION DU CAPITAL — trois actes, deux gestes chacun.
+   C'est la source unique du plan : la barre du haut, le carnet (coach) et le
+   plan du chantier la lisent. Acte I : l'argent se fixe dans des moyens de
+   production. Acte II : l'autre côté du marché — la clôture des communs
+   fabrique des vendeurs de force de travail, on embauche. Acte III : la
+   rencontre — on produit, on vend, et l'on compte. */
+const FONDATION = [
+  {acte:'I',   nom:'Les moyens de production', steps:[
+    {id:'atelier',   sym:'At', nm:'L’atelier',      done:()=>state.buildings.atelier>0},
+    {id:'outils',    sym:'Ou', nm:'Les outils',     done:()=>state.buildings.outils>0}]},
+  {acte:'II',  nom:'L’autre côté du marché', steps:[
+    {id:'enclosure', sym:'Tc', nm:'La clôture',     done:()=>state.buildings.travail>0},
+    {id:'embauche0', sym:'Ft', nm:'L’embauche',     done:()=>state.travailleurs>0}]},
+  {acte:'III', nom:'La rencontre', steps:[
+    {id:'produire',  sym:'M′', nm:'La marchandise', done:()=>!!state.firstProduced},
+    {id:'vendre',    sym:'A′', nm:'La vente',       done:()=>!!state.firstSold}]},
 ];
+const PRECAPITAL_STEPS = FONDATION.flatMap(a=>a.steps);
+function fondationActe(){ return FONDATION.find(a=>a.steps.some(s=>!s.done())) || FONDATION[FONDATION.length-1]; }
 let crisisStreak = 0;         // cycles consécutifs à très haut risque
 
 // Progression pédagogique : un concept par cycle (cf. cahier des charges)
 // Objectif de la phase 0 (hors circuit)
-const OBJ_PRECAPITAL = {titre:'Argent dormant', concept:'argent vs capital',
-   but:'Transformer l’argent en capital : construis l’atelier, achète les outils, embauche, produis et vends.',
-   court:'Créer les conditions', rew:'+ le capital prend vie', risk:'rien ne se produit tant que tu n’as rien construit',
+const OBJ_PRECAPITAL = {titre:'La fondation', concept:'argent vs capital',
+   but:'Faire de ton argent du capital : réunir les moyens de production et la force de travail, produire, vendre.',
+   court:'Créer les conditions', rew:'+ le capital prend vie', risk:'rien ne se produit tant que les deux côtés du marché ne sont pas réunis',
    ok:s=>true,
    lecture:'L’argent n’est pas du capital : il ne le devient qu’en se jetant dans le circuit pour en revenir augmenté.'};
 // Cycles du circuit — progression PÉDAGOGIQUE par objectifs atteignables (objectifIndex)
@@ -6907,9 +6951,9 @@ function objectifCourant(){
 
 // Sous-objectifs de la phase 0 (Argent dormant)
 const SOUS_OBJ_0 = [
-  {t:'Construire un atelier',            ok:()=>state.buildings.atelier>0},
+  {t:'Construire l’atelier',             ok:()=>state.buildings.atelier>0},
   {t:'Acheter outils et matières',       ok:()=>state.buildings.outils>0},
-  {t:'Ouvrir un marché du travail',      ok:()=>state.buildings.travail>0},
+  {t:'Assister à la clôture des communs',ok:()=>state.buildings.travail>0},
   {t:'Embaucher le premier ouvrier',     ok:()=>state.travailleurs>0},
   {t:'Produire la première marchandise', ok:()=>state.firstProduced},
   {t:'Vendre la première marchandise',   ok:()=>state.firstSold},
@@ -6930,6 +6974,7 @@ function makeCircuitStepButton(c, cls, label, labelClass, diagInfo){
 }
 function renderCircuitBar(){
   const el=document.getElementById('circuit'); el.innerHTML='';
+  el.classList.toggle('fonda', gamePhase==='precapital');
   if(typeof gameMode!=='undefined' && gameMode==='socialFormation'){
     CIRCUIT.forEach((c,i)=>{
       if(i>0){ const a=document.createElement('span'); a.className='arr'; a.textContent='→'; el.appendChild(a); }
@@ -6940,16 +6985,21 @@ function renderCircuitBar(){
     return;
   }
   if(gamePhase==='precapital'){
-    // barre spéciale de la phase 0
-    let firstUndone = PRECAPITAL_STEPS.findIndex(s=>!s.done());
-    if(firstUndone<0) firstUndone = PRECAPITAL_STEPS.length;
-    PRECAPITAL_STEPS.forEach((s,i)=>{
-      if(i>0){ const a=document.createElement('span'); a.className='arr'; a.textContent='→'; el.appendChild(a); }
-      const d=document.createElement('div');
-      const done=s.done();
-      d.className='stp'+(done?' done':'')+(i===firstUndone?' now':'');
-      d.innerHTML=`<span class="sym">${s.sym}</span><span class="full">${s.nm}</span>`;
-      el.appendChild(d);
+    // La fondation en trois actes : on voit d'un coup d'œil où l'on en est.
+    const nowId=(PRECAPITAL_STEPS.find(s=>!s.done())||{}).id;
+    FONDATION.forEach(a=>{
+      const g=document.createElement('div');
+      g.className='act'+(a.steps.every(s=>s.done())?' done':(a.steps.some(s=>s.id===nowId)?' now':''));
+      g.innerHTML=`<div class="ah"><span class="an">${a.acte}</span>${a.nom}</div>`;
+      const row=document.createElement('div'); row.className='ar';
+      a.steps.forEach((s,i)=>{
+        if(i>0){ const ar=document.createElement('span'); ar.className='arr'; ar.textContent='→'; row.appendChild(ar); }
+        const d=document.createElement('div');
+        d.className='stp'+(s.done()?' done':'')+(s.id===nowId?' now':'');
+        d.innerHTML=`<span class="sym">${s.sym}</span><span class="full">${s.nm}</span>`;
+        row.appendChild(d);
+      });
+      g.appendChild(row); el.appendChild(g);
     });
     return;
   }
@@ -6965,13 +7015,13 @@ function renderCircuitBar(){
 }
 function renderQuest(){
   const o=objectifCourant();
-  set('q-cycle', gamePhase==='precapital' ? 'Phase 0' : 'Cycle '+(state.cycle+1));
+  set('q-cycle', gamePhase==='precapital' ? 'Fondation' : 'Cycle '+(state.cycle+1));
   set('q-rew',o.rew); set('q-risk',o.risk);
   const c=CIRCUIT[step];
   if(gamePhase==='precapital'){
-    set('q-goal','Va vers le prochain lieu indiqué sur la carte.');
+    set('q-goal','Suis la balise rouge : chaque geste de la fondation a son lieu.');
     const tz=precapitalTargetZone();
-    const nextLine = tz ? `Prochaine étape : <b>${precapitalZoneLabel(tz)}</b>` : 'Toutes les conditions sont réunies — vends ta première marchandise.';
+    const nextLine = tz ? `Prochaine étape : <b>${precapitalZoneLabel(tz)}</b>` : 'Tout est réuni — vends la première marchandise.';
     document.getElementById('q-next').innerHTML=
       `<div class="solist">${sousObjHTML()}</div>${nextLine}`;
   } else {
@@ -7243,22 +7293,29 @@ function updateCapitalStage(){
 // Améliorations disponibles (bâtiment, coût, effet éco, conséquence, transformation, lecture marxienne)
 const UPGRADES = [
   // --- AMÉLIORATIONS FONDATRICES (phase 0 : créer les conditions du capital) ---
-  {id:'atelier', b:'atelier', t:'Construire un atelier', cost:150, once:true, founding:true,
-   eff:'débloque la production', cq:'l’argent commence à se fixer dans des moyens de production', vis:'un atelier s’élève sur le terrain vide',
+  {id:'atelier', b:'atelier', t:'Construire l’atelier', cost:150, once:true, founding:true,
+   avail:()=>state.buildings.atelier===0,
+   eff:'un lieu de production', cq:'l’argent commence à se fixer dans des moyens de production', vis:'un atelier s’élève sur le terrain vide',
    marx:'L’argent commence à se fixer dans des moyens de production : il cesse d’être oisif.',
    apply:s=>{ s.buildings.atelier=1; s.buildings.usine=Math.max(1,s.buildings.usine); }},
   {id:'outils', b:'outils', t:'Acheter outils et matières', cost:100, once:true, founding:true,
-   eff:'+ capital constant minimal', cq:'les moyens de production ne créent pas seuls de la valeur', vis:'caisses, outils et matières dans l’atelier',
+   avail:()=>state.buildings.atelier>0 && state.buildings.outils===0,
+   eff:'l’atelier est équipé', cq:'les moyens de production ne créent pas seuls de la valeur', vis:'caisses, outils et matières dans l’atelier',
    marx:'Les moyens de production transmettent leur valeur au produit, mais n’en créent aucune par eux-mêmes.',
    apply:s=>{ s.buildings.outils=1; s.niveauMachine=Math.max(1,s.niveauMachine); }},
-  {id:'travail0', b:'travail', t:'Ouvrir le marché du travail', cost:50, once:true, founding:true,
-   eff:'main-d’œuvre disponible (+3)', cq:'la force de travail devient une marchandise', vis:'des silhouettes apparaissent près du marché du travail',
-   marx:'La force de travail devient disponible comme marchandise : des hommes n’ont plus que leurs bras à vendre.',
-   apply:s=>{ s.buildings.travail=Math.max(1,s.buildings.travail); s.populationActive+=3; }},
+  // La clôture des communs ne se joue pas, elle se REGARDE : ce n'est pas l'acte
+  // du capitaliste individuel mais celui de la loi et du propriétaire. Elle ne
+  // coûte rien au joueur — c'est l'histoire qui travaille pour lui — et c'est
+  // elle qui met des vendeurs de force de travail sur la place d'embauche.
+  {id:'enclosure', b:'travail', t:'Assister à la clôture des communs', cost:0, once:true, founding:true,
+   avail:()=>state.buildings.atelier>0 && state.buildings.outils>0 && state.buildings.travail===0,
+   eff:'trois paysans sans terre à la place d’embauche', cq:'la force de travail devient une marchandise', vis:'les haies se ferment, les paysans quittent les champs',
+   marx:'Ce n’est pas toi qui clôtures. Mais sans cette séparation des producteurs et de leurs moyens de production, personne n’aurait de force de travail à vendre.',
+   apply:s=>{ s.buildings.travail=Math.max(1,s.buildings.travail); s.populationActive+=3; s.enclos=true; }},
   {id:'embauche0', t:'Embaucher le premier ouvrier', cost:0, founding:true,
    avail:()=>state.populationActive>0 && state.travailleurs===0,
-   eff:'1er ouvrier (salaire 5 £/cycle)', cq:'le capital peut désormais acheter la force de travail', vis:'un ouvrier apparaît dans l’atelier',
-   marx:'Le capital peut maintenant acheter la force de travail — la seule marchandise qui crée plus de valeur qu’elle ne coûte.',
+   eff:'un ouvrier, 5 £ par cycle', cq:'le capital achète la force de travail', vis:'un ouvrier apparaît dans l’atelier',
+   marx:'Tu n’achètes pas son travail : tu achètes le droit de le faire travailler dix heures. C’est la seule marchandise dont l’usage produit plus de valeur qu’elle ne coûte.',
    apply:s=>{ s.travailleurs=Math.max(1,s.travailleurs); }},
   {id:'produire', t:'Produire la première marchandise', cost:0, founding:true,
    avail:()=>state.buildings.atelier>0 && state.buildings.outils>0 && state.travailleurs>0 && !state.firstProduced,
@@ -7331,9 +7388,10 @@ function recomputeProduction(){
 
 /* ---- Phase 0 jouée dans l'espace : chaque action fondatrice a son lieu ---- */
 const PRECAP_ZONE_CARDS = {
-  'Usine':            ['atelier','embauche0','produire'],
+  'Usine':            ['atelier','produire'],
   'Marché des moyens':['outils'],
-  'Marché du travail':['travail0'],
+  'Terres communes':  ['enclosure'],
+  'Marché du travail':['embauche0'],
   'Marché de vente':  ['vendre'],
 };
 // carte fondatrice disponible à cette zone (selon l'avancement), sinon null
@@ -7347,8 +7405,8 @@ function precapitalAction(zoneName){
 function precapitalTargetZone(){
   if(state.buildings.atelier===0) return 'Usine';
   if(state.buildings.outils===0)  return 'Marché des moyens';
-  if(state.buildings.travail===0) return 'Marché du travail';
-  if(state.travailleurs===0)      return 'Usine';
+  if(state.buildings.travail===0) return 'Terres communes';
+  if(state.travailleurs===0)      return 'Marché du travail';
   if(!state.firstProduced)        return 'Usine';
   if(!state.firstSold)            return 'Marché de vente';
   return null;
@@ -7357,53 +7415,75 @@ function precapitalTargetZone(){
 function precapitalZoneLabel(name){
   if(name==='Usine') return state.buildings.atelier===0 ? 'Terrain vide' : 'Atelier';
   if(name==='Marché des moyens') return 'Marché local — outils et matières';
-  if(name==='Marché du travail') return 'Place d’embauche';
-  if(name==='Marché de vente')   return 'Marché local';
+  if(name==='Terres communes')   return 'Les terres communes';
+  if(name==='Marché du travail') return state.buildings.travail===0 ? 'Place d’embauche — vide' : 'Place d’embauche';
+  if(name==='Marché de vente')   return 'Marché de vente';
   return name;
 }
 // invite contextuelle de la phase 0 selon l'action disponible
 function precapitalPrompt(u){
   switch(u.id){
-    case 'atelier':   return 'Appuie sur E pour construire le premier atelier.';
-    case 'outils':    return 'Appuie sur E pour acheter les premiers moyens de production.';
-    case 'travail0':  return 'Appuie sur E pour rendre disponible la force de travail.';
-    case 'embauche0': return 'Appuie sur E pour embaucher le premier ouvrier.';
-    case 'produire':  return 'Appuie sur E pour produire la première marchandise.';
-    case 'vendre':    return 'Appuie sur E pour vendre la première marchandise.';
-    default:          return 'Appuie sur E.';
+    case 'atelier':   return 'construire l’atelier';
+    case 'outils':    return 'acheter outils et matières';
+    case 'enclosure': return 'regarder les communs';
+    case 'embauche0': return 'embaucher un ouvrier';
+    case 'produire':  return 'lancer la production';
+    case 'vendre':    return 'vendre les marchandises';
+    default:          return 'agir';
   }
 }
-// courte phrase de sens, montrée après l'action (le changement visible reste premier)
-const FOUNDING_FLASH = {
-  atelier:  'Un atelier s’élève sur le terrain.',
-  outils:   'Outils et matières entrent dans l’atelier.',
-  travail0: 'Des bras disponibles se rassemblent à la place d’embauche.',
-  embauche0:'La force de travail est maintenant achetée comme marchandise.',
-  produire: 'La première marchandise sort de l’atelier.',
-  vendre:   'La marchandise est vendue : l’argent revient augmenté.',
-};
+// Ce que le joueur VIENT DE FAIRE, avec les chiffres de sa propre partie. Reste
+// affiché dans le carnet jusqu'au geste suivant — pas de minuterie, pas de
+// panneau qui se replie : on doit pouvoir le relire.
+let fondaRecap=null;
+function fondationRecap(u, avant){
+  const s=state, cout=avant-s.argent, reste=money(s.argent);
+  switch(u.id){
+    case 'atelier':   return {t:'Tu as construit l’atelier.', n:`− ${money(cout)} · reste ${reste}`,
+      m:'Une part de ton argent s’est fixée dans des murs. Ils ne reviendront pas comme argent — et ne produisent rien seuls.'};
+    case 'outils':    return {t:'Tu as acheté outils et matières.', n:`− ${money(cout)} · reste ${reste}`,
+      m:'L’atelier est équipé. Les moyens de production transmettent leur valeur au produit, ils n’en créent aucune. Il manque le travail.'};
+    case 'enclosure': return {t:'Les communs sont clôturés.', n:`0 £ · ${s.populationActive} paysans sans terre à la place d’embauche`,
+      m:'Tu n’as rien payé : ce n’est pas toi qui as clôturé. Mais sans cette séparation, personne n’aurait eu de force de travail à te vendre.'};
+    case 'embauche0': return {t:'Tu as embauché un ouvrier.', n:`salaire ${money(s.salaire)} par cycle, avancé à la production`,
+      m:`Tu n’as pas acheté son travail : tu as acheté le droit de le faire travailler ${s.heures} heures. Toute la question est dans cet écart.`};
+    case 'produire':  return {t:`Tu as produit ${s._pcQ} marchandises.`, n:`avancé ${money2((s._pcV||0)+(s._pcMat||0))} (salaire ${money2(s._pcV||0)} + matières ${money2(s._pcMat||0)}) · reste ${money2(s.argent)}`,
+      m:'La valeur est dans les caisses, pas dans ton coffre. Tant qu’elles ne sont pas vendues, elles ne valent rien pour toi.'};
+  }
+  return {t:u.t+'.', n:'', m:u.marx||''};
+}
 // exécuter une action fondatrice DANS L'ESPACE (sans passer par le panneau)
 function doFounding(u){
   const cost=upgradeCost(u);
   if(state.argent<cost){
-    showWhap({action:'Capital insuffisant pour : '+u.t+'.', fx:[['il manque '+money(cost-state.argent),'-']], chain:null,
-      marx:'L’argent disponible ne suffit pas encore à acheter cette condition du capital.'});
+    pushLog('Fondation', `Il manque ${money(cost-state.argent)} pour ${u.t.toLowerCase()}.`,'warn');
     return;
   }
+  const avant=state.argent;
   state.argent-=cost; u.apply(state); recomputeProduction();
   if(u.final){ state.firstSold=true; }
-  pushLog('Phase 0', `${u.t}${cost>0?` (−${money(cost)})`:''}. ${u.eff}.`,'plain');
+  pushLog('Fondation', `${u.t}${cost>0?` (−${money(cost)})`:''}. ${u.eff}.`,'plain');
   updateBuildings(); updateZoneVisibility(); updateConsequences(); updateHUD();
   renderCircuitBar(); renderQuest();
+  // Après le geste : le carnet dit ce qu'on vient de faire, et l'on sauvegarde —
+  // en fondation il n'y a pas encore de cycle, chaque geste EST la progression.
+  const after=()=>{ fondaRecap=fondationRecap(u,avant); moveTargetMarker(); tutorialCoachRefresh(true);
+    if(typeof SaveGame!=='undefined') SaveGame.autosave(); };
   // effets visibles sur la carte (le monde change avant l'explication)
   if(u.id==='atelier'){ fxPuff('Usine'); fxHalo('Usine'); flashTimer=0.5; animateConstruction(zoneGroups['Usine']); floatText('atelier construit',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'gain'); }
   else if(u.id==='outils'){ fxPuff('Usine'); floatText('moyens de production',{x:zonePos('Usine').x,y:8,z:zonePos('Usine').z},'gain'); }
-  else if(u.id==='travail0'){ fxHalo('Marché du travail'); animateConstruction(zoneGroups['Marché du travail']); floatText('force de travail disponible',{x:zonePos('Marché du travail').x,y:8,z:zonePos('Marché du travail').z},'social'); }
-  else if(u.id==='embauche0'){ fxHalo('Usine'); floatText('ouvrier embauché',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'social'); }
-  else if(u.id==='produire'){ fxPing('Marché de vente'); floatText('+ marchandise',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'gain'); }   // clignote la prochaine destination
-  if(u.final){ fxCrate('Usine','Marché de vente'); birthOfCapital(); return; } // la vente fait naître le capital
-  showWhap({action:FOUNDING_FLASH[u.id]||(u.t+'.'), fx:[[u.eff,'+']], chain:null, marx:u.marx});
-  moveTargetMarker(); tutorialCoachRefresh(true);
+  else if(u.id==='enclosure'){
+    // L'événement se REGARDE : la caméra quitte le chariot et fait le tour des
+    // champs pendant que les paysans les quittent ; puis la carte raconte.
+    fxHalo('Marché du travail'); animateConstruction(zoneGroups['Marché du travail']);
+    const carte=()=>showConcept({...ENCLOSURE_SCREEN, onClose:after});
+    if(!CinemaSequences.playEnclosure(carte)) carte();
+    return;
+  }
+  else if(u.id==='embauche0'){ fxHalo('Usine'); floatText('ouvrier embauché',{x:zonePos('Marché du travail').x,y:9,z:zonePos('Marché du travail').z},'social'); }
+  else if(u.id==='produire'){ fxPing('Marché de vente'); floatText('+ marchandises',{x:zonePos('Usine').x,y:9,z:zonePos('Usine').z},'gain'); }   // clignote la prochaine destination
+  if(u.final){ fxCrate('Usine','Marché de vente'); fondaRecap=null; birthOfCapital(); return; } // la vente fait naître le capital
+  after();
 }
 
 /* ---- transformations visuelles (couche 'lvl', reconstruite à chaque fois) ---- */
@@ -7595,6 +7675,7 @@ function precapitalProduce(){
   state.argent -= (v+matieres);                      // capital avancé
   state.stocks += Q;
   state._pcQ = Q; state._pcRecette = Q*state.prixUnitaire; state._pcCost = v+matieres;
+  state._pcV = v; state._pcMat = matieres; state._pcHeures = state.heures; state._pcPrix = state.prixUnitaire;
   state._pcPlus = Math.max(0, Q - v);                // plus-value approx (valeur nouvelle − salaire)
   state.firstProduced = true;
 }
@@ -7619,7 +7700,7 @@ function birthOfCapital(){
   ['Banque','Usine','Marché de vente'].forEach(n=>fxPing(n)); // le circuit s'éveille
   afterConcept=()=>{ renderQuest(); renderCircuitBar(); moveTargetMarker(); updateHUD(); updateVilleBadge(); tutorialCoachRefresh(true); };
   Tuto.applyBodyClass();               // bascule phase-precapital → phase-circuit dès la naissance du capital
-  showConcept(BIRTH_SCREEN);           // "Le capital est né" (onClose: unlockVoile)
+  showConcept(birthScreen());          // "Le capital est né", sur le compte du joueur (onClose: unlockVoile)
 }
 
 /* ---- panneau "Choisir une amélioration" ---- */
@@ -7663,8 +7744,8 @@ function openFounding(){
   resumePlay();
 }
 // où réaliser chaque action fondatrice (pour le « Plan du chantier »)
-const FOUNDING_PLACE = {atelier:'Terrain disponible', outils:'Marché local — moyens', travail0:'Place d’embauche',
-  embauche0:'Atelier', produire:'Atelier', vendre:'Marché local — vente'};
+const FOUNDING_PLACE = {atelier:'Terrain disponible', outils:'Marché local — moyens', enclosure:'Terres communes',
+  embauche0:'Place d’embauche', produire:'Atelier', vendre:'Marché de vente'};
 function renderUpgradeDeck(){
   const deck=document.getElementById('upgrade-deck'); deck.innerHTML='';
   if(foundingMode){
@@ -8196,72 +8277,75 @@ const TutorialCoach={
     const b=document.getElementById('coach-body'); if(b) b.innerHTML=step.body||'';
     const keys=document.getElementById('coach-keys');
     if(keys) keys.innerHTML=(step.keys||[]).map(x=>`<span>${x}</span>`).join('');
+    const rc=document.getElementById('coach-recap');
+    if(rc){
+      const r=step.recap;
+      if(r){ rc.innerHTML=`<div class="rl">Tu viens de</div><div class="rt">${r.t}</div>${r.n?`<div class="rn">${r.n}</div>`:''}<div class="rm">${r.m}</div>`; rc.hidden=false; }
+      else { rc.hidden=true; rc.innerHTML=''; }
+    }
   }
 };
 function tutorialCoachRefresh(force=false){
   try{ Tuto.applyBodyClass(); TutorialCoach.render(force); }catch(e){}
 }
+/* Le carnet de la fondation. Une seule surface, deux temps : la consigne (où
+   aller, quoi faire, pourquoi) et, sous un filet, ce qu'on vient de faire —
+   avec les chiffres. Le sur-titre dit l'acte : c'est une histoire en trois. */
+const FONDATION_TXT={
+  atelier:  {far:['Va au terrain vide, au sud de la grand-rue.','Un atelier, c’est de l’argent qui cesse de dormir pour se fixer dans des murs. Il t’en coûtera 150 £ sur tes 400.'],
+             near:['Construis l’atelier.','Appuie sur <b>E</b>. 150 £ deviennent un bâtiment : ils ne reviendront pas comme argent, mais comme lieu de production.']},
+  outils:   {far:['Va au marché local, au nord.','Des murs vides ne transforment rien. Il faut ce sur quoi le travail va porter — les matières — et ce avec quoi il va porter — les outils.'],
+             near:['Achète outils et matières.','Appuie sur <b>E</b>. 100 £. Les moyens de production transmettent leur valeur au produit ; ils n’en créent aucune.']},
+  enclosure:{far:['Va aux terres communes, tout à l’ouest.','Personne ici ne vend sa force de travail : les paysans ont leurs champs, leur bétail, les communs. Tant qu’ils peuvent vivre sans toi, ton atelier restera vide.'],
+             near:['Regarde ce qui se passe.','Appuie sur <b>E</b>. Ce n’est pas toi qui clôtures — c’est la loi et le propriétaire. Mais sans cela, personne ne viendrait vendre ses bras.']},
+  embauche0:{far:['Va à la place d’embauche.','Ils ont leur personne, et rien d’autre. Toi, tu as l’atelier. La rencontre peut avoir lieu.'],
+             near:['Embauche le premier ouvrier.','Appuie sur <b>E</b>. Tu achètes sa force de travail : 5 £ par cycle, pour dix heures de travail par jour.']},
+  produire: {far:['Retourne à l’atelier.','Tout est réuni : les murs, les outils, les matières, un ouvrier. Il reste à les faire fonctionner ensemble.'],
+             near:['Lance la production.','Appuie sur <b>E</b>. Tu avances le salaire et les matières ; dix heures de travail changent les matières en marchandises.']},
+  vendre:   {far:['Va au marché de vente, à l’est.','La valeur est dans les caisses, pas dans ton coffre. Il faut la réaliser — la changer en argent.'],
+             near:['Vends.','Appuie sur <b>E</b>. Si le marché prend tes marchandises à leur valeur, l’argent revient. On saura alors s’il revient augmenté.']},
+};
 function foundingCoachStep(){
   TutorialCoach.updateMovement();
   const tz=precapitalTargetZone();
-  if(!tz) return {key:'founding-sell',kicker:'Naissance du capital',title:'Vends la première marchandise.',body:'Va au marché local pour transformer la marchandise en argent revenu augmenté.',keys:['Suivre la balise','E : agir']};
+  const acte=fondationActe();
+  const base={kicker:`Acte ${acte.acte} · ${acte.nom}`, keys:['Z / ↑ avancer','Q / D tourner','E agir'], recap:fondaRecap};
+  if(!tz) return {...base,key:'founding-sell',title:'Vends la première marchandise.',body:'Va au marché de vente, à l’est.'};
   const u=precapitalAction(tz);
-  const base={kicker:'Première mise en route',keys:['Z / ↑ : avancer','S / ↓ : reculer','Q-D / ←-→ : tourner','E : agir']};
+  const near = currentZone && currentZone.name===tz;
 
   if(!TutorialCoach.hasMoved && state.buildings.atelier===0){
     return {...base,
       key:'move-first',
-      title:'Commence par déplacer le chariot.',
-      body:'Avant de construire quoi que ce soit, prends la main : avance, tourne, recule. Le chariot est ton curseur dans le monde social.<div class="movegrid"><span class="ghost"></span><b>Z</b><span class="ghost"></span><b>Q</b><b>S</b><b>D</b></div>',
+      title:'Prends le chariot.',
+      body:'Avance, tourne, recule. La balise rouge, au sud de la grand-rue, marque un terrain vide : c’est là que tout commence.<div class="movegrid"><span class="ghost"></span><b>Z</b><span class="ghost"></span><b>Q</b><b>S</b><b>D</b></div>',
       keys:['Z ou ↑ : avancer','S ou ↓ : reculer','Q/D ou ←/→ : tourner','R : replacer']
     };
   }
-
-  if(state.buildings.atelier===0){
-    const near = currentZone && currentZone.name===tz;
-    return {...base,
-      key: near?'press-e-workshop':'go-workshop',
-      title: near?'Appuie sur E pour construire.':'Suis maintenant la balise rouge.',
-      body: near
-        ? `Tu es au <b>${precapitalZoneLabel(tz)}</b>. Appuie sur <b>E</b> : cela construit le premier atelier.`
-        : `Va jusqu’à la <b>balise rouge</b>, vers le <b>${precapitalZoneLabel(tz)}</b>. Quand la description du lieu apparaît, tu pourras appuyer sur <b>E</b>.`,
-      keys: near?['E : construire l’atelier']:['Balise rouge = destination','E seulement quand tu es sur le lieu']
-    };
-  }
-
-  if(!u) return {...base,key:'go-next',title:'Suis la balise rouge.',body:`Approche-toi de <b>${precapitalZoneLabel(tz)}</b>. Le jeu t’indique le prochain lieu nécessaire.`};
-  const near = currentZone && currentZone.name===tz;
-  const map={
-    atelier:['Construis le premier atelier.','Le capital ne produit encore rien. Il lui faut d’abord un lieu de production.'],
-    outils:['Achète les moyens de production.','Outils et matières entrent dans l’atelier : sans eux, le travail ne peut rien transformer.'],
-    travail0:['Ouvre le marché du travail.','La force de travail doit devenir disponible avant d’être embauchée.'],
-    embauche0:['Embauche le premier ouvrier.','Le capital achète maintenant de la force de travail : la production peut commencer.'],
-    produire:['Produis la première marchandise.','L’atelier transforme outils, matières et travail vivant en marchandise.'],
-    vendre:['Vends la première marchandise.','La marchandise revient au marché : si elle se vend, l’argent revient augmenté.']
-  };
-  const m=map[u.id]||['Agis ici.','Cette action construit une condition du capital.'];
+  const tx=(u&&FONDATION_TXT[u.id])||{far:['Rejoins la balise rouge.','Le prochain lieu de la fondation.'],near:['Agis ici.','Appuie sur <b>E</b>.']};
+  const [ti,bo]=near?tx.near:tx.far;
   return {...base,
-    key:'founding-'+u.id+(near?'-near':'-far'),
-    title:near?m[0]:'Rejoins le prochain lieu.',
-    body:near ? `${m[1]}<br>Tu es au bon endroit : appuie sur <b>E</b>.` : `${m[1]}<br><b>Lieu à rejoindre :</b> ${precapitalZoneLabel(tz)}.`,
-    keys:near?['E : agir maintenant']:['Suis la balise rouge','Approche-toi du lieu']
+    key:'founding-'+(u?u.id:tz)+(near?'-near':'-far'),
+    title:ti,
+    body:bo+(near?'':`<br><b>Où :</b> ${precapitalZoneLabel(tz)}.`),
+    keys:near?['E : agir maintenant']:['Suis la balise rouge','E une fois sur place']
   };
 }
 /* v47 : une seule phrase courte par lettre — la compréhension passe par le trajet, pas par le texte */
 const CIRCUIT_COACH={
-  A:['A — Argent avancé','L’argent s’avance : il ne dort plus, il s’engage.'],
-  M:['M — Moyens de production','Outils, matières, machines : les conditions matérielles.'],
-  Ft:['Ft — Force de travail','Le capital achète la seule marchandise qui crée de la valeur.'],
-  P:['P — Production','Travail vivant + moyens de production = marchandises.'],
-  "M′":['M′ — Marchandises','La valeur existe — mais en caisses, pas en argent.'],
-  "A′":['A′ — Argent revenu','Vendre, ou rien : la valeur doit se réaliser.']
+  A:['A — L’argent avancé','Cette fois tu sais ce qu’il va faire. Le comptoir est le point de départ — et le point de retour.'],
+  M:['M — Les moyens de production','Ce que le travail a consommé doit être racheté : matières, usure des outils.'],
+  Ft:['Ft — La force de travail','L’ouvrier est là ; sa journée se rachète à chaque cycle. C’est la seule marchandise qui rend plus qu’elle ne coûte.'],
+  P:['P — La production','Dix heures. C’est ici, et nulle part ailleurs, que la valeur nouvelle apparaît.'],
+  "M′":['M′ — Les marchandises','Elles contiennent les matières, le salaire et la plus-value — en caisses. Rien n’est acquis.'],
+  "A′":['A′ — L’argent revenu','Vendre. Le bilan dira si A′ dépasse A, et de combien.']
 };
 function circuitCoachStep(){
   const c=CIRCUIT[step]||CIRCUIT[0];
   const guide=CIRCUIT_COACH[c.sym]||[c.sym,c.full||''];
   return {
     key:'circuit-'+c.sym,
-    kicker:'Premier circuit guidé',
+    kicker: state.cycle===0 ? 'Premier circuit · cycle 1' : 'Le circuit',
     title:guide[0],
     body:`${guide[1]}<br><b>Prochaine destination :</b> ${displayZoneName(c.zone)}. Approche-toi puis appuie sur <b>E</b>.`,
     keys:['Suis la trace au sol','E : agir','Le bandeau du haut = le circuit'],
@@ -8369,14 +8453,47 @@ function tutorialCoachStep(){
 
 /* ---- Écran de concept : révélations majeures, une seule fois ---- */
 // Écran de naissance du capital (fin de la phase 0) — déclenché manuellement
-const BIRTH_SCREEN = {stamp:'Fin de la phase 0', title:'Le capital est né',
-   body:`<p>Au départ, tu avais seulement de l’argent. Cet argent ne produisait rien.</p>
-     <p>Tu as construit un atelier, acheté des moyens de production et embauché de la force de travail. Une marchandise a été produite, puis vendue.</p>
-     <p>L’argent revient maintenant <b>augmenté</b>.</p>
+// Le prologue : qui l'on est, ce qu'on a, et pourquoi ce n'est pas encore du capital.
+const PROLOGUE_SCREEN={stamp:'Prologue', title:'Tu as de l’argent. Ce n’est pas encore du capital.',
+  body:`<p>Quatre cents livres — un héritage, le produit d’un comptoir, peu importe. Tant qu’elles dorment dans un coffre, elles ne sont que de l’argent : elles n’engendrent rien.</p>
+    <p>Pour qu’elles deviennent du <b>capital</b>, il faut qu’elles partent et qu’elles reviennent plus nombreuses. Cela ne se fait pas tout seul. Il faut réunir deux choses qui n’existent pas encore ici : des <b>moyens de produire</b> — un atelier, des outils, des matières — et des gens qui n’ont rien d’autre à vendre que leur <b>force de travail</b>.</p>
+    <p>Les premiers, tu vas les acheter. Les seconds, l’histoire va les fabriquer sous tes yeux.</p>
+    <p class="how">Le chariot est ton corps dans ce monde : <b>Z Q S D</b> pour le conduire, <b>E</b> pour agir dans un lieu. La balise rouge dit où aller ; le carnet, en bas, dit ce que tu fais et ce que tu viens de faire.</p>`,
+  unlock:['Acte I — Les moyens de production']};
+// La clôture des communs : l'événement que l'on vient de regarder, et ce qu'il fabrique.
+const ENCLOSURE_SCREEN={stamp:'Acte II · L’autre côté du marché', title:'Les communs sont clôturés',
+  body:`<p>Une loi d’enclosure. Les champs ouverts deviennent la propriété de quelques-uns : les haies se ferment, le bétail est chassé, les droits d’usage sont abolis. Ceux qui vivaient de ces terres ne peuvent plus en vivre.</p>
+    <p>Les voilà <b>libres</b> — au double sens du mot : libres de leur personne, et libres de tout moyen de production. C’est cette double liberté qui fait d’eux des vendeurs de force de travail. Trois d’entre eux attendent déjà à la place d’embauche.</p>
+    <p>Marx appelle cela l’<b>accumulation primitive</b> : non pas l’épargne vertueuse d’un premier capitaliste, mais la séparation, par la violence, des producteurs et de leurs moyens de production (<i>Le Capital</i>, livre I, chap. XXVI).</p>`,
+  unlock:['Place d’embauche ouverte — trois bras à vendre']};
+// La naissance du capital, sur le compte du joueur : les chiffres sont ceux de
+// SA production, pas d'un exemple. C'est ici qu'on comprend ce qu'on vient de
+// faire — et d'où vient la différence.
+function birthScreen(){
+  const s=state, q=s._pcQ||0, rec=s._pcRecette||0, v=s._pcV||0, mat=s._pcMat||0, h=s._pcHeures||s.heures||10;
+  const avance=v+mat, plus=rec-avance, neuf=rec-mat;              // valeur nouvelle = ce que le travail a ajouté aux matières
+  const hNec = neuf>0 ? Math.min(h, h*v/neuf) : h, hSur=Math.max(0,h-hNec), pn=(hNec/h*100).toFixed(1);
+  const hFr = x => x.toFixed(1).replace('.', ',');
+  const fixe = UPGRADES.filter(u=>u.founding && u.cost>0).reduce((a,u)=>a+upgradeCost(u),0);   // atelier + outils
+  const depart = s.argent + fixe - plus;                          // ce qu'il y avait dans le coffre au prologue
+  return {stamp:'Fin de l’acte III — La rencontre', title:'Le capital est né',
+   body:`<p>Reprends le compte de ce que tu viens de faire.</p>
+     <div class="ledger">
+       <span class="k">Avancé pour produire</span><span class="v">${money2(avance)}</span>
+       <span class="k sub">salaire ${money2(v)} · matières ${money2(mat)}</span><span class="v sub"></span>
+       <span class="k">Revenu de la vente</span><span class="v">${money2(rec)}</span>
+       <span class="k sub">${q} marchandises × ${money2(s._pcPrix||s.prixUnitaire)}</span><span class="v sub"></span>
+       <span class="k tot">Différence</span><span class="v tot">+ ${money2(plus)}</span>
+     </div>
+     <p>D’où viennent ces ${money2(plus)} ? Pas du marché : tu as acheté et vendu à leur valeur. De l’atelier. En ${h} heures, l’ouvrier a ajouté ${money2(neuf)} de valeur nouvelle aux matières ; tu lui en as payé ${money2(v)}. Le reste est à toi.</p>
+     <div class="journee"><div class="jbar"><i style="width:${pn}%"></i></div>
+       <div class="jleg"><span>≈ ${hFr(hNec)} h nécessaires<br>le salaire</span><span>≈ ${hFr(hSur)} h de surtravail<br>la plus-value</span></div></div>
+     <p>Et ton coffre ? ${money(depart)} au départ, ${money2(s.argent)} maintenant. Les ${money(fixe)} qui manquent ne sont pas dépensés : ils sont <b>fixés</b> dans l’atelier et les outils, qui passeront leur valeur aux marchandises au fil de leur usure.</p>
      <div class="formula">A → M → Ft → P → M′ → <b>A′</b></div>
-     <p>À partir de ce moment, il ne fonctionne plus seulement comme argent : il fonctionne comme <b>capital</b>.</p>`,
-   unlock:['Débloqué : circuit A → M → Ft → P → M′ → A′','Concept débloqué : PLUS-VALUE','Concept débloqué : TAUX D’EXPLOITATION','Touche V débloquée : lever le voile'],
+     <p>L’argent qui a fait cela ne fonctionne plus seulement comme argent : il fonctionne comme <b>capital</b>. Et il va recommencer.</p>`,
+   unlock:['Le circuit A → A′ est ouvert','Touche V — lever le voile : la plus-value sous les prix'],
    onClose:()=>unlockVoile()};
+}
 // Concepts introduisant chaque cycle (clé = index du prochain objectif OBJECTIFS)
 const CONCEPTS = {
   5:{stamp:'Nouvel objectif', title:'La concurrence',
@@ -8495,6 +8612,7 @@ let currentZone=null, cooldownReal=0;
 
 function interactZone(zone){
   if(gameOver || anyModalOpen()) return;
+  if(typeof CinemaMode!=='undefined' && CinemaMode.isActive()) return;
   if(gameMode==='commune'){
     if(COMMUNE_ACTIONS[zone.name]) openCommuneActions(zone);
     else pushLog(zone.name,'Ce lieu appartient à l’ancien monde — il n’a plus de fonction dans la Commune.','warn');
@@ -8512,7 +8630,7 @@ function interactZone(zone){
     if(u){ doFounding(u); }
     else {
       const tz=precapitalTargetZone();
-      pushLog('Phase 0','Le circuit n’existe pas encore. Construis d’abord ses conditions'+(tz?` — va à ${precapitalZoneLabel(tz)}.`:'.'),'warn');
+      pushLog('Fondation','Rien à faire ici pour l’instant'+(tz?` — prochaine étape : ${precapitalZoneLabel(tz)}.`:'.'),'warn');
     }
     return;
   }
@@ -8556,6 +8674,14 @@ function performStep(zone){
     if(!state.productionActive){
       showWhap({action:'Tu arrives au lieu de production.', fx:[['production impossible','-']], chain:null,
         marx:'Il n’y a pas encore de production : il faut construire un atelier et embaucher de la force de travail.'});
+    } else if(state.cycle===0){
+      // Premier circuit : on regarde la production se faire avec ce qu'on a.
+      // Les décisions (journée, salaire, machines) viennent avec la formation
+      // sociale, une fois le mouvement d'ensemble compris.
+      showLevers(true);
+      showWhap({action:`La production tourne : ${state.travailleurs} ouvrier, ${state.heures} h, l’atelier et ses outils.`,
+        fx:[['marchandises','+'],['salaire et matières avancés','-']], chain:null,
+        marx:'C’est ici que la valeur nouvelle apparaît — et nulle part ailleurs. Les décisions sur la journée, le salaire et les machines viendront au cycle suivant.'});
     } else { showLevers(true); openCards('usine'); }   // les cartes déclenchent leur propre "Ce qui vient de se passer"
   }
   else if(zone.name==='Banque' && state.cycle>2){ openCards('bank'); }  // crédit volontaire, jamais avant
@@ -8701,6 +8827,7 @@ function bilanLecturesMarx(s,d){
 }
 function showReport(){
   const s=state, d=s.d, p=s.prev||{};
+  const premier = s.cycle===1;   // premier circuit bouclé : le compte et une lecture, pas le grand livre
   const obj=objectifCourant();
   const reussi=obj.ok(s);
   const gauge=obj.gauge?obj.gauge(s):'';
@@ -8826,10 +8953,12 @@ function showReport(){
       <span class="k">Chômage</span><span class="v">${fmtDeltaPct(s.chomage-(p.chomage||0))}</span>
       <span class="k">Risque de crise</span><span class="v">${fmtDeltaPct((d.risqueCrise||0)-(p.risqueCrise||0))}</span>
     </div>`;
-  const lectures=bilanLecturesMarx(s,d).map(l=>`<div>${l}</div>`).join('');
+  const lectures = premier
+    ? '<div>Le même mouvement qu’à la fondation, mais comme un cycle qui se répète : l’argent avancé — salaires, matières — revient par la vente, et la différence vient du travail non payé. Ce que tu as vu naître une fois va maintenant se reproduire, ou se gripper.</div>'
+    : bilanLecturesMarx(s,d).map(l=>`<div>${l}</div>`).join('');
   sheet.innerHTML=`
     <div class="stamp">Registre · An ${1800+s.cycle} · ${obj.titre}</div>
-    <h3>Bilan du cycle ${s.cycle}</h3>
+    <h3>${premier?'Premier cycle bouclé':'Bilan du cycle '+s.cycle}</h3>
     <p class="verdict ${reussi?'ok':'ko'}">${reussi?'✓ Objectif validé — étape pédagogique suivante débloquée':'✗ Objectif non atteint — le prochain cycle conserve le même objectif'}</p>
     <p class="objline"><b>Objectif :</b> ${obj.but}${gauge?`<br><span class="gauge">${gauge}</span>`:''}${manque?`<br><span class="manque">Ce qu’il manque : ${manque}</span>`:''}${aide?`<br><span class="aide">💡 ${aide}</span>`:''}</p>
     ${compte}
@@ -8839,10 +8968,10 @@ function showReport(){
     ${reserve}
     ${social}
     ${etat}
-    ${variations}
-    <div class="auto">${bilanAuto(s,d)}</div>
+    ${premier?'':variations}
+    ${premier?'':`<div class="auto">${bilanAuto(s,d)}</div>`}
     <div class="interp"><div class="veilline">Lecture marxienne</div>${lectures}</div>
-    <button class="go" id="report-go">Repartir pour le cycle ${s.cycle+1} ▸</button>`;
+    <button class="go" id="report-go">${premier?'Continuer ▸':`Repartir pour le cycle ${s.cycle+1} ▸`}</button>`;
   document.getElementById('report').classList.add('on');
   document.getElementById('report-go').onclick=()=>{
     document.getElementById('report').classList.remove('on');
@@ -9149,7 +9278,7 @@ function startGame(opts={}){
   // la partie restaurée a déjà son propre avancement. chargerPartie() pose
   // son propre message juste après.
   if(opts.resume) return;
-  pushLog('Phase 0','Ton argent dort. Va sur le terrain vide et construis un atelier pour commencer.','plain');
+  pushLog('Fondation','Quatre cents livres dorment dans un coffre. Le terrain vide, au sud de la grand-rue, attend un atelier.','plain');
 }
 
 
@@ -9284,11 +9413,11 @@ function handleZones(dt){
       if(u){
         const cost=upgradeCost(u);
         const can=state.argent>=cost;
-        prompt.innerHTML=`${lab} &nbsp;—&nbsp; <b>${precapitalPrompt(u)}</b>`+
-          `<small>${cost>0?money(cost):'gratuit'}${can?'':' · capital insuffisant'} — ${u.eff}</small>`;
+        prompt.innerHTML=`<b>E</b> — ${precapitalPrompt(u)}`+
+          `<small>${lab} · ${cost>0?money(cost):'sans frais'}${can?'':' · argent insuffisant'}</small>`;
       } else {
         const tz=precapitalTargetZone();
-        prompt.innerHTML=`${lab}<small>Le circuit n’existe pas encore. Construis d’abord ses conditions${tz?` — va à ${precapitalZoneLabel(tz)}.`:'.'}</small>`;
+        prompt.innerHTML=`${lab}<small>Rien à faire ici pour l’instant${tz?` — prochaine étape : ${precapitalZoneLabel(tz)}`:''}.</small>`;
       }
       return;
     }
@@ -9886,7 +10015,7 @@ function updateClassLighting(dt){
   const capitalRaw = Math.max(0, Math.min(1.4, profit/SEUIL));
   const chomageRaw = Math.max(0, Math.min(1, state.chomage||0));
   const niveauV    = state.niveauVille || 0;
-  const enclosureRaw = Math.max(0, Math.min(1, niveauV/7));
+  const enclosureRaw = Math.max(0, Math.min(1, niveauV/7, state.enclos ? 0.5 : 0), Math.min(1, niveauV/7));
   const Q         = (state.d && state.d.Q) || 0;
   const usineQRaw = Math.max(0, Math.min(1, Q/200));        // ~200 = pleine production
   const crise     = (state.d && state.d.risqueCrise) || 0;
@@ -12286,7 +12415,9 @@ const PeuplePop = (function(){
   const _employed   = s => Math.max(0, s.travailleurs|0);
   const _popActive  = s => Math.max(0, s.populationActive|0);
   const _chomeursN  = s => Math.max(0, _popActive(s) - _employed(s));
-  const _enclosure  = s => Math.min(1, Math.max(0, (s.niveauVille||0)/7));
+  // La clôture des communs (acte II de la fondation) chasse la moitié des
+  // paysans avant même que la ville ne grandisse.
+  const _enclosure  = s => Math.min(1, Math.max(0, (s.niveauVille||0)/7, s.enclos ? 0.5 : 0));
   const _capitalAcc = s => Math.max(0, (s.profitCumule||0)) + Math.max(0, s.argent||0);
   const _isProd     = s => !!s.productionActive;
   const _hasBld     = (s,k) => !!(s.buildings && s.buildings[k]>0);
@@ -12301,7 +12432,7 @@ const PeuplePop = (function(){
   const SPECS = [
     // — Terres communes : paysans qui diminuent avec l'enclosure —
     //   M-Peuple-détail : type 'paysan' = chapeau paille + faux + sabots.
-    { zone:'Terres communes', role:'paysan', type:'paysan', anim:'farm',
+    { zone:'Terres communes', role:'paysan', type:'paysan', anim:'farm', precap:true,
       max:6,
       count: s => Math.round( Math.max(0, 6 * (1 - _enclosure(s))) ),
       place: (f,i,n)=>{
@@ -12322,7 +12453,7 @@ const PeuplePop = (function(){
       } },
 
     // — Usine : ouvriers réellement employés, anim work, orientés au bâtiment —
-    { zone:'Usine', role:'ouvrier-emploi', type:'ouvrier', anim:'work', max:10,
+    { zone:'Usine', role:'ouvrier-emploi', type:'ouvrier', anim:'work', max:10, precap:true,
       count: s => _isProd(s) ? Math.min(10, _employed(s)) : 0,
       place: (f,i,n)=>{
         const k = (i/Math.max(1,n) - 0.5);
@@ -12333,7 +12464,7 @@ const PeuplePop = (function(){
       } },
 
     // — Usine : capitaliste qui surveille (1, présent quand on emploie) —
-    { zone:'Usine', role:'capitaliste-surveille', type:'capitaliste', anim:'watch', max:1,
+    { zone:'Usine', role:'capitaliste-surveille', type:'capitaliste', anim:'watch', max:1, precap:true,
       count: s => (_isProd(s) && _employed(s)>0) ? 1 : 0,
       place: (f,i,n)=>{
         f.position.set(-6.5, 0, 4.5);
@@ -12374,7 +12505,7 @@ const PeuplePop = (function(){
     //   donc 0.5 m derrière le bord sud de l'auvent à z=+4.5), tourné
     //   vers l'allée client (face nord → rotation.y = π). Sol pavé
     //   à y=0.15 : pieds posés DESSUS, pas encastrés dans le soubassement.
-    { zone:'Marché de vente', role:'marchand', type:'marchand', anim:'sell', max:3,
+    { zone:'Marché de vente', role:'marchand', type:'marchand', anim:'sell', max:3, precap:true,
       count: s => 3,
       place: (f,i,n)=>{
         f.position.set(-5 + i*5, 0.15, 5.0); // dégagé de l'auvent
@@ -12406,7 +12537,7 @@ const PeuplePop = (function(){
     //   arrière à z=-1.9, pas sous la toile inclinée. Tourné vers le sud
     //   (rotation.y = 0). Sol pavé de la halle à y=0.55 : pieds DESSUS,
     //   plus encastrés dans le soubassement+plinthe en pierre.
-    { zone:'Marché des moyens', role:'marchand', type:'marchand', anim:'sell', max:2,
+    { zone:'Marché des moyens', role:'marchand', type:'marchand', anim:'sell', max:2, precap:true,
       count: s => 2,
       place: (f,i,n)=>{
         f.position.set(-4.5 + i*9, 0.55, -2.8); // dos aux stands 1 (-4.5) et 3 (+4.5)
@@ -12417,7 +12548,7 @@ const PeuplePop = (function(){
     // — Marché du travail : file de chômeurs (∝ chômage réel).
     //   Devant le bureau d'embauche (guichet à z≈+0.05, face sud),
     //   2 rangées tournées vers le guichet (face nord = rotation.y = π).
-    { zone:'Marché du travail', role:'file-chomeurs', type:'chomeur', anim:'idle', max:14,
+    { zone:'Marché du travail', role:'file-chomeurs', type:'chomeur', anim:'idle', max:14, precap:true,
       count: s => Math.min(14, _chomeursN(s)),
       place: (f,i,n)=>{
         const col = i % 6, row = Math.floor(i/6);
@@ -12566,17 +12697,16 @@ const PeuplePop = (function(){
     _t += dt;
     if(_t < THROTTLE) return;
     _t = 0;
-    if(!_phaseGate()){
-      // précapital : tout planquer, ne rien rafraîchir.
-      for(const [, slot] of _slots)
-        for(const f of slot.figs) if(f.visible) f.visible = false;
-      return;
-    }
     const s = _safeS();
     if(!s) return;
+    // Fondation : seuls les rôles marqués precap vivent — les paysans des
+    // communs (que la clôture chasse), les marchands, la file de la place
+    // d'embauche, puis l'ouvrier et le capitaliste à l'atelier. Le reste de
+    // la ville attend la naissance du capital.
+    const precap = !_phaseGate();
     for(const spec of SPECS){
       if(typeof zoneGroups === 'undefined' || !zoneGroups[spec.zone]) continue;
-      _refresh(_slot(spec), spec.count(s));
+      _refresh(_slot(spec), (precap && !spec.precap) ? 0 : spec.count(s));
     }
   }
 
@@ -16466,9 +16596,9 @@ function enterSocialFormation(){
   addHistoricalEvent('age','Naissance de la formation sociale : le circuit devient une contrainte systémique.');
   CompetitorWorld.reveal();          // v48 : le monde dépasse le joueur — les autres capitaux apparaissent
   tutorialCoachRefresh(true);
-  showConcept({stamp:'Formation sociale', title:'Le circuit devient diagnostic',
-    body:'<p>Tu as terminé la première boucle. Désormais, tu ne suis plus une route obligatoire : tu interviens dans une <b>formation sociale</b>.</p><p><b>Panneau de droite</b> : âge, objectif, contradictions, actions restantes. <b>Circuit du haut</b> : diagnostic des blocages. <b>Bouton tout en bas du panneau</b> : <i>Lancer le cycle productif</i>, pour transformer tes interventions en bilan.</p>',
-    unlock:['Haut : circuit diagnostic','Droite : Formation sociale','3 interventions / période','Bas du panneau : Lancer le cycle productif']});
+  showConcept({stamp:'Formation sociale', title:'Le circuit devient une société',
+    body:'<p>Tu as bouclé le circuit une fois, pas à pas. Désormais il tourne de lui-même — et tu n’es plus seul : d’autres capitaux produisent la même marchandise.</p><p>À chaque période, tu disposes de <b>trois interventions</b> : conduis vers un bâtiment, appuie sur <b>E</b>, choisis un bouton. Puis lance le cycle, en bas du panneau de droite, et lis le bilan.</p>',
+    unlock:['3 interventions par période','En bas du panneau de droite : Lancer le cycle productif']});
 }
 
 function renderCommunePanel(){
@@ -17075,7 +17205,10 @@ const Accueil = {
     slotActif = i;
     titrePartie = nettoieTitre(titre);
     this.fermer();
-    CinemaSequences.playIntro(() => tutorialCoachRefresh(true));
+    // L'intro joue, puis le prologue dit qui l'on est. Si l'intro ne peut pas
+    // jouer (déjà vue dans cette session), le prologue vient tout de suite.
+    const prologue=()=>{ showConcept(PROLOGUE_SCREEN); tutorialCoachRefresh(true); };
+    if(!CinemaSequences.playIntro(prologue)) prologue();
     startGame({handoff:true});
     SaveGame.autosave();      // l'emplacement est réservé dès le premier pas
     refreshSaveUI();
