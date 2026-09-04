@@ -139,13 +139,25 @@
   .circuit .stp.done{opacity:.9}
   .circuit .stp.done .sym{background:var(--encre);color:var(--papier)}
   .circuit .stp.now{opacity:1}
-  .circuit .stp.now .sym{background:var(--rouge);color:var(--papier);border-color:var(--rouge);
-    animation:pulseStep 1.1s ease-in-out infinite}
+  /* la case courante reste pleine ; seul son halo (::after) pulse — la case elle-même
+     portait l'animation et s'éteignait à mi-pulsation (opacité 0) */
+  .circuit .stp.now .sym{background:var(--rouge);color:var(--papier);border-color:var(--rouge)}
   .circuit .stp.now .sym{position:relative}
   .circuit .stp.now .sym::after{content:"";position:absolute;inset:-1px;border:2px solid var(--rouge);
     pointer-events:none;animation:pulseStep 1.1s ease-in-out infinite}
   @keyframes pulseStep{0%,100%{transform:scale(1);opacity:.55}50%{transform:scale(1.5);opacity:0}}
   .circuit .arr{font-family:"IBM Plex Mono",monospace;opacity:.45;margin:0 1px 14px;font-size:13px}
+  /* ---- la fondation en trois actes (barre du haut, phase précapitale) ---- */
+  .circuit.fonda{gap:0;padding:6px 10px 7px}
+  .circuit.fonda .act{display:flex;flex-direction:column;align-items:center;gap:4px;padding:0 12px;opacity:.5;transition:opacity .3s}
+  .circuit.fonda .act+.act{border-left:1px solid rgba(36,31,23,.28)}
+  .circuit.fonda .act.now,.circuit.fonda .act.done{opacity:1}
+  .circuit.fonda .ah{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap}
+  .circuit.fonda .act.now .ah{color:var(--rouge)}
+  .circuit.fonda .ah .an{font-family:"Zilla Slab",serif;font-size:12px;margin-right:6px}
+  .circuit.fonda .ar{display:flex;align-items:center}
+  .circuit.fonda .ar .stp{min-width:52px}
+  .circuit.fonda .stp .full{white-space:nowrap;font-size:10.5px}
 
   .circuit .stp{border:0;background:transparent;color:inherit;padding:0;font:inherit}
   .circuit .stp:focus-visible .sym{outline:2px solid var(--or);outline-offset:2px}
@@ -261,7 +273,8 @@
     background:rgba(36,31,23,.55)}
   .concept.on{display:flex}
   .concept .cpanel{background:var(--papier);border:2px solid var(--encre);box-shadow:8px 10px 0 rgba(36,31,23,.35);
-    padding:30px 34px;width:min(540px,92vw);text-align:left;position:relative}
+    padding:30px 34px;width:min(540px,92vw);text-align:left;position:relative;
+    max-height:92vh;overflow-y:auto}   /* l'écran de naissance est long : il défile sur un petit écran */
   .concept .cstamp{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:2px;text-transform:uppercase;
     color:var(--rouge);margin-bottom:8px}
   .concept h2{font-family:"Zilla Slab",serif;font-size:30px;margin:0 0 18px;letter-spacing:.5px;line-height:1.1}
@@ -270,6 +283,21 @@
   .concept .cbody .formula{font-family:"IBM Plex Mono",monospace;font-size:17px;letter-spacing:1.5px;
     text-align:center;margin:14px 0;opacity:.9}
   .concept .cbody .formula b{color:var(--rouge)}
+  /* le compte de la naissance : ce que le joueur a avancé, ce qui est revenu */
+  .concept .cbody .ledger{display:grid;grid-template-columns:1fr auto;gap:2px 18px;font-size:14px;margin:6px 0 14px;padding:10px 12px;
+    border:1.5px solid var(--encre);background:rgba(233,221,198,.5)}
+  .concept .cbody .ledger .k.sub{font-size:12px;opacity:.7;font-style:italic;margin-bottom:4px}
+  .concept .cbody .ledger .v{font-family:"IBM Plex Mono",monospace;font-weight:600;text-align:right}
+  .concept .cbody .ledger .tot{border-top:1.5px solid var(--encre);padding-top:4px;margin-top:2px}
+  .concept .cbody .ledger .v.tot{color:var(--rouge)}
+  /* la journée coupée en deux : travail nécessaire / surtravail */
+  .concept .cbody .journee{margin:6px 0 14px}
+  .concept .cbody .jbar{height:14px;border:1.5px solid var(--encre);background:var(--rouge);display:flex;overflow:hidden}
+  .concept .cbody .jbar i{display:block;height:100%;background:var(--bleu)}
+  .concept .cbody .jleg{display:flex;justify-content:space-between;gap:12px;font:500 11px "IBM Plex Mono",monospace;margin-top:5px}
+  .concept .cbody .jleg span:first-child{color:var(--bleu)} .concept .cbody .jleg span:last-child{color:var(--rouge);text-align:right}
+  .concept .cbody p.how{font-size:13px;opacity:.85;border-top:1px solid rgba(36,31,23,.3);padding-top:10px;margin-top:4px}
+  .concept .cbody p.how b{font-family:"IBM Plex Mono",monospace;color:var(--encre)}
   .concept .cunlock{font-family:"Zilla Slab",serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;
     font-size:13px;border:2px solid var(--rouge);color:var(--rouge);padding:9px 12px;margin:6px 0 18px;
     display:flex;flex-direction:column;gap:4px}
@@ -716,7 +744,13 @@
   .coach p{margin:0;font-size:13.5px;line-height:1.42}
   .coach .keys{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font:600 11px "IBM Plex Mono",monospace}
   .coach .keys span{border:1px solid rgba(233,221,198,.52);padding:2px 6px;background:rgba(233,221,198,.08)}
-  .coach.min h3,.coach.min p,.coach.min .keys{display:none}
+  .coach.min h3,.coach.min p,.coach.min .keys,.coach.min .crecap{display:none}
+  /* Fondation — « Tu viens de » : le geste, ses chiffres, son sens. */
+  .coach .crecap{margin-top:10px;padding-top:9px;border-top:1px solid rgba(233,221,198,.32)}
+  .coach .crecap .rl{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:#f1d48a;margin-bottom:3px}
+  .coach .crecap .rt{font:700 14px/1.25 "Zilla Slab",serif;color:#f4ecd8}
+  .coach .crecap .rn{font:600 11.5px "IBM Plex Mono",monospace;color:#c9b78c;margin-top:2px}
+  .coach .crecap .rm{font-size:12.5px;line-height:1.4;font-style:italic;margin-top:4px;opacity:.92}
   .coach.min{width:auto;max-width:88vw;padding:7px 10px;bottom:88px}
   .coach.min .ctop{margin:0}
   .coach-pulse{animation:coachPulse 1.1s ease-in-out infinite!important;outline:3px solid #f1d48a!important;outline-offset:4px}
@@ -777,11 +811,12 @@
   /* Entrée épurée : pendant tout le précapital, seul le coach guide.
      Le HUD éclôt en phase circuit (la lumière, c'est le capital). */
   #hud, #circuit, .quest, .villebadge, .log{ transition:opacity .9s ease; }
-  body.phase-precapital #hud,
-  body.phase-precapital #circuit,
   body.phase-precapital .quest,
   body.phase-precapital .villebadge,
   body.phase-precapital .log{ opacity:0; pointer-events:none; }
+  /* Fondation : on ne voit que ce qui sert — l'argent (une ligne) et le plan en trois actes. */
+  body.phase-precapital #hud{min-width:0}
+  body.phase-precapital #hud .r:not(.r-argent), body.phase-precapital #hud #marxbox, body.phase-precapital #hud .r .delta{display:none}
   body.tuto-p5 .how-actions{display:none!important}
   body.tuto-p5 #tutorial-coach{display:none!important}
   /* v46 — l'interface pédagogique ne reste pas après le tutoriel */
@@ -839,7 +874,7 @@
 <div class="hud" id="hud">
   <h2 id="hud-title">Tableau de bord</h2>
   <!-- v47 : les 6 variables structurantes sont TOUJOURS visibles, avec delta du dernier cycle -->
-  <div class="r"><span>Capital</span><b class="gold" id="h-argent">—</b><i class="delta" id="d-argent"></i></div>
+  <div class="r r-argent"><span id="h-argent-lab">Capital</span><b class="gold" id="h-argent">—</b><i class="delta" id="d-argent"></i></div>
   <div class="r"><span>Dette</span><b id="h-dette">—</b><i class="delta" id="d-dette"></i></div>
   <div class="r"><span>Profit (cycle)</span><b id="h-profit">—</b><i class="delta" id="d-profit"></i></div>
   <div class="r"><span>Stocks</span><b id="h-stocks">—</b><i class="delta" id="d-stocks"></i></div>
@@ -995,6 +1030,8 @@
   <h3 id="coach-title">Prends le chariot.</h3>
   <p id="coach-body">Suis la balise rouge, approche-toi du lieu indiqué, puis appuie sur E pour agir.</p>
   <div class="keys" id="coach-keys"></div>
+  <!-- Fondation : ce que le joueur vient de faire, avec ses chiffres. Reste jusqu'au geste suivant. -->
+  <div class="crecap" id="coach-recap" hidden></div>
   <div class="cnav" id="coach-nav" style="display:none">
     <div class="cprog" id="coach-prog">1 / 1</div>
     <div class="cbtns"><button id="coach-prev">◂</button><button id="coach-next">▸</button></div>
